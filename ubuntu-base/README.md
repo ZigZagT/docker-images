@@ -13,3 +13,9 @@ docker pull deaddev/ubuntu-base
     - you may find a mirror near to you from https://launchpad.net/ubuntu/+archivemirrors
 3. Disable installing recommends and suggests for `apt-get`. The recommends and suggests are usually useless for serious server setups, and are usually severely slowing down image build speed.
 4. Be HTTP ready. Adding `curl` and `wget` to the image. Anyone that doesn't trust `curl` or `wget` should just stay away from the internet.
+
+## Geoip variant
+The `:geoip` tag is a version includes the common MaxMind GeoLite databases. Including:
+- `/usr/share/GeoIP/GeoLite2-ASN.mmdb`
+- `/usr/share/GeoIP/GeoLite2-City.mmdb`
+- `/usr/share/GeoIP/GeoLite2-Country.mmdb`
