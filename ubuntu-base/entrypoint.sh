@@ -4,7 +4,7 @@
 echo $TZ > /etc/timezone
 rm -f /etc/localtime
 ln -snf /usr/share/zoneinfo/$TZ /etc/localtime
-dpkg-reconfigure -f noninteractive tzdata
+dpkg-reconfigure -f noninteractive tzdata 2>/dev/null
 
 # set apt mirror
 if [[ -n $APT_MIRROR ]]; then
