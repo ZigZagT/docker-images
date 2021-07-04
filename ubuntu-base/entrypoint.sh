@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+set -e
 
-sudo /container-setup.sh
-exec "$@"
+/setup-tz.sh
+/setup-apt.sh
+
+setpriv --clear-groups --regid ${GID:-0} --reuid ${UID:-0} "$@"
