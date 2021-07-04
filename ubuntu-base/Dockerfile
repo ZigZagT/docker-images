@@ -13,12 +13,16 @@ RUN echo archive.ubuntu.com > /apt-mirror.txt \
     && echo 'APT::AutoRemove::SuggestsImportant "false";' >> /etc/apt/apt.conf.d/99_norecommends \
     && apt-get update \
     && apt-get install --no-install-recommends -y \
+        sudo \
         tzdata \
         wget \
         curl \
         unzip \
         ca-certificates \
     && apt-get autoremove -y --purge
+
+COPY container-sudoer /etc/sudoers.d/
+COPY container-setup.sh /container-setup.sh
 COPY entrypoint.sh /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["/bin/bash"]

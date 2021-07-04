@@ -1,0 +1,1 @@
+ALL localhost=(root) NOPASSWD:NOEXEC: /container-setup.sh
