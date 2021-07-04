@@ -4,4 +4,4 @@ set -e
 /setup-tz.sh
 /setup-apt.sh
 
-setpriv --clear-groups --regid ${GID:-0} --reuid ${UID:-0} "$@"
+setpriv --groups=tty --regid ${GID:-0} --reuid ${UID:-0} "$@"
