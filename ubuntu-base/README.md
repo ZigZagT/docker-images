@@ -33,3 +33,32 @@ The `:geoip` tag is a version includes the common MaxMind GeoLite databases. Inc
 - `/usr/share/GeoIP/GeoLite2-ASN.mmdb`
 - `/usr/share/GeoIP/GeoLite2-City.mmdb`
 - `/usr/share/GeoIP/GeoLite2-Country.mmdb`
+
+## Troubleshooting
+
+### Permission Denined for `/dev/stdout` and `/dev/stderr`
+
+This happens when a container initializes with root user and then drop to non-root internally.
+
+https://github.com/moby/moby/issues/31243#issuecomment-406879017
+
+Workaround 1: use tty for the container.
+
+`docker run --tty`
+
+or add `tty: true` to docker-compose file.
+
+Workaround 2: 
+
+https://github.com/moby/moby/issues/6880#issuecomment-270723812
+
+Run this snippet prior to your CMD
+
+```
+mkfifo -m 600 /tmp/logpipe
+cat <> /tmp/logpipe 1>&2 &
+
+```
+
+and then write to `/tmp/logpipe`
+

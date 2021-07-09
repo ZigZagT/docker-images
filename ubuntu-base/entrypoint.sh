@@ -10,5 +10,6 @@ rm -f /container-setup/*
 if [[ $EUID -ne 0 ]]; then
     exec "$@"
 else
-    setpriv --clear-groups --regid ${GID:-0} --reuid ${UID:-0} "$@"
+    setpriv --groups=tty --regid ${GID:-$EGID} --reuid ${UID:-$EUID} "$@"
 fi
+
