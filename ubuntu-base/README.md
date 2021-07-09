@@ -8,21 +8,25 @@ docker pull deaddev/ubuntu-base
 
 ## Usage
 
-1. Timezone can be set via `TZ` environment variable. Either at build or run time.
-    - for build time, use something like `docker build --build-arg TZ=America/Vancouver`
-    - for run time, use something like `docker run -e TZ=America/Vancouver`
-2. Set apt mirror via `APT_MIRROR` environment variable, also at either build time and run time:
-    - for build time, set mirror with `docker build --build-arg APT_MIRROR=us.archive.ubuntu.com`
-    - for run time, set mirror with `docker run -e APT_MIRROR=us.archive.ubuntu.com`
-    - you may find a mirror near to you from https://launchpad.net/ubuntu/+archivemirrors
-3. Use `UID` and `GID` environment variables to run as non-root user.
-4. Never installing recommends and suggests for `apt-get`. Recommends and suggests are usually useless for serious server setups, and are usually severely slowing down image build speed.
-5. HTTP ready. Adding `curl` and `wget` to the image. Anyone that doesn't trust `curl` or `wget` should just stay away from the internet.
+1. Timezone can be set via `TZ` environment variable. Supports both build time and run time.
+    - for build time, set `build-arg` like `docker build --build-arg TZ=America/Vancouver`
+    - for run time, set `environment` like `docker run -e TZ=America/Vancouver`
+2. Set apt mirror via `APT_MIRROR` environment variable. Also supports both build time and run time:
+    - for build time, set `build-arg` like `docker build --build-arg APT_MIRROR=us.archive.ubuntu.com`
+    - for run time, set `environment` like `docker run -e APT_MIRROR=us.archive.ubuntu.com`
+    - you may find a mirror from https://launchpad.net/ubuntu/+archivemirrors
+3. Set `UID` and `GID` environment variables to switch to an arbitrary user settings.
+    - Note: When using this feature, make sure your container process has the permission to change user/group.
+4. Disabled installing recommends and suggests for `apt-get`.
+5. HTTP ready. `curl` and `wget` are included in the image.
+
+Both `TZ` and `APT_MIRROR` works with non-root user. So you can freely use `USER` command in `Dockerfile`.
 
 ## Caveats
-Never use `USER` command in `Dockerfile` that based on this image. The run-time setup of `TZ` and `APT_MIRROR` needs root access and `USER` commend just breaks everything.
 
-Alter natively, set `UID` and `GID` environment variables to use an non-root user in container.
+Make sure you run `rm -f /container-setup/*` if you're using a customized `ENTRYPOINT`.
+
+In order to make `TZ` and `APT_MIRROR` working with non-root user, `SETUID` bit was set on the script file. This can pose a security risk. The image eliminates the risk by removing `SETUID` enabled scripts in at container launch time. This is done inside the bundled `/entrypoint.sh`.
 
 ## Geoip variant
 The `:geoip` tag is a version includes the common MaxMind GeoLite databases. Including:
