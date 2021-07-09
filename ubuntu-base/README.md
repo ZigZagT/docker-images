@@ -38,7 +38,7 @@ The `:geoip` tag is a version includes the common MaxMind GeoLite databases. Inc
 
 ### Permission Denined for `/dev/stdout` and `/dev/stderr`
 
-This happens when a container initializes with root user and then drop to non-root internally.
+This happens when a container initializes with root user and then drop to non-root internally. (i.e. with `UID` and `GID` environments)
 
 https://github.com/moby/moby/issues/31243#issuecomment-406879017
 
@@ -48,7 +48,7 @@ Workaround 1: use tty for the container.
 
 or add `tty: true` to docker-compose file.
 
-Workaround 2: 
+Workaround 2:
 
 https://github.com/moby/moby/issues/6880#issuecomment-270723812
 
