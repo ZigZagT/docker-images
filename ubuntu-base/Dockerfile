@@ -18,8 +18,8 @@ RUN echo archive.ubuntu.com > /apt-mirror.txt \
         ca-certificates \
         shc \
         build-essential \
-    && shc -S -f /container-setup/setup-apt.sh -v \
-    && shc -S -f /container-setup/setup-tz.sh -v \
+    && shc -r -S -f /container-setup/setup-apt.sh -v \
+    && shc -r -S -f /container-setup/setup-tz.sh -v \
     && chmod u+s /container-setup/setup-apt.sh.x /container-setup/setup-tz.sh.x \
     && chmod a+w /container-setup \
     && rm -f /container-setup/*.sh /container-setup/*.sh.x.c \
