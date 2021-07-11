@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set -e
 DIR="$(dirname "$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )")"
 
 echo -n '' > $DIR/MAXMIND_VERSIONS
@@ -14,4 +15,5 @@ add_version GeoLite2-Country
 add_version GeoLite2-City
 add_version GeoLite2-ASN
 
-docker build "$DIR" -t deaddev/ubuntu-base:geoip --build-arg "LICENSE_KEY=${LICENSE_KEY}"
+docker build "$DIR" -t deaddev/ubuntu-base:geoip-builder --build-arg "LICENSE_KEY=${LICENSE_KEY}" --target builder
+docker build "$DIR" -t deaddev/ubuntu-base:geoip --build-arg "LICENSE_KEY=${LICENSE_KEY}" --cache-from deaddev/ubuntu-base:geoip-builder
