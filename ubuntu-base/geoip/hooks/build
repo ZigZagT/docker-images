@@ -16,4 +16,4 @@ add_version GeoLite2-City
 add_version GeoLite2-ASN
 
 docker build "$DIR" -t deaddev/ubuntu-base:geoip-builder --build-arg "LICENSE_KEY=${LICENSE_KEY}" --target builder
-docker build "$DIR" -t deaddev/ubuntu-base:geoip --build-arg "LICENSE_KEY=${LICENSE_KEY}" --cache-from deaddev/ubuntu-base:geoip-builder
+docker build "$DIR" -t deaddev/ubuntu-base:geoip --build-arg "LICENSE_KEY=${LICENSE_KEY}" --cache-from deaddev/ubuntu-base:geoip-builder,deaddev/ubuntu-base:geoip
