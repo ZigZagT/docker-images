@@ -5,7 +5,7 @@ set -e
 /container-setup/setup-apt.sh.x
 
 # remove the setuid enabled executables for security
-rm -f /container-setup/*.x
+rm -f /container-setup/*
 
 if [[ $EUID -ne 0 ]]; then
     exec "$@"
