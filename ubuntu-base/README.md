@@ -22,11 +22,24 @@ docker pull deaddev/ubuntu-base
 
 Both `TZ` and `APT_MIRROR` works with non-root user. So you can freely use `USER` command in `Dockerfile`.
 
+### Use Custom `ENTRYPOINT`
+
+This image comes with an `ENTRYPOINT` script to achive all the run-time features listed above (build time features are not affected). To make everything work with an custom `ENTRYPOINT` script, use this command in your `ENTRYPOINT` script where you're about to starting the container command:
+
+```sh
+// equivalent to exec "$@"
+/container-setup/entrypoint.sh "$@"
+```
+
+This usually replaces `exec "$@"` in a typical `ENTRYPOINT` script.
+
 ## Caveats
 
-Make sure you run `rm -f /container-setup/*` if you're using a customized `ENTRYPOINT`.
+Make sure you run `rm -f /container-setup/*` if you're not using the bundled `/container-setup/entrypoint.sh` script at all.
 
-In order to make `TZ` and `APT_MIRROR` working with non-root user, `SETUID` bit was set on the script file. This can pose a security risk. The image eliminates the risk by removing `SETUID` enabled scripts in at container launch time. This is done inside the bundled `/entrypoint.sh`.
+In order to make `TZ` and `APT_MIRROR` working with non-root user, `SETUID` bit was set on the script files. This can pose a security risk. To eliminates the risk you need to remove `SETUID` enabled scripts at container launch time. This is handled by the bundled `entrypoint.sh`.
+
+`/container-setup/` has `rwx` permission to allow deletion by any non-root users.
 
 ## Geoip variant
 The `:geoip` tag is a version includes the common MaxMind GeoLite databases. Including:
