@@ -39,7 +39,7 @@ Make sure you run `rm -f /container-setup/*` if you're not using the bundled `/c
 
 In order to make `TZ` and `APT_MIRROR` working with non-root user, `SETUID` bit was set on the script files. This can pose a security risk. To eliminates the risk you need to remove `SETUID` enabled scripts at container launch time. This is handled by the bundled `entrypoint.sh`.
 
-`/container-setup/` has `rwx` permission to allow deletion by any non-root users.
+`/container-setup/` has `rwx` permission to allow deletion of its content by a non-root user.
 
 ## Geoip variant
 The `:geoip` tag is a version includes the common MaxMind GeoLite databases. Including:
