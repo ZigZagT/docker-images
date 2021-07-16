@@ -11,7 +11,8 @@ docker pull deaddev/ubuntu-base
 - Set timezone with `TZ` environment variable
 - Set apt mirror via `APT_MIRROR` environment variable
 - Set arbitrary `UID` and `GID` at contaienr starting time
-- Disabled installing recommends and suggests for `apt-get`
+- Set container process niceness with `NICE` environment variable
+- No installing recommends and suggests from `apt-get`
 - HTTP ready. `curl`, `wget`, and `ca-certificates` are included in the image
 
 ## Usage
@@ -54,28 +55,35 @@ If you need to change `UID` and `GID` at container start time rather than with t
 
 The `UID` and `GID` only works with the bundled `ENTRYPOINT`. See the [Use Custom `ENTRYPOINT`](#use-custom-entrypoint) section for guides of using custom entrypoint script.
 
+## Set Niceness via `NICE` environment variable
+
+You may set the `NICE` environment variable to an integer between `-20` to `19` to adjust the container process niceness.
+
+Note: setting `NICE` to value lower than `0` would need both `CAP_SYS_NICE` capacity and root priviledge. A non-root user can only set `NICE` to a positive value. These are limitations posed by Linux kernel.
+
+This feature needs the bundled `ENTRYPOINT`. See the [Use Custom `ENTRYPOINT`](#use-custom-entrypoint) section for guides of using custom entrypoint script.
+
 ## Use Custom `ENTRYPOINT`
 
-This `ENTRYPOINT` script buneled in the image is used to achive all the run-time features listed above (build time features are not affected). To make everything work with an custom `ENTRYPOINT` script, use this command in your `ENTRYPOINT` script where you're about to starting the container command:
+The `ENTRYPOINT` script buneled with image is used for the features listed above. To make everything work with custom `ENTRYPOINT` script, use this command in your `ENTRYPOINT` script for starting the container process:
 
 ```sh
-// equivalent to exec "$@"
 /container-setup/entrypoint.sh "$@"
 ```
 
 You can think it as a equivalent of `exec "$@"`, but with all the perks provided by the image.
 
-If you don't call `/container-setup/entrypoint.sh` in your `ENTRYPOINT`, the container would run, but the features passed by environment variables wouldn't be effective.
+If you don't use `/container-setup/entrypoint.sh`, the container would run, but the features environment variables wouldn't be effective.
 
 ### Security Caveat
 
-In order to make `TZ` and `APT_MIRROR` working with non-root user, `SETUID` bit was set on the scripts in `/container-setu`. This may pose a security risk depends on your security requirements. To eliminates the risk you need to remove those scripts at container launch time. This is handled by the bundled `entrypoint.sh`.
+In order to make `TZ` and `APT_MIRROR` working with non-root user, `SETUID` bit was set on the scripts in `/container-setup/*.sh.x`. This may pose a security risk depends on your security requirements. To eliminates the risk you need to remove those scripts at container launch time. This is handled by the bundled `entrypoint.sh`.
 
-A result of the mitigation is that `/container-setup/` has `777` permission so it allow deletion of its content by any user.
+A side-effect of this mitigation is that `/container-setup/` has `777` permission so it allow deletion of its content by any user.
 
 In short, it's highly recommended to use the bundled `/container-setup/entrypoint.sh` at all time since it takes care of all the boilerplates.
 
-The bottom line is you should at least run `rm -f /container-setup/*` if you insist of not using `/container-setup/entrypoint.sh`.
+The bottom line is you should at least run `rm -f /container-setup/*.sh.x` if you insist of not using `/container-setup/entrypoint.sh`.
 
 ## Geoip variant
 The `:geoip` tag is a version includes the common MaxMind GeoLite databases. Including:

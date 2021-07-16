@@ -28,7 +28,7 @@ RUN echo 'APT::Install-Recommends "false";' >> /etc/apt/apt.conf.d/99_norecommen
     && rm -f /container-setup/*.sh.x.c \
     && apt-get purge -y build-essential shc \
     && apt-get autoremove -y --purge \
-    && /container-setup/setup-tz.sh.x
+    && /container-setup/setup-tz.sh
 
 ENTRYPOINT ["/container-setup/entrypoint.sh"]
 CMD ["/bin/bash"]
