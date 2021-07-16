@@ -1,21 +1,24 @@
 FROM ubuntu:20.04
-ENV TERM=xterm-256color DEBIAN_FRONTEND=noninteractive
+ENV LANG=C.UTF-8 TERM=xterm-256color DEBIAN_FRONTEND=noninteractive
 ARG APT_MIRROR
 ARG TZ
 COPY setup-tz.sh setup-apt.sh entrypoint.sh /container-setup/
-RUN echo archive.ubuntu.com > /apt-mirror.txt \
-    && /container-setup/setup-apt.sh \
-    && echo 'APT::Install-Recommends "false";' >> /etc/apt/apt.conf.d/99_norecommends \
+
+RUN echo 'APT::Install-Recommends "false";' >> /etc/apt/apt.conf.d/99_norecommends \
     && echo 'APT::Install-Suggests "false";' >> /etc/apt/apt.conf.d/99_norecommends \
     && echo 'APT::AutoRemove::RecommendsImportant "false";' >> /etc/apt/apt.conf.d/99_norecommends \
     && echo 'APT::AutoRemove::SuggestsImportant "false";' >> /etc/apt/apt.conf.d/99_norecommends \
+    && apt-get update \
+    && apt-get install --no-install-recommends -y \
+        ca-certificates \
+    && grep -v -E '^(#|\s*$)' /etc/apt/sources.list | head -n 1 | cut -d ' ' -f 2 > /apt-mirror.txt \
+    && /container-setup/setup-apt.sh \
     && apt-get update \
     && apt-get install --no-install-recommends -y \
         tzdata \
         wget \
         curl \
         unzip \
-        ca-certificates \
         shc \
         build-essential \
     && shc -r -S -f /container-setup/setup-apt.sh -v \

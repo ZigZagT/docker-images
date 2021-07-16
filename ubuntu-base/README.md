@@ -6,40 +6,76 @@ A minimal ubuntu images with life-quality-improvements built in.
 docker pull deaddev/ubuntu-base
 ```
 
+## Features
+
+- Set timezone with `TZ` environment variable
+- Set apt mirror via `APT_MIRROR` environment variable
+- Set arbitrary `UID` and `GID` at contaienr starting time
+- Disabled installing recommends and suggests for `apt-get`
+- HTTP ready. `curl`, `wget`, and `ca-certificates` are included in the image
+
 ## Usage
 
-1. Timezone can be set via `TZ` environment variable. Supports both build time and run time.
-    - for build time, set `build-arg` like `docker build --build-arg TZ=America/Vancouver`
-    - for run time, set `environment` like `docker run -e TZ=America/Vancouver`
-2. Set apt mirror via `APT_MIRROR` environment variable. Also supports both build time and run time:
-    - for build time, set `build-arg` like `docker build --build-arg APT_MIRROR=us.archive.ubuntu.com`
-    - for run time, set `environment` like `docker run -e APT_MIRROR=us.archive.ubuntu.com`
-    - you may find a mirror from https://launchpad.net/ubuntu/+archivemirrors
-3. Set `UID` and `GID` environment variables to switch to an arbitrary user settings.
-    - Note: When using this feature, make sure your container process has the permission to change user/group.
-4. Disabled installing recommends and suggests for `apt-get`.
-5. HTTP ready. `curl` and `wget` are included in the image.
+### Set timezone with `TZ` environment variable
 
-Both `TZ` and `APT_MIRROR` works with non-root user. So you can freely use `USER` command in `Dockerfile`.
+#### Build time usage
 
-### Use Custom `ENTRYPOINT`
+For build time, use `build-arg` to set the environment variable like `docker build --build-arg TZ=America/Vancouver`, and then add `RUN /container-setup/setup-apt.sh` in your `Dockerfile`.
 
-This image comes with an `ENTRYPOINT` script to achive all the run-time features listed above (build time features are not affected). To make everything work with an custom `ENTRYPOINT` script, use this command in your `ENTRYPOINT` script where you're about to starting the container command:
+#### Runtime usage
+
+If you're not overriding the `ENTRYPOINT` comes with the image, you may simply set `environment` like `docker run -e TZ=America/Vancouver`. Everything would just work. And this even supports non-root users.
+
+See the [Use Custom `ENTRYPOINT`](#use-custom-entrypoint) section for guides of using custom entrypoint script.
+
+### Set apt mirror via `APT_MIRROR` environment variable
+
+#### Build time usage
+
+For build time, use `build-arg` to set the environment variable like `docker build --build-arg APT_MIRROR=http://archive.ubuntu.com/ubuntu/`, and then add `RUN /container-setup/setup-tz.sh` in your `Dockerfile`.
+
+#### Runtime usage
+
+If you're not overriding the `ENTRYPOINT` comes with the image, you may simply set `environment` like `docker run -e APT_MIRROR=http://archive.ubuntu.com/ubuntu/`. Everything would just work. And this even supports non-root users.
+
+See the [Use Custom `ENTRYPOINT`](#use-custom-entrypoint) section for guides of using custom entrypoint script.
+
+you may find a mirror near to you on https://launchpad.net/ubuntu/+archivemirrors
+
+### Change `UID` and `GID` at run time
+
+If you need to change `UID` and `GID` at container start time rather than with the `USER` command in `Dockerfile`, the `UID` and `GID` environment variables are just for you.
+
+`UID` and `GID` settings are for runtime only.
+
+- Upon starting, the container will switch to the arbitrary user and/or group specified by the `UID` and `GID` settings.
+- You can specify either `UID`, or `GUI`, or both, non none. The freedom is yours.
+- Note: when using this feature, make sure your container starting has the permission to switch user/group. This wouldn't be a problem if you don't use `USER` command in `Dockerfile`.
+
+The `UID` and `GID` only works with the bundled `ENTRYPOINT`. See the [Use Custom `ENTRYPOINT`](#use-custom-entrypoint) section for guides of using custom entrypoint script.
+
+## Use Custom `ENTRYPOINT`
+
+This `ENTRYPOINT` script buneled in the image is used to achive all the run-time features listed above (build time features are not affected). To make everything work with an custom `ENTRYPOINT` script, use this command in your `ENTRYPOINT` script where you're about to starting the container command:
 
 ```sh
 // equivalent to exec "$@"
 /container-setup/entrypoint.sh "$@"
 ```
 
-This usually replaces `exec "$@"` in a typical `ENTRYPOINT` script.
+You can think it as a equivalent of `exec "$@"`, but with all the perks provided by the image.
 
-## Caveats
+If you don't call `/container-setup/entrypoint.sh` in your `ENTRYPOINT`, the container would run, but the features passed by environment variables wouldn't be effective.
 
-Make sure you run `rm -f /container-setup/*` if you're not using the bundled `/container-setup/entrypoint.sh` script at all.
+### Security Caveat
 
-In order to make `TZ` and `APT_MIRROR` working with non-root user, `SETUID` bit was set on the script files. This can pose a security risk. To eliminates the risk you need to remove `SETUID` enabled scripts at container launch time. This is handled by the bundled `entrypoint.sh`.
+In order to make `TZ` and `APT_MIRROR` working with non-root user, `SETUID` bit was set on the scripts in `/container-setu`. This may pose a security risk depends on your security requirements. To eliminates the risk you need to remove those scripts at container launch time. This is handled by the bundled `entrypoint.sh`.
 
-`/container-setup/` has `rwx` permission to allow deletion of its content by a non-root user.
+A result of the mitigation is that `/container-setup/` has `777` permission so it allow deletion of its content by any user.
+
+In short, it's highly recommended to use the bundled `/container-setup/entrypoint.sh` at all time since it takes care of all the boilerplates.
+
+The bottom line is you should at least run `rm -f /container-setup/*` if you insist of not using `/container-setup/entrypoint.sh`.
 
 ## Geoip variant
 The `:geoip` tag is a version includes the common MaxMind GeoLite databases. Including:
