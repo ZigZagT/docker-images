@@ -10,5 +10,21 @@ if [[ ! -f /tmp/CONTAINER_HAS_STARTED ]]; then
 fi
 echo 1 > /tmp/CONTAINER_HAS_STARTED
 
-nice -n ${NICE:-0} setpriv --groups=tty --regid ${GID:-$(id -g)} --reuid ${UID:-$(id -u)} "$@"
+CH_NICE=""
+CH_UID=""
+CH_GID=""
+
+if [[ -n "$NICE" ]]; then
+    CH_NICE="nice -n ${NICE}"
+fi
+
+if [[ -n "$UID" ]]; then
+    CH_UID="--reuid ${UID}"
+fi
+
+if [[ -n "$GID" ]]; then
+    CH_GID="--groups=tty --regid ${GID}"
+fi
+
+$CH_NICE setpriv $CH_UID $CH_GID "$@"
 

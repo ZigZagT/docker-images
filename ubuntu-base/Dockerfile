@@ -23,9 +23,11 @@ RUN echo 'APT::Install-Recommends "false";' >> /etc/apt/apt.conf.d/99_norecommen
         build-essential \
     && shc -r -S -f /container-setup/setup-apt.sh -v \
     && shc -r -S -f /container-setup/setup-tz.sh -v \
-    && chmod u+s /container-setup/setup-apt.sh.x /container-setup/setup-tz.sh.x \
-    && chmod a+w /container-setup \
     && rm -f /container-setup/*.sh.x.c \
+    && chmod 0700 /container-setup/setup-apt.sh /container-setup/setup-tz.sh \
+    && chmod 4755 /container-setup/setup-apt.sh.x /container-setup/setup-tz.sh.x \
+    && chmod 0755 /container-setup/entrypoint.sh \
+    && chmod 0733 /container-setup \
     && apt-get purge -y build-essential shc \
     && apt-get autoremove -y --purge \
     && /container-setup/setup-tz.sh
