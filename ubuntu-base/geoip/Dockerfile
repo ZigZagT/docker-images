@@ -1,4 +1,5 @@
-FROM deaddev/ubuntu-base as builder
+ARG UPSTREAM_TAG
+FROM deaddev/ubuntu-base:$UPSTREAM_TAG as builder
 ARG LICENSE_KEY
 # invalidate build cache if versions has changed
 COPY MAXMIND_VERSIONS /MAXMIND_VERSIONS
@@ -19,6 +20,6 @@ RUN cd /tmp \
     && mkdir -p /usr/share/GeoIP \
     && ln -s /var/GeoLite2-*.mmdb /usr/share/GeoIP
 
-FROM deaddev/ubuntu-base
+FROM deaddev/ubuntu-base:$UPSTREAM_TAG
 COPY --from=builder /MAXMIND_VERSIONS /MAXMIND_VERSIONS
 COPY --from=builder /usr/share/GeoIP /usr/share/GeoIP

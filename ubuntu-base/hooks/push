@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -e
+DIR="$(dirname "$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )")"
+
+push_with_upstream_tag() {
+  UPSTREAM_TAG=$1
+  TAG_ALIAS=$2
+  if [[ -z $TAG_ALIAS ]]; then
+    docker push deaddev/ubuntu-base:$UPSTREAM_TAG
+  else
+    docker tag deaddev/ubuntu-base:$UPSTREAM_TAG deaddev/ubuntu-base:$TAG_ALIAS
+    docker push deaddev/ubuntu-base:$TAG_ALIAS
+  fi
+}
+
+push_with_upstream_tag 20.04
+push_with_upstream_tag 20.04 latest
+push_with_upstream_tag 21.04
+

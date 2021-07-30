@@ -10,8 +10,6 @@ docker pull deaddev/ubuntu-base
 
 - Set timezone with `TZ` environment variable
 - Set apt mirror via `APT_MIRROR` environment variable
-- Set arbitrary `UID` and `GID` at contaienr starting time
-- Set container process niceness with `NICE` environment variable
 - No installing recommends and suggests from `apt-get`
 - HTTP ready. `curl`, `wget`, and `ca-certificates` are included in the image
 
@@ -43,26 +41,6 @@ See the [Use Custom `ENTRYPOINT`](#use-custom-entrypoint) section for guides of 
 
 you may find a mirror near to you on https://launchpad.net/ubuntu/+archivemirrors
 
-### Change `UID` and `GID` at run time
-
-If you need to change `UID` and `GID` at container start time rather than with the `USER` command in `Dockerfile`, the `UID` and `GID` environment variables are just for you.
-
-`UID` and `GID` settings are for runtime only.
-
-- Upon starting, the container will switch to the arbitrary user and/or group specified by the `UID` and `GID` settings.
-- You can specify either `UID`, or `GUI`, or both, non none. The freedom is yours.
-- Note: when using this feature, make sure your container starting has the permission to switch user/group. This wouldn't be a problem if you don't use `USER` command in `Dockerfile`.
-
-The `UID` and `GID` only works with the bundled `ENTRYPOINT`. See the [Use Custom `ENTRYPOINT`](#use-custom-entrypoint) section for guides of using custom entrypoint script.
-
-## Set Niceness via `NICE` environment variable
-
-You may set the `NICE` environment variable to an integer between `-20` to `19` to adjust the container process niceness.
-
-Note: setting `NICE` to value lower than `0` would need both `CAP_SYS_NICE` capacity and root priviledge. A non-root user can only set `NICE` to a positive value. These are limitations posed by Linux kernel.
-
-This feature needs the bundled `ENTRYPOINT`. See the [Use Custom `ENTRYPOINT`](#use-custom-entrypoint) section for guides of using custom entrypoint script.
-
 ## Use Custom `ENTRYPOINT`
 
 The `ENTRYPOINT` script buneled with image is used for the features listed above. To make everything work with custom `ENTRYPOINT` script, use this command in your `ENTRYPOINT` script for starting the container process:
@@ -90,32 +68,4 @@ The `:geoip` tag is a version includes the common MaxMind GeoLite databases. Inc
 - `/usr/share/GeoIP/GeoLite2-ASN.mmdb`
 - `/usr/share/GeoIP/GeoLite2-City.mmdb`
 - `/usr/share/GeoIP/GeoLite2-Country.mmdb`
-
-## Troubleshooting
-
-### Permission Denined for `/dev/stdout` and `/dev/stderr`
-
-This happens when a container initializes with root user and then drop to non-root internally. (i.e. with `UID` and `GID` environments)
-
-https://github.com/moby/moby/issues/31243#issuecomment-406879017
-
-Workaround 1: use tty for the container.
-
-`docker run --tty`
-
-or add `tty: true` to docker-compose file.
-
-Workaround 2:
-
-https://github.com/moby/moby/issues/6880#issuecomment-270723812
-
-Run this snippet prior to your CMD
-
-```
-mkfifo -m 600 /tmp/logpipe
-cat <> /tmp/logpipe 1>&2 &
-
-```
-
-and then write to `/tmp/logpipe`
 

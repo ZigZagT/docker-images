@@ -15,5 +15,24 @@ add_version GeoLite2-Country
 add_version GeoLite2-City
 add_version GeoLite2-ASN
 
-docker build "$DIR" -t deaddev/ubuntu-base:geoip-builder --build-arg "LICENSE_KEY=${LICENSE_KEY}" --target builder
-docker build "$DIR" -t deaddev/ubuntu-base:geoip --build-arg "LICENSE_KEY=${LICENSE_KEY}" --cache-from deaddev/ubuntu-base:geoip-builder,deaddev/ubuntu-base:geoip
+
+build_with_upstream_tag() {
+  UPSTREAM_TAG=$1
+
+  docker build "$DIR" -t deaddev/ubuntu-base:${UPSTREAM_TAG}-geoip-builder --build-arg UPSTREAM_TAG=$UPSTREAM_TAG --build-arg "LICENSE_KEY=${LICENSE_KEY}" --target builder
+
+  docker build "$DIR" \
+    -t deaddev/ubuntu-base:${UPSTREAM_TAG}-geoip \
+    --build-arg UPSTREAM_TAG=$UPSTREAM_TAG \
+    --build-arg "LICENSE_KEY=${LICENSE_KEY}" \
+    --cache-from deaddev/ubuntu-base:${UPSTREAM_TAG}-geoip-builder,deaddev/ubuntu-base:${UPSTREAM_TAG}-geoip
+}
+
+if [[ -z $UPSTREAM_TAG ]]; then
+  build_with_upstream_tag 20.04
+  build_with_upstream_tag 21.04
+else
+  build_with_upstream_tag ${UPSTREAM_TAG}
+  docker tag deaddev/ubuntu-base:${UPSTREAM_TAG}-geoip deaddev/ubuntu-base:geoip
+fi
+

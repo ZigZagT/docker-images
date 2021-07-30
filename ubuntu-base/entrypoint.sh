@@ -10,21 +10,4 @@ if [[ ! -f /container-setup/CONTAINER_HAS_STARTED ]]; then
 fi
 echo 1 > /container-setup/CONTAINER_HAS_STARTED
 
-CH_NICE=""
-CH_UID=""
-CH_GID=""
-
-if [[ -n "$NICE" ]]; then
-    CH_NICE="nice -n ${NICE}"
-fi
-
-if [[ -n "$UID" ]]; then
-    CH_UID="--reuid ${UID}"
-fi
-
-if [[ -n "$GID" ]]; then
-    CH_GID="--groups=tty --regid ${GID}"
-fi
-
-$CH_NICE setpriv $CH_UID $CH_GID "$@"
-
+exec "$@"
