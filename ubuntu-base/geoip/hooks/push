@@ -14,6 +14,6 @@ push_with_upstream_tag() {
 }
 
 push_with_upstream_tag 20.04
-push_with_upstream_tag 20.04 geoip
-push_with_upstream_tag 21.04
+push_with_upstream_tag 22.04
+push_with_upstream_tag 22.04 geoip
 
