@@ -12,7 +12,6 @@ RUN echo 'APT::Install-Recommends "false";' >> /etc/apt/apt.conf.d/99_norecommen
     && apt-get update \
     && apt-get install --no-install-recommends -y \
         ca-certificates \
-    && grep -v -E '^(#|\s*$)' /etc/apt/sources.list | head -n 1 | cut -d ' ' -f 2 > /apt-mirror.txt \
     && /container-setup/setup-apt.sh \
     && apt-get update \
     && apt-get install --no-install-recommends -y \
