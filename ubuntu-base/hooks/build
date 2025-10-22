@@ -9,9 +9,10 @@ build_with_upstream_tag() {
   docker build "$DIR" $BUILD_ARGS -t deaddev/ubuntu-base:$UPSTREAM_TAG --build-arg UPSTREAM_TAG=$UPSTREAM_TAG
 }
 
-if [[ -z "UPSTREAM_TAG" ]]; then
+if [[ -z "$UPSTREAM_TAG" ]]; then
   build_with_upstream_tag 20.04
   build_with_upstream_tag 22.04
+  build_with_upstream_tag 24.04
 else
   build_with_upstream_tag ${UPSTREAM_TAG}
   docker tag deaddev/ubuntu-base:${UPSTREAM_TAG} deaddev/ubuntu-base:latest

@@ -31,6 +31,7 @@ build_with_upstream_tag() {
 if [[ -z $UPSTREAM_TAG ]]; then
   build_with_upstream_tag 20.04
   build_with_upstream_tag 22.04
+  build_with_upstream_tag 24.04
 else
   build_with_upstream_tag ${UPSTREAM_TAG}
   docker tag deaddev/ubuntu-base:${UPSTREAM_TAG}-geoip deaddev/ubuntu-base:geoip

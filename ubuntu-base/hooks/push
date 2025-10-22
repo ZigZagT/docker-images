@@ -15,5 +15,6 @@ push_with_upstream_tag() {
 
 push_with_upstream_tag 20.04
 push_with_upstream_tag 22.04
-push_with_upstream_tag 22.04 latest
+push_with_upstream_tag 24.04
+push_with_upstream_tag 24.04 latest
 
