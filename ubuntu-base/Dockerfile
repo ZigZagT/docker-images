@@ -18,6 +18,7 @@ RUN echo 'APT::Install-Recommends "false";' >> /etc/apt/apt.conf.d/99_norecommen
         tzdata \
         wget \
         curl \
+        jq \
         unzip \
         shc \
         build-essential \
