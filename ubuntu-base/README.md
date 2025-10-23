@@ -1,10 +1,14 @@
 # Ubuntu Base
 
-A minimal ubuntu images with life-quality-improvements built in.
+Minimal Ubuntu images with quality-of-life improvements built in.
 
 ```bash
 docker pull deaddev/ubuntu-base
+docker pull deaddev/ubuntu-base:22.04
+docker pull deaddev/ubuntu-base:latest
 ```
+
+All images are built for **linux/amd64** and **linux/arm64** platforms.
 
 ## Features
 
@@ -63,9 +67,6 @@ In short, it's highly recommended to use the bundled `/container-setup/entrypoin
 
 The bottom line is you should at least run `rm -f /container-setup/*.sh.x` if you insist of not using `/container-setup/entrypoint.sh`.
 
-## Geoip variant
-The `:geoip` tag is a version includes the common MaxMind GeoLite databases. Including:
-- `/usr/share/GeoIP/GeoLite2-ASN.mmdb`
-- `/usr/share/GeoIP/GeoLite2-City.mmdb`
-- `/usr/share/GeoIP/GeoLite2-Country.mmdb`
+## GeoIP Variant
 
+For images with MaxMind GeoIP databases, see the separate [ubuntu-base-geoip](../ubuntu-base-geoip/README.md) image.

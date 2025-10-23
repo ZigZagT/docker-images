@@ -1,9 +1,10 @@
 ARG UPSTREAM_TAG
 FROM deaddev/ubuntu-base:$UPSTREAM_TAG as builder
-ARG LICENSE_KEY
 # invalidate build cache if versions has changed
 COPY MAXMIND_VERSIONS /MAXMIND_VERSIONS
-RUN cd /tmp \
+RUN --mount=type=secret,id=maxmind_license_key \
+    cd /tmp \
+    && LICENSE_KEY=$(cat /run/secrets/maxmind_license_key) \
     && mkdir -p /usr/share/GeoIP \
     && echo download GeoLite2-Country ... \
     && wget "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-Country&license_key=${LICENSE_KEY}&suffix=tar.gz" -O GeoLite2-Country.tar.gz \

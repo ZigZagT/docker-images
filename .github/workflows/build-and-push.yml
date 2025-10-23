@@ -1,0 +1,386 @@
+name: Build and Push Docker Images
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+    inputs:
+      upstream_tags:
+        description: 'Ubuntu versions to build (space-separated)'
+        required: false
+        default: '20.04 22.04 24.04'
+        type: string
+      latest_tag:
+        description: 'Which Ubuntu version should the "latest" tag point to'
+        required: false
+        default: '22.04'
+        type: string
+  schedule:
+    # At 00:00 on Saturday https://crontab.guru/#0_0_*_*_6
+    - cron: '0 0 * * 6'
+
+env:
+  UPSTREAM_TAGS: ${{ github.event.inputs.upstream_tags || '20.04 22.04 24.04' }}
+  LATEST_TAG: ${{ github.event.inputs.latest_tag || '22.04' }}
+
+jobs:
+  detect-changes:
+    name: Detect Changed Images
+    runs-on: ubuntu-latest
+    environment: action-build-and-push
+    outputs:
+      ubuntu-base: ${{ steps.changes.outputs.ubuntu-base }}
+      ubuntu-base-geoip: ${{ steps.changes.outputs.ubuntu-base-geoip }}
+      dnsmasq-exporter: ${{ steps.changes.outputs.dnsmasq-exporter }}
+      sqitch-pg: ${{ steps.changes.outputs.sqitch-pg }}
+      wait-for-pg: ${{ steps.changes.outputs.wait-for-pg }}
+      any-changes: ${{ steps.changes.outputs.any-changes }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get last successful build commit
+        id: last-build
+        run: |
+          # Try to get the commit SHA from the last successful workflow run
+          LAST_SUCCESS=$(gh run list \
+            --workflow=build-and-push.yml \
+            --branch=master \
+            --status=success \
+            --limit=1 \
+            --json headSha \
+            --jq '.[0].headSha' 2>/dev/null || echo "")
+
+          if [[ -n "$LAST_SUCCESS" ]]; then
+            echo "last-success-sha=$LAST_SUCCESS" >> $GITHUB_OUTPUT
+            echo "Found last successful build at commit: $LAST_SUCCESS"
+          else
+            echo "last-success-sha=" >> $GITHUB_OUTPUT
+            echo "No previous successful build found"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Restore MaxMind versions cache
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/maxmind_versions_cached_last_build.txt
+          key: maxmind-versions-
+          restore-keys: |
+            maxmind-versions-
+
+      - name: Check MaxMind database versions
+        id: maxmind
+        run: |
+          # Get current versions and compare with cached version from last successful build
+          if ./scripts/get-and-compare-maxmind-versions.sh \
+            --key "${{ secrets.MAXMIND_LICENSE_KEY }}" \
+            --output /tmp/maxmind_versions_upstream_latest.txt \
+            --input /tmp/maxmind_versions_cached_last_build.txt | grep -q "changed=true"; then
+            echo "maxmind-changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "maxmind-changed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Detect changes
+        id: changes
+        run: |
+          # For scheduled runs or manual triggers, build all images
+          if [[ "${{ github.event_name }}" == "schedule" ]] || [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "ubuntu-base=true" >> $GITHUB_OUTPUT
+            echo "ubuntu-base-geoip=true" >> $GITHUB_OUTPUT
+            echo "dnsmasq-exporter=true" >> $GITHUB_OUTPUT
+            echo "sqitch-pg=true" >> $GITHUB_OUTPUT
+            echo "wait-for-pg=true" >> $GITHUB_OUTPUT
+            echo "any-changes=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Determine base reference for comparison
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            # For PRs, compare against base branch
+            BASE_REF="${{ github.event.pull_request.base.sha }}"
+          else
+            # For pushes, use last successful build commit
+            if [[ -n "${{ steps.last-build.outputs.last-success-sha }}" ]]; then
+              BASE_REF="${{ steps.last-build.outputs.last-success-sha }}"
+              echo "Comparing against last successful build: $BASE_REF"
+            else
+              # No previous successful build found - build everything to be safe
+              echo "No previous successful build found, building all images"
+              echo "ubuntu-base=true" >> $GITHUB_OUTPUT
+              echo "ubuntu-base-geoip=true" >> $GITHUB_OUTPUT
+              echo "dnsmasq-exporter=true" >> $GITHUB_OUTPUT
+              echo "sqitch-pg=true" >> $GITHUB_OUTPUT
+              echo "wait-for-pg=true" >> $GITHUB_OUTPUT
+              echo "any-changes=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          fi
+
+          # Check each image directory for changes
+          ANY_CHANGES=false
+
+          if ./scripts/has-git-diff-at-path.sh ubuntu-base "$BASE_REF"; then
+            echo "ubuntu-base=true" >> $GITHUB_OUTPUT
+            echo "ubuntu-base-geoip=true" >> $GITHUB_OUTPUT  # geoip depends on base
+            ANY_CHANGES=true
+          else
+            echo "ubuntu-base=false" >> $GITHUB_OUTPUT
+            # Check geoip separately (code changes or MaxMind updates)
+            if ./scripts/has-git-diff-at-path.sh ubuntu-base-geoip "$BASE_REF" || [[ "${{ steps.maxmind.outputs.maxmind-changed }}" == "true" ]]; then
+              echo "ubuntu-base-geoip=true" >> $GITHUB_OUTPUT
+              ANY_CHANGES=true
+            else
+              echo "ubuntu-base-geoip=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+          if ./scripts/has-git-diff-at-path.sh dnsmasq_exporter "$BASE_REF"; then
+            echo "dnsmasq-exporter=true" >> $GITHUB_OUTPUT
+            ANY_CHANGES=true
+          else
+            echo "dnsmasq-exporter=false" >> $GITHUB_OUTPUT
+          fi
+
+          if ./scripts/has-git-diff-at-path.sh sqitch-pg "$BASE_REF"; then
+            echo "sqitch-pg=true" >> $GITHUB_OUTPUT
+            ANY_CHANGES=true
+          else
+            echo "sqitch-pg=false" >> $GITHUB_OUTPUT
+          fi
+
+          if ./scripts/has-git-diff-at-path.sh wait-for-pg "$BASE_REF"; then
+            echo "wait-for-pg=true" >> $GITHUB_OUTPUT
+            ANY_CHANGES=true
+          else
+            echo "wait-for-pg=false" >> $GITHUB_OUTPUT
+          fi
+
+          echo "any-changes=$ANY_CHANGES" >> $GITHUB_OUTPUT
+
+  build-ubuntu-base:
+    name: Build ubuntu-base
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.ubuntu-base == 'true'
+    environment: action-build-and-push
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to DockerHub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push ubuntu-base images
+        if: github.event_name != 'pull_request'
+        run: |
+          for UPSTREAM_TAG in ${{ env.UPSTREAM_TAGS }}; do
+            docker buildx build ubuntu-base \
+              --platform linux/amd64,linux/arm64 \
+              --build-arg UPSTREAM_TAG=${UPSTREAM_TAG} \
+              -t ${{ vars.DOCKERHUB_USERNAME }}/ubuntu-base:${UPSTREAM_TAG} \
+              --cache-from ${{ vars.DOCKERHUB_USERNAME }}/ubuntu-base:${UPSTREAM_TAG} \
+              --push
+          done
+          # Tag latest with the specified version
+          docker buildx imagetools create \
+            -t ${{ vars.DOCKERHUB_USERNAME }}/ubuntu-base:latest \
+            ${{ vars.DOCKERHUB_USERNAME }}/ubuntu-base:${{ env.LATEST_TAG }}
+
+      - name: Build ubuntu-base images (PR - no push)
+        if: github.event_name == 'pull_request'
+        run: |
+          for UPSTREAM_TAG in ${{ env.UPSTREAM_TAGS }}; do
+            docker buildx build ubuntu-base \
+              --platform linux/amd64,linux/arm64 \
+              --build-arg UPSTREAM_TAG=${UPSTREAM_TAG} \
+              -t ${{ vars.DOCKERHUB_USERNAME }}/ubuntu-base:${UPSTREAM_TAG} \
+              --cache-from ${{ vars.DOCKERHUB_USERNAME }}/ubuntu-base:${UPSTREAM_TAG}
+          done
+
+      - name: Sync README to DockerHub
+        if: github.event_name != 'pull_request'
+        run: |
+          ./scripts/sync-readme.sh ubuntu-base/README.md ${{ vars.DOCKERHUB_USERNAME }}/ubuntu-base
+        env:
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+
+  build-ubuntu-base-geoip:
+    name: Build ubuntu-base-geoip
+    runs-on: ubuntu-latest
+    needs: [detect-changes, build-ubuntu-base]
+    if: |
+      always() &&
+      needs.detect-changes.outputs.ubuntu-base-geoip == 'true' &&
+      (needs.build-ubuntu-base.result == 'success' || needs.build-ubuntu-base.result == 'skipped')
+    environment: action-build-and-push
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to DockerHub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Generate current MAXMIND_VERSIONS
+        if: github.event_name != 'pull_request'
+        run: |
+          # Generate fresh version file for this build
+          ./scripts/get-and-compare-maxmind-versions.sh \
+            --key "${{ secrets.MAXMIND_LICENSE_KEY }}" \
+            --output ubuntu-base-geoip/MAXMIND_VERSIONS
+          echo "MAXMIND_VERSIONS for build:"
+          cat ubuntu-base-geoip/MAXMIND_VERSIONS
+        env:
+          MAXMIND_LICENSE_KEY: ${{ secrets.MAXMIND_LICENSE_KEY }}
+
+      - name: Build and push ubuntu-base-geoip images
+        if: github.event_name != 'pull_request'
+        run: |
+          for UPSTREAM_TAG in ${{ env.UPSTREAM_TAGS }}; do
+            docker buildx build ubuntu-base-geoip \
+              --platform linux/amd64,linux/arm64 \
+              --build-arg UPSTREAM_TAG=${UPSTREAM_TAG} \
+              --secret id=maxmind_license_key,env=MAXMIND_LICENSE_KEY \
+              -t ${{ vars.DOCKERHUB_USERNAME }}/ubuntu-base-geoip:${UPSTREAM_TAG} \
+              --cache-from ${{ vars.DOCKERHUB_USERNAME }}/ubuntu-base-geoip:${UPSTREAM_TAG} \
+              --push
+          done
+          # Tag latest with the specified version
+          docker buildx imagetools create \
+            -t ${{ vars.DOCKERHUB_USERNAME }}/ubuntu-base-geoip:latest \
+            ${{ vars.DOCKERHUB_USERNAME }}/ubuntu-base-geoip:${{ env.LATEST_TAG }}
+        env:
+          MAXMIND_LICENSE_KEY: ${{ secrets.MAXMIND_LICENSE_KEY }}
+
+      - name: Generate current MAXMIND_VERSIONS (PR)
+        if: github.event_name == 'pull_request'
+        run: |
+          # Generate fresh version file for this build
+          ./scripts/get-and-compare-maxmind-versions.sh \
+            --key "${{ secrets.MAXMIND_LICENSE_KEY }}" \
+            --output ubuntu-base-geoip/MAXMIND_VERSIONS
+          echo "MAXMIND_VERSIONS for build:"
+          cat ubuntu-base-geoip/MAXMIND_VERSIONS
+        env:
+          MAXMIND_LICENSE_KEY: ${{ secrets.MAXMIND_LICENSE_KEY }}
+
+      - name: Build ubuntu-base-geoip images (PR - no push)
+        if: github.event_name == 'pull_request'
+        run: |
+          for UPSTREAM_TAG in ${{ env.UPSTREAM_TAGS }}; do
+            docker buildx build ubuntu-base-geoip \
+              --platform linux/amd64,linux/arm64 \
+              --build-arg UPSTREAM_TAG=${UPSTREAM_TAG} \
+              --secret id=maxmind_license_key,env=MAXMIND_LICENSE_KEY \
+              -t ${{ vars.DOCKERHUB_USERNAME }}/ubuntu-base-geoip:${UPSTREAM_TAG} \
+              --cache-from ${{ vars.DOCKERHUB_USERNAME }}/ubuntu-base-geoip:${UPSTREAM_TAG}
+          done
+        env:
+          MAXMIND_LICENSE_KEY: ${{ secrets.MAXMIND_LICENSE_KEY }}
+
+      - name: Sync README to DockerHub
+        if: github.event_name != 'pull_request'
+        run: |
+          ./scripts/sync-readme.sh ubuntu-base-geoip/README.md ${{ vars.DOCKERHUB_USERNAME }}/ubuntu-base-geoip
+        env:
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Save MaxMind versions cache
+        if: github.event_name != 'pull_request'
+        uses: actions/cache/save@v4
+        with:
+          path: ubuntu-base-geoip/MAXMIND_VERSIONS
+          key: maxmind-versions-${{ github.run_id }}
+
+  build-other-images:
+    name: Build ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    environment: action-build-and-push
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: dnsmasq_exporter
+            dockerfile: dnsmasq_exporter/Dockerfile
+            tags: latest
+            output: dnsmasq-exporter
+          - image: sqitch-pg
+            dockerfile: sqitch-pg/Dockerfile
+            tags: latest
+            output: sqitch-pg
+          - image: wait-for-pg
+            dockerfile: wait-for-pg/Dockerfile
+            tags: latest
+            output: wait-for-pg
+    steps:
+      - name: Check if build needed
+        id: should-build
+        run: |
+          if [[ "${{ needs.detect-changes.outputs[matrix.output] }}" == "true" ]]; then
+            echo "build=true" >> $GITHUB_OUTPUT
+          else
+            echo "build=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout code
+        if: steps.should-build.outputs.build == 'true'
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        if: steps.should-build.outputs.build == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to DockerHub
+        if: steps.should-build.outputs.build == 'true' && github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push image
+        if: steps.should-build.outputs.build == 'true' && github.event_name != 'pull_request'
+        run: |
+          docker buildx build $(dirname ${{ matrix.dockerfile }}) \
+            --platform linux/amd64,linux/arm64 \
+            -t ${{ vars.DOCKERHUB_USERNAME }}/${{ matrix.image }}:${{ matrix.tags }} \
+            --push
+
+      - name: Build image (PR - no push)
+        if: steps.should-build.outputs.build == 'true' && github.event_name == 'pull_request'
+        run: |
+          docker buildx build $(dirname ${{ matrix.dockerfile }}) \
+            --platform linux/amd64,linux/arm64 \
+            -t ${{ vars.DOCKERHUB_USERNAME }}/${{ matrix.image }}:${{ matrix.tags }}
+
+      - name: Sync README to DockerHub
+        if: steps.should-build.outputs.build == 'true' && github.event_name != 'pull_request'
+        run: |
+          ./scripts/sync-readme.sh $(dirname ${{ matrix.dockerfile }})/README.md \
+            ${{ vars.DOCKERHUB_USERNAME }}/${{ matrix.image }}
+        env:
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
