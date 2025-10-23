@@ -17,7 +17,7 @@ on:
       latest_tag:
         description: 'Which Ubuntu version should the "latest" tag point to'
         required: false
-        default: '22.04'
+        default: '24.04'
         type: string
   schedule:
     # At 00:00 on Saturday https://crontab.guru/#0_0_*_*_6
@@ -25,7 +25,7 @@ on:
 
 env:
   UPSTREAM_TAGS: ${{ github.event.inputs.upstream_tags || '20.04 22.04 24.04' }}
-  LATEST_TAG: ${{ github.event.inputs.latest_tag || '22.04' }}
+  LATEST_TAG: ${{ github.event.inputs.latest_tag || '24.04' }}
 
 jobs:
   detect-changes:
