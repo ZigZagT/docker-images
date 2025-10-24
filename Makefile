@@ -51,12 +51,22 @@ ubuntu-base-geoip: ubuntu-base
 		echo "Error: MAXMIND_LICENSE_KEY environment variable is required"; \
 		exit 1; \
 	fi
-	@./scripts/get-and-compare-maxmind-versions.sh \
+	@echo "Checking MaxMind database versions..."
+	@MAXMIND_OUTPUT=$$(./scripts/get-and-compare-maxmind-versions.sh \
 		--key "$(MAXMIND_LICENSE_KEY)" \
-		--output ubuntu-base-geoip/MAXMIND_VERSIONS
-	@echo "Generated MAXMIND_VERSIONS file"
+		--output ubuntu-base-geoip/MAXMIND_VERSIONS 2>&1) || true; \
+	echo "$$MAXMIND_OUTPUT"; \
+	if echo "$$MAXMIND_OUTPUT" | grep -q "rate_limited=true"; then \
+		echo "MaxMind API rate limited - will reuse databases from previous image"; \
+		MAXMIND_DB_NO_UPDATE=true; \
+	else \
+		echo "MaxMind versions retrieved successfully"; \
+		MAXMIND_DB_NO_UPDATE=false; \
+	fi; \
+	echo "Building with MAXMIND_DB_NO_UPDATE=$$MAXMIND_DB_NO_UPDATE"; \
 	docker build ubuntu-base-geoip \
 		--build-arg UPSTREAM_TAG=$(UPSTREAM_TAG) \
+		--build-arg MAXMIND_DB_NO_UPDATE=$$MAXMIND_DB_NO_UPDATE \
 		--secret id=maxmind_license_key,env=MAXMIND_LICENSE_KEY \
 		-t ubuntu-base-geoip:$(LOCAL_TAG)
 	@echo "Successfully built ubuntu-base-geoip:$(LOCAL_TAG)"

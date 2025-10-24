@@ -51,6 +51,7 @@ jobs:
       sqitch-pg: ${{ steps.changes.outputs.sqitch-pg }}
       wait-for-pg: ${{ steps.changes.outputs.wait-for-pg }}
       any-changes: ${{ steps.changes.outputs.any-changes }}
+      maxmind-rate-limited: ${{ steps.maxmind.outputs.maxmind-rate-limited }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -91,12 +92,21 @@ jobs:
         id: maxmind
         run: |
           # Get current versions and compare with cached version from last successful build
-          if ./scripts/get-and-compare-maxmind-versions.sh \
+          OUTPUT=$(./scripts/get-and-compare-maxmind-versions.sh \
             --key "${{ secrets.MAXMIND_LICENSE_KEY }}" \
             --output /tmp/maxmind_versions_upstream_latest.txt \
-            --input /tmp/maxmind_versions_cached_last_build.txt | grep -q "changed=true"; then
+            --input /tmp/maxmind_versions_cached_last_build.txt)
+
+          echo "$OUTPUT"
+
+          if echo "$OUTPUT" | grep -q "rate_limited=true"; then
+            echo "maxmind-rate-limited=true" >> $GITHUB_OUTPUT
+            echo "maxmind-changed=false" >> $GITHUB_OUTPUT
+          elif echo "$OUTPUT" | grep -q "changed=true"; then
+            echo "maxmind-rate-limited=false" >> $GITHUB_OUTPUT
             echo "maxmind-changed=true" >> $GITHUB_OUTPUT
           else
+            echo "maxmind-rate-limited=false" >> $GITHUB_OUTPUT
             echo "maxmind-changed=false" >> $GITHUB_OUTPUT
           fi
 
@@ -259,13 +269,23 @@ jobs:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Restore MaxMind versions cache for build
+        if: github.event_name != 'pull_request'
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/maxmind_versions_for_build.txt
+          key: maxmind-versions-
+          restore-keys: |
+            maxmind-versions-
+
       - name: Generate current MAXMIND_VERSIONS
         if: github.event_name != 'pull_request'
         run: |
           # Generate fresh version file for this build
           ./scripts/get-and-compare-maxmind-versions.sh \
             --key "${{ secrets.MAXMIND_LICENSE_KEY }}" \
-            --output ubuntu-base-geoip/MAXMIND_VERSIONS
+            --output ubuntu-base-geoip/MAXMIND_VERSIONS \
+            --input /tmp/maxmind_versions_for_build.txt
           echo "MAXMIND_VERSIONS for build:"
           cat ubuntu-base-geoip/MAXMIND_VERSIONS
         env:
@@ -274,10 +294,17 @@ jobs:
       - name: Build and push ubuntu-base-geoip images
         if: github.event_name != 'pull_request'
         run: |
+          MAXMIND_NO_UPDATE="false"
+          if [[ "${{ needs.detect-changes.outputs.maxmind-rate-limited }}" == "true" ]]; then
+            echo "MaxMind API rate limited, reusing databases from previous image"
+            MAXMIND_NO_UPDATE="true"
+          fi
+
           for UPSTREAM_TAG in ${{ env.UPSTREAM_TAGS }}; do
             docker buildx build ubuntu-base-geoip \
               --platform linux/amd64,linux/arm64 \
               --build-arg UPSTREAM_TAG=${UPSTREAM_TAG} \
+              --build-arg MAXMIND_NO_UPDATE=${MAXMIND_NO_UPDATE} \
               --secret id=maxmind_license_key,env=MAXMIND_LICENSE_KEY \
               -t ${{ vars.DOCKERHUB_USERNAME }}/ubuntu-base-geoip:${UPSTREAM_TAG} \
               --cache-from ${{ vars.DOCKERHUB_USERNAME }}/ubuntu-base-geoip:${UPSTREAM_TAG} \
@@ -290,13 +317,23 @@ jobs:
         env:
           MAXMIND_LICENSE_KEY: ${{ secrets.MAXMIND_LICENSE_KEY }}
 
+      - name: Restore MaxMind versions cache for build (PR)
+        if: github.event_name == 'pull_request'
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/maxmind_versions_for_build.txt
+          key: maxmind-versions-
+          restore-keys: |
+            maxmind-versions-
+
       - name: Generate current MAXMIND_VERSIONS (PR)
         if: github.event_name == 'pull_request'
         run: |
           # Generate fresh version file for this build
           ./scripts/get-and-compare-maxmind-versions.sh \
             --key "${{ secrets.MAXMIND_LICENSE_KEY }}" \
-            --output ubuntu-base-geoip/MAXMIND_VERSIONS
+            --output ubuntu-base-geoip/MAXMIND_VERSIONS \
+            --input /tmp/maxmind_versions_for_build.txt
           echo "MAXMIND_VERSIONS for build:"
           cat ubuntu-base-geoip/MAXMIND_VERSIONS
         env:
@@ -305,10 +342,17 @@ jobs:
       - name: Build ubuntu-base-geoip images (PR - no push)
         if: github.event_name == 'pull_request'
         run: |
+          MAXMIND_NO_UPDATE="false"
+          if [[ "${{ needs.detect-changes.outputs.maxmind-rate-limited }}" == "true" ]]; then
+            echo "MaxMind API rate limited, reusing databases from previous image"
+            MAXMIND_NO_UPDATE="true"
+          fi
+
           for UPSTREAM_TAG in ${{ env.UPSTREAM_TAGS }}; do
             docker buildx build ubuntu-base-geoip \
               --platform linux/amd64,linux/arm64 \
               --build-arg UPSTREAM_TAG=${UPSTREAM_TAG} \
+              --build-arg MAXMIND_NO_UPDATE=${MAXMIND_NO_UPDATE} \
               --secret id=maxmind_license_key,env=MAXMIND_LICENSE_KEY \
               -t ${{ vars.DOCKERHUB_USERNAME }}/ubuntu-base-geoip:${UPSTREAM_TAG} \
               --cache-from ${{ vars.DOCKERHUB_USERNAME }}/ubuntu-base-geoip:${UPSTREAM_TAG}

@@ -56,18 +56,53 @@ fi
 get_version() {
   local EDITION=$1
   local URL="https://download.maxmind.com/app/geoip_download?edition_id=${EDITION}&license_key=${LICENSE_KEY}&suffix=tar.gz"
-  curl -sI "${URL}" | grep -i last-modified | tr -d '\r'
+  local RESPONSE=$(curl -sI "${URL}" 2>&1)
+  local HTTP_CODE=$(echo "${RESPONSE}" | grep -i "^HTTP" | tail -1 | awk '{print $2}')
+
+  # Check for rate limiting (429)
+  if [[ "${HTTP_CODE}" == "429" ]]; then
+    echo "Rate limited (429)" >&2
+    return 1
+  fi
+
+  echo "${RESPONSE}" | tee /dev/stderr | grep -i last-modified | tr -d '\r'
 }
 
 # Get current versions from MaxMind API
-CURRENT_VERSIONS=$(
-  echo "GeoLite2-Country"
-  get_version GeoLite2-Country
-  echo "GeoLite2-City"
-  get_version GeoLite2-City
-  echo "GeoLite2-ASN"
-  get_version GeoLite2-ASN
-)
+RATE_LIMITED=false
+CURRENT_VERSIONS=""
+
+for EDITION in GeoLite2-Country GeoLite2-City GeoLite2-ASN; do
+  CURRENT_VERSIONS="${CURRENT_VERSIONS}${EDITION}"$'\n'
+  if VERSION=$(get_version "${EDITION}"); then
+    CURRENT_VERSIONS="${CURRENT_VERSIONS}${VERSION}"$'\n'
+  else
+    echo "Warning: Failed to get version for ${EDITION}, likely rate limited" >&2
+    RATE_LIMITED=true
+    break
+  fi
+done
+
+# If rate limited, use cached versions if available, otherwise create empty version file
+if [[ "${RATE_LIMITED}" == "true" ]]; then
+  if [[ -n "${INPUT_FILE}" ]] && [[ -f "${INPUT_FILE}" ]]; then
+    echo "Using cached versions due to rate limiting" >&2
+    CURRENT_VERSIONS=$(cat "${INPUT_FILE}")
+    echo "${CURRENT_VERSIONS}" > "${OUTPUT_FILE}"
+  else
+    echo "Warning: Rate limited and no cached versions available, creating placeholder" >&2
+    # Create a placeholder version file to allow build to proceed with fallback
+    echo "GeoLite2-Country" > "${OUTPUT_FILE}"
+    echo "Last-Modified: Rate Limited - Using Previous Image" >> "${OUTPUT_FILE}"
+    echo "GeoLite2-City" >> "${OUTPUT_FILE}"
+    echo "Last-Modified: Rate Limited - Using Previous Image" >> "${OUTPUT_FILE}"
+    echo "GeoLite2-ASN" >> "${OUTPUT_FILE}"
+    echo "Last-Modified: Rate Limited - Using Previous Image" >> "${OUTPUT_FILE}"
+  fi
+  echo "rate_limited=true"
+  echo "changed=false"
+  exit 0
+fi
 
 # Write current versions to output file
 echo "${CURRENT_VERSIONS}" > "${OUTPUT_FILE}"
