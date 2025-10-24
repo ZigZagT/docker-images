@@ -19,6 +19,16 @@ on:
         required: false
         default: '24.04'
         type: string
+      tz:
+        description: 'Default timezone configured in the images'
+        required: false
+        default: 'America/Vancouver'
+        type: string
+      apt_mirror:
+        description: 'Default APT mirror URL (leave empty for default Ubuntu mirrors)'
+        required: false
+        default: ''
+        type: string
   schedule:
     # At 00:00 on Saturday https://crontab.guru/#0_0_*_*_6
     - cron: '0 0 * * 6'
@@ -26,6 +36,8 @@ on:
 env:
   UPSTREAM_TAGS: ${{ github.event.inputs.upstream_tags || '20.04 22.04 24.04' }}
   LATEST_TAG: ${{ github.event.inputs.latest_tag || '24.04' }}
+  TZ: ${{ github.event.inputs.tz || 'America/Vancouver' }}
+  APT_MIRROR: ${{ github.event.inputs.apt_mirror || '' }}
 
 jobs:
   detect-changes:
@@ -192,6 +204,8 @@ jobs:
             docker buildx build ubuntu-base \
               --platform linux/amd64,linux/arm64 \
               --build-arg UPSTREAM_TAG=${UPSTREAM_TAG} \
+              --build-arg TZ="${{ env.TZ }}" \
+              --build-arg APT_MIRROR="${{ env.APT_MIRROR }}" \
               -t ${{ vars.DOCKERHUB_USERNAME }}/ubuntu-base:${UPSTREAM_TAG} \
               --cache-from ${{ vars.DOCKERHUB_USERNAME }}/ubuntu-base:${UPSTREAM_TAG} \
               --push
@@ -208,6 +222,8 @@ jobs:
             docker buildx build ubuntu-base \
               --platform linux/amd64,linux/arm64 \
               --build-arg UPSTREAM_TAG=${UPSTREAM_TAG} \
+              --build-arg TZ="${{ env.TZ }}" \
+              --build-arg APT_MIRROR="${{ env.APT_MIRROR }}" \
               -t ${{ vars.DOCKERHUB_USERNAME }}/ubuntu-base:${UPSTREAM_TAG} \
               --cache-from ${{ vars.DOCKERHUB_USERNAME }}/ubuntu-base:${UPSTREAM_TAG}
           done
