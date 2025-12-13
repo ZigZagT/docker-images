@@ -59,13 +59,13 @@ If you don't use `/container-setup/entrypoint.sh`, the container would run, but 
 
 ### Security Caveat
 
-In order to make `TZ` and `APT_MIRROR` working with non-root user, `SETUID` bit was set on the scripts in `/container-setup/*.sh.x`. This may pose a security risk depends on your security requirements. To eliminates the risk you need to remove those scripts at container launch time. This is handled by the bundled `entrypoint.sh`.
+To support `TZ` and `APT_MIRROR` configuration for non-root users, setuid binaries (`setup-apt` and `setup-tz`) are included in `/container-setup/`. These binaries can modify system files and pose a security risk depending on your requirements.
 
-A side-effect of this mitigation is that `/container-setup/` has `777` permission so it allow deletion of its content by any user.
+**Mitigation:** The bundled `entrypoint.sh` removes these setuid binaries after first container start. Use the bundled entrypoint to ensure proper cleanup.
 
-In short, it's highly recommended to use the bundled `/container-setup/entrypoint.sh` at all time since it takes care of all the boilerplates.
+**Minimum requirement:** If using a custom entrypoint, run `rm -f /container-setup/setup-apt /container-setup/setup-tz` after initialization.
 
-The bottom line is you should at least run `rm -f /container-setup/*.sh.x` if you insist of not using `/container-setup/entrypoint.sh`.
+**Note:** `/container-setup/` has `733` permissions (owner read/write/execute, group/others write/execute only) to allow deletion by any user while preventing directory listing.
 
 ## GeoIP Variant
 

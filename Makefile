@@ -44,6 +44,30 @@ ubuntu-base:
 		-t ubuntu-base:$(LOCAL_TAG)
 	@echo "Successfully built ubuntu-base:$(LOCAL_TAG)"
 
+test-ubuntu-base-setup-apt:
+	docker build ubuntu-base \
+		--build-arg UPSTREAM_TAG=$(UPSTREAM_TAG) \
+		--build-arg APT_MIRROR="https://mirror.hashy0917.net/ubuntu-ports/" \
+# 		`# --build-arg APT_MIRROR="https://ports.ubuntu.com/ubuntu-ports/"` \
+		-t ubuntu-base:$(LOCAL_TAG)
+	docker build ubuntu-base \
+		--build-arg UPSTREAM_TAG=$(UPSTREAM_TAG) \
+		--build-arg APT_MIRROR="" \
+
+test-ubuntu-base-setup-tz:
+	docker build ubuntu-base \
+		--build-arg UPSTREAM_TAG=$(UPSTREAM_TAG) \
+		--build-arg TZ="America/Vancouver"
+	! docker build ubuntu-base \
+		--build-arg UPSTREAM_TAG=$(UPSTREAM_TAG) \
+		--build-arg TZ="America/../../../../etc/passwd"
+	! docker build ubuntu-base \
+		--build-arg UPSTREAM_TAG=$(UPSTREAM_TAG) \
+		--build-arg TZ="America/BadZone"
+	docker build ubuntu-base \
+		--build-arg UPSTREAM_TAG=$(UPSTREAM_TAG) \
+		--build-arg TZ=""
+
 ubuntu-base-geoip: ubuntu-base
 	$(MAXMIND_LICENSE_KEY_WARNING)
 	@echo "Building ubuntu-base-geoip:$(LOCAL_TAG) with Ubuntu $(UPSTREAM_TAG)..."
