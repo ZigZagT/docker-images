@@ -34,5 +34,6 @@ RUN echo 'APT::Install-Recommends "false";' >> /etc/apt/apt.conf.d/99_norecommen
     && apt-get autoremove -y --purge \
     && /container-setup/setup-tz
 
+ENV CONTAINER_SETUP_LOG=warn
 ENTRYPOINT ["/container-setup/entrypoint.sh"]
 CMD ["/bin/bash"]
