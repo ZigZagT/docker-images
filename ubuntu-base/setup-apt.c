@@ -1,11 +1,14 @@
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
+#include <sys/stat.h>
 
 #define MAX_LINE 256
 
 int main() {
+    umask(0022); // Ensure secure permissions for created files
+
     char *apt_mirror = getenv("APT_MIRROR");
     if (!apt_mirror || strlen(apt_mirror) == 0) {
         fprintf(stderr, "setup-apt: No mirror configured, using system default\n");

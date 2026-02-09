@@ -4,8 +4,11 @@
 #include <unistd.h>
 #include <errno.h>
 #include <limits.h>
+#include <sys/stat.h>
 
 int main() {
+    umask(0022); // Ensure secure permissions for created files
+
     char *tz = getenv("TZ");
     if (!tz || strlen(tz) == 0) {
         fprintf(stderr, "setup-tz: No timezone configured, using system default\n");
@@ -65,7 +68,7 @@ int main() {
 
     // Reconfigure tzdata package (suppresses output but checks exit status)
     fprintf(stderr, "setup-tz: Running dpkg-reconfigure tzdata\n");
-    int status = system("dpkg-reconfigure -f noninteractive tzdata 2>/dev/null");
+    int status = system("/usr/sbin/dpkg-reconfigure -f noninteractive tzdata 2>/dev/null");
 
     if (status == -1) {
         fprintf(stderr, "setup-tz: WARNING: Failed to execute dpkg-reconfigure\n");
