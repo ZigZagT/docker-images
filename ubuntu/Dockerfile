@@ -28,6 +28,7 @@ RUN echo 'APT::Install-Recommends "false";' >> /etc/apt/apt.conf.d/99_norecommen
         curl \
         jq \
         unzip \
+        python3 \
     && apt-get purge -y \
         gcc \
         libc6-dev \

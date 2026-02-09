@@ -1,125 +1,157 @@
-# Default Ubuntu version
-UPSTREAM_TAG ?= 22.04
+SHELL := /bin/bash
 
-# Image tag for local builds
-LOCAL_TAG := local
+# Default arguments
+UPSTREAM_TAGS ?= 22.04 24.04
+LATEST_TAG ?= 24.04
+NODEJS_VERSIONS ?= 22 24
+DEFAULT_NODEJS_VERSION ?= 24
+TZ ?= America/Vancouver
+APT_MIRROR ?=
+DOCKERHUB_USERNAME ?= deaddev
+PUSH ?= false
 
-# Check if MAXMIND_LICENSE_KEY is set (required for geoip image)
-ifndef MAXMIND_LICENSE_KEY
-MAXMIND_LICENSE_KEY_WARNING := @echo "Warning: MAXMIND_LICENSE_KEY not set. Required for ubuntu-base-geoip build."
+# Buildx specific
+PLATFORM ?= linux/amd64,linux/arm64
+BUILDX_CMD = docker buildx build --platform $(PLATFORM)
+ifeq ($(PUSH),true)
+	BUILDX_CMD += --push
 endif
 
-.PHONY: help all ubuntu-base ubuntu-base-geoip dnsmasq-exporter sqitch-pg wait-for-pg clean
+.PHONY: all ubuntu ubuntu-nodejs ubuntu-rust ubuntu-geoip dnsmasq-exporter sqitch-pg wait-for-pg clean
 
 # Default target
-help:
-	@echo "Docker Images - Local Build Makefile"
-	@echo ""
-	@echo "Usage: make [target]"
-	@echo ""
-	@echo "Targets:"
-	@echo "  all                 - Build all images"
-	@echo "  ubuntu-base         - Build ubuntu-base image"
-	@echo "  ubuntu-base-geoip   - Build ubuntu-base-geoip image (requires MAXMIND_LICENSE_KEY)"
-	@echo "  dnsmasq-exporter    - Build dnsmasq_exporter image"
-	@echo "  sqitch-pg           - Build sqitch-pg image"
-	@echo "  wait-for-pg         - Build wait-for-pg image"
-	@echo "  clean               - Remove all local tagged images"
-	@echo ""
-	@echo "Environment Variables:"
-	@echo "  UPSTREAM_TAG        - Ubuntu version (default: 22.04)"
-	@echo "  MAXMIND_LICENSE_KEY - MaxMind license key (required for ubuntu-base-geoip)"
-	@echo ""
-	@echo "Examples:"
-	@echo "  make ubuntu-base"
-	@echo "  make ubuntu-base-geoip MAXMIND_LICENSE_KEY=your_key"
-	@echo "  make all UPSTREAM_TAG=24.04"
+all: ubuntu ubuntu-nodejs ubuntu-rust ubuntu-geoip dnsmasq-exporter sqitch-pg wait-for-pg
+all-ubuntu: ubuntu ubuntu-nodejs ubuntu-rust
 
-all: ubuntu-base ubuntu-base-geoip dnsmasq-exporter sqitch-pg wait-for-pg
+ubuntu:
+	@for tag in $(UPSTREAM_TAGS); do \
+		echo "Building ubuntu:$$tag"; \
+		tags="-t $(DOCKERHUB_USERNAME)/ubuntu:$$tag"; \
+		if [ "$$tag" = "$(LATEST_TAG)" ]; then \
+			tags="$$tags -t $(DOCKERHUB_USERNAME)/ubuntu:latest"; \
+		fi; \
+		$(BUILDX_CMD) \
+			--build-arg UPSTREAM_TAG=$$tag \
+			--build-arg TZ="$(TZ)" \
+			--build-arg APT_MIRROR="$(APT_MIRROR)" \
+			$$tags \
+			--cache-from $(DOCKERHUB_USERNAME)/ubuntu:$$tag \
+			ubuntu; \
+	done
 
-ubuntu-base:
-	@echo "Building ubuntu-base:$(LOCAL_TAG) with Ubuntu $(UPSTREAM_TAG)..."
-	docker build ubuntu-base \
-		--build-arg UPSTREAM_TAG=$(UPSTREAM_TAG) \
-		-t ubuntu-base:$(LOCAL_TAG)
-	@echo "Successfully built ubuntu-base:$(LOCAL_TAG)"
-
-test-ubuntu-base-setup-apt:
-	docker build ubuntu-base \
-		--build-arg UPSTREAM_TAG=$(UPSTREAM_TAG) \
-		--build-arg APT_MIRROR="https://mirror.hashy0917.net/ubuntu-ports/" \
-# 		`# --build-arg APT_MIRROR="https://ports.ubuntu.com/ubuntu-ports/"` \
-		-t ubuntu-base:$(LOCAL_TAG)
-	docker build ubuntu-base \
-		--build-arg UPSTREAM_TAG=$(UPSTREAM_TAG) \
-		--build-arg APT_MIRROR="" \
-
-test-ubuntu-base-setup-tz:
-	docker build ubuntu-base \
-		--build-arg UPSTREAM_TAG=$(UPSTREAM_TAG) \
+test-ubuntu-setup-tz:
+	docker build ubuntu \
+		--build-arg UPSTREAM_TAG=$(LATEST_TAG) \
 		--build-arg TZ="America/Vancouver"
-	! docker build ubuntu-base \
-		--build-arg UPSTREAM_TAG=$(UPSTREAM_TAG) \
+	! docker build ubuntu \
+		--build-arg UPSTREAM_TAG=$(LATEST_TAG) \
 		--build-arg TZ="America/../../../../etc/passwd"
-	! docker build ubuntu-base \
-		--build-arg UPSTREAM_TAG=$(UPSTREAM_TAG) \
+	! docker build ubuntu \
+		--build-arg UPSTREAM_TAG=$(LATEST_TAG) \
 		--build-arg TZ="America/BadZone"
-	docker build ubuntu-base \
-		--build-arg UPSTREAM_TAG=$(UPSTREAM_TAG) \
+	docker build ubuntu \
+		--build-arg UPSTREAM_TAG=$(LATEST_TAG) \
 		--build-arg TZ=""
 
-ubuntu-base-geoip: ubuntu-base
-	$(MAXMIND_LICENSE_KEY_WARNING)
-	@echo "Building ubuntu-base-geoip:$(LOCAL_TAG) with Ubuntu $(UPSTREAM_TAG)..."
-	@if [ -z "$(MAXMIND_LICENSE_KEY)" ]; then \
-		echo "Error: MAXMIND_LICENSE_KEY environment variable is required"; \
-		exit 1; \
-	fi
+ubuntu-nodejs:
+	@for ubuntu in $(UPSTREAM_TAGS); do \
+		for nodejs in $(NODEJS_VERSIONS); do \
+			echo "Building ubuntu:$$ubuntu-nodejs-$$nodejs"; \
+			tags="-t $(DOCKERHUB_USERNAME)/ubuntu:$$ubuntu-nodejs-$$nodejs"; \
+			if [ "$$nodejs" = "$(DEFAULT_NODEJS_VERSION)" ]; then \
+				tags="$$tags -t $(DOCKERHUB_USERNAME)/ubuntu:$$ubuntu-nodejs"; \
+			fi; \
+			if [ "$$ubuntu" = "$(LATEST_TAG)" ]; then \
+				tags="$$tags -t $(DOCKERHUB_USERNAME)/ubuntu:nodejs-$$nodejs"; \
+				if [ "$$nodejs" = "$(DEFAULT_NODEJS_VERSION)" ]; then \
+					tags="$$tags -t $(DOCKERHUB_USERNAME)/ubuntu:nodejs"; \
+				fi; \
+			fi; \
+			$(BUILDX_CMD) \
+				--build-arg BASE_IMAGE=$(DOCKERHUB_USERNAME)/ubuntu:$$ubuntu \
+				--build-arg NODE_VERSION=$$nodejs \
+				$$tags \
+				-f ubuntu/Dockerfile.nodejs \
+				ubuntu; \
+		done \
+	done
+
+ubuntu-rust:
+	@for ubuntu in $(UPSTREAM_TAGS); do \
+		echo "Building ubuntu:$$ubuntu-rust"; \
+		tags="-t $(DOCKERHUB_USERNAME)/ubuntu:$$ubuntu-rust"; \
+		if [ "$$ubuntu" = "$(LATEST_TAG)" ]; then \
+			tags="$$tags -t $(DOCKERHUB_USERNAME)/ubuntu:rust"; \
+		fi; \
+		$(BUILDX_CMD) \
+			--build-arg BASE_IMAGE=$(DOCKERHUB_USERNAME)/ubuntu:$$ubuntu \
+			--build-arg RUST_VERSION=stable \
+			$$tags \
+			-f ubuntu/Dockerfile.rust \
+			ubuntu; \
+	done
+
+ubuntu-geoip:
 	@echo "Checking MaxMind database versions..."
-	@MAXMIND_OUTPUT=$$(./scripts/get-and-compare-maxmind-versions.sh \
-		--key "$(MAXMIND_LICENSE_KEY)" \
-		--output ubuntu-base-geoip/MAXMIND_VERSIONS 2>&1) || true; \
-	echo "$$MAXMIND_OUTPUT"; \
-	if echo "$$MAXMIND_OUTPUT" | grep -q "rate_limited=true"; then \
-		echo "MaxMind API rate limited - will reuse databases from previous image"; \
+	@cmd="./scripts/get-and-compare-maxmind-versions.sh --key $(or $(MAXMIND_LICENSE_KEY), '') --output ubuntu-geoip/MAXMIND_VERSIONS"; \
+	if [ -n "$(MAXMIND_SAVED_VERSION_FILE)" ]; then \
+		cmd="$$cmd --input $(MAXMIND_SAVED_VERSION_FILE)"; \
+	fi; \
+	MAXMIND_VERSION_CHECK_RESULTS=$$($$cmd) || true; \
+	if echo "$$MAXMIND_VERSION_CHECK_RESULTS" | grep -q "fetch_failed=true"; then \
+		echo "MaxMind download failed or rate limited - must use databases from previous image"; \
 		MAXMIND_DB_NO_UPDATE=true; \
 	else \
-		echo "MaxMind versions retrieved successfully"; \
+		echo "MaxMind versions check done"; \
 		MAXMIND_DB_NO_UPDATE=false; \
 	fi; \
-	echo "Building with MAXMIND_DB_NO_UPDATE=$$MAXMIND_DB_NO_UPDATE"; \
-	docker build ubuntu-base-geoip \
-		--build-arg UPSTREAM_TAG=$(UPSTREAM_TAG) \
-		--build-arg MAXMIND_DB_NO_UPDATE=$$MAXMIND_DB_NO_UPDATE \
-		--secret id=maxmind_license_key,env=MAXMIND_LICENSE_KEY \
-		-t ubuntu-base-geoip:$(LOCAL_TAG)
-	@echo "Successfully built ubuntu-base-geoip:$(LOCAL_TAG)"
+	for tag in $(UPSTREAM_TAGS); do \
+		echo "Building ubuntu-geoip:$$tag"; \
+		tags="-t $(DOCKERHUB_USERNAME)/ubuntu-geoip:$$tag"; \
+		if [ "$$tag" = "$(LATEST_TAG)" ]; then \
+			tags="$$tags -t $(DOCKERHUB_USERNAME)/ubuntu-geoip:latest"; \
+		fi; \
+		CACHE_IMAGE=""; \
+		if docker buildx imagetools inspect $(DOCKERHUB_USERNAME)/ubuntu-geoip:$$tag >/dev/null 2>&1; then \
+			echo "Previous image found, maxmind databases maybe reused from this image"; \
+			CACHE_IMAGE=$(DOCKERHUB_USERNAME)/ubuntu-geoip:$$tag; \
+		else \
+			echo "No previous image found, maxmind databases must be downloaded from internet"; \
+			CACHE_IMAGE=$(DOCKERHUB_USERNAME)/ubuntu:$$tag; \
+			if [ "$$MAXMIND_DB_NO_UPDATE" = "true" ]; then \
+				echo "No previous image found and unable to download from internet, failed to obtain maxmind databases."; \
+				exit 1; \
+			fi; \
+		fi; \
+		$(BUILDX_CMD) \
+			--build-arg UPSTREAM_TAG=$$tag \
+			--build-arg BASE_IMAGE=$(DOCKERHUB_USERNAME)/ubuntu:$$tag \
+			--build-arg CACHE_IMAGE="$$CACHE_IMAGE" \
+			--build-arg MAXMIND_NO_UPDATE=$$MAXMIND_DB_NO_UPDATE \
+			--secret id=maxmind_license_key,env=MAXMIND_LICENSE_KEY \
+			$$tags \
+			--cache-from $(DOCKERHUB_USERNAME)/ubuntu-geoip:$$tag \
+			ubuntu-geoip; \
+	done
 
 dnsmasq-exporter:
-	@echo "Building dnsmasq_exporter:$(LOCAL_TAG)..."
-	docker build dnsmasq_exporter \
-		-t dnsmasq_exporter:$(LOCAL_TAG)
-	@echo "Successfully built dnsmasq_exporter:$(LOCAL_TAG)"
+	@echo "Building dnsmasq_exporter..."
+	$(BUILDX_CMD) \
+		-t $(DOCKERHUB_USERNAME)/dnsmasq_exporter:latest \
+		dnsmasq_exporter
 
 sqitch-pg:
-	@echo "Building sqitch-pg:$(LOCAL_TAG)..."
-	docker build sqitch-pg \
-		-t sqitch-pg:$(LOCAL_TAG)
-	@echo "Successfully built sqitch-pg:$(LOCAL_TAG)"
+	@echo "Building sqitch-pg..."
+	$(BUILDX_CMD) \
+		-t $(DOCKERHUB_USERNAME)/sqitch-pg:latest \
+		sqitch-pg
 
 wait-for-pg:
-	@echo "Building wait-for-pg:$(LOCAL_TAG)..."
-	docker build wait-for-pg \
-		-t wait-for-pg:$(LOCAL_TAG)
-	@echo "Successfully built wait-for-pg:$(LOCAL_TAG)"
+	@echo "Building wait-for-pg..."
+	$(BUILDX_CMD) \
+		-t $(DOCKERHUB_USERNAME)/wait-for-pg:latest \
+		wait-for-pg
 
 clean:
-	@echo "Removing local tagged images..."
-	-docker rmi ubuntu-base:$(LOCAL_TAG) 2>/dev/null || true
-	-docker rmi ubuntu-base-geoip:$(LOCAL_TAG) 2>/dev/null || true
-	-docker rmi dnsmasq_exporter:$(LOCAL_TAG) 2>/dev/null || true
-	-docker rmi sqitch-pg:$(LOCAL_TAG) 2>/dev/null || true
-	-docker rmi wait-for-pg:$(LOCAL_TAG) 2>/dev/null || true
-	@echo "Removing generated files..."
-	-rm -f ubuntu-base-geoip/MAXMIND_VERSIONS 2>/dev/null || true
-	@echo "Cleanup complete"
+	@echo "Cleaning up..."
+	-rm -f ubuntu-geoip/MAXMIND_VERSIONS

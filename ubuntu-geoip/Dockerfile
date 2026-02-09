@@ -1,6 +1,8 @@
 ARG UPSTREAM_TAG
+ARG BASE_IMAGE
+ARG CACHE_IMAGE
 ARG MAXMIND_NO_UPDATE=false
-FROM deaddev/ubuntu-base-geoip:$UPSTREAM_TAG as builder
+FROM ${CACHE_IMAGE} as builder
 # invalidate build cache if versions has changed
 COPY MAXMIND_VERSIONS /MAXMIND_VERSIONS
 RUN --mount=type=secret,id=maxmind_license_key \
@@ -26,6 +28,6 @@ RUN --mount=type=secret,id=maxmind_license_key \
         && rm -rf GeoLite2-* ; \
     fi
 
-FROM deaddev/ubuntu-base:$UPSTREAM_TAG
+FROM ${BASE_IMAGE}
 COPY --from=builder /MAXMIND_VERSIONS /MAXMIND_VERSIONS
 COPY --from=builder /usr/share/GeoIP /usr/share/GeoIP

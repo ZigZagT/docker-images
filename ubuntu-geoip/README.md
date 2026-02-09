@@ -1,13 +1,13 @@
-# Ubuntu Base with GeoIP
+# Ubuntu with GeoIP
 
-Ubuntu base image with MaxMind GeoLite2 databases pre-installed.
+Ubuntu image with MaxMind GeoLite2 databases pre-installed.
 
 You must build the image with your own maxmind license key.
 
 ```bash
-docker pull deaddev/ubuntu-base-geoip
-docker pull deaddev/ubuntu-base-geoip:22.04
-docker pull deaddev/ubuntu-base-geoip:latest
+docker pull deaddev/ubuntu-geoip
+docker pull deaddev/ubuntu-geoip:22.04
+docker pull deaddev/ubuntu-geoip:latest
 ```
 
 All images are built for **linux/amd64** and **linux/arm64** platforms.
@@ -25,7 +25,7 @@ This image includes the following MaxMind GeoLite2 databases:
 To check which versions of the databases are included in your image:
 
 ```bash
-docker run --rm deaddev/ubuntu-base-geoip:latest cat /MAXMIND_VERSIONS
+docker run --rm deaddev/ubuntu-geoip:latest cat /MAXMIND_VERSIONS
 ```
 
 This will display the last-modified dates of each database, for example:
@@ -40,6 +40,6 @@ last-modified: Mon, 13 Oct 2025 08:30:40 GMT
 
 ## Features
 
-This image inherits all features from [ubuntu-base](../ubuntu-base/README.md):
+This image inherits all features from [ubuntu](../ubuntu/README.md):
 
-See the [ubuntu-base README](../ubuntu-base/README.md) for detailed usage instructions.
+See the [ubuntu README](../ubuntu/README.md) for detailed usage instructions.

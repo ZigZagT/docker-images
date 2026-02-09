@@ -1,0 +1,15 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+ARG RUST_VERSION
+
+RUN if [ -z "$RUST_VERSION" ]; then echo "RUST_VERSION not set" && exit 1; fi \
+    && echo "Installing Rust version $RUST_VERSION" \
+    && apt-get update \
+    && apt-get install -y curl build-essential \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain "$RUST_VERSION" \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/root/.rustup \
+    CARGO_HOME=/root/.cargo \
+    PATH=/root/.cargo/bin:$PATH
