@@ -15,18 +15,25 @@ All images are built for **linux/amd64** and **linux/arm64** platforms.
 | --- | --- |
 | `latest`, `24.04` | Ubuntu 24.04 Base |
 | `22.04` | Ubuntu 22.04 Base |
-| `20.04` | Ubuntu 20.04 Base |
 | `node`, `nodejs`, `nodejs-24` | Node.js 24 on Latest Ubuntu (24.04) |
 | `nodejs-22` | Node.js 22 on Latest Ubuntu (24.04) |
 | `24.04-nodejs`, `24.04-nodejs-24` | Node.js 24 on Ubuntu 24.04 |
 | `24.04-nodejs-22` | Node.js 22 on Ubuntu 24.04 |
 | `22.04-nodejs`, `22.04-nodejs-24` | Node.js 24 on Ubuntu 22.04 |
 | `22.04-nodejs-22` | Node.js 22 on Ubuntu 22.04 |
-| `20.04-nodejs`, `20.04-nodejs-24` | Node.js 24 on Ubuntu 20.04 |
-| `20.04-nodejs-22` | Node.js 22 on Ubuntu 20.04 |
 | `rust` | Rust Stable on Latest Ubuntu (24.04) |
 | `24.04-rust` | Rust Stable on Ubuntu 24.04 |
 | `22.04-rust` | Rust Stable on Ubuntu 22.04 |
+
+### End of Life (EOL)
+
+EOL images are no longer updated and may be removed at any time.
+
+| Tag | Content |
+| --- | --- |
+| `20.04` | Ubuntu 20.04 Base |
+| `20.04-nodejs`, `20.04-nodejs-24` | Node.js 24 on Ubuntu 20.04 |
+| `20.04-nodejs-22` | Node.js 22 on Ubuntu 20.04 |
 | `20.04-rust` | Rust Stable on Ubuntu 20.04 |
 
 ## Features

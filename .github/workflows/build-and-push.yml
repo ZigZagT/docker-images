@@ -12,7 +12,7 @@ on:
       upstream_tags:
         description: 'Ubuntu versions to build (space-separated)'
         required: false
-        default: '20.04 22.04 24.04'
+        default: '22.04 24.04'
         type: string
       latest_tag:
         description: 'Which Ubuntu version should the "latest" tag point to'
@@ -34,7 +34,7 @@ on:
     - cron: '0 0 * * 6'
 
 env:
-  UPSTREAM_TAGS: ${{ github.event.inputs.upstream_tags || '20.04 22.04 24.04' }}
+  UPSTREAM_TAGS: ${{ github.event.inputs.upstream_tags || '22.04 24.04' }}
   LATEST_TAG: ${{ github.event.inputs.latest_tag || '24.04' }}
   TZ: ${{ github.event.inputs.tz || 'America/Vancouver' }}
   APT_MIRROR: ${{ github.event.inputs.apt_mirror || '' }}
