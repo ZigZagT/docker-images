@@ -12,12 +12,22 @@ on:
       upstream_tags:
         description: 'Ubuntu versions to build (space-separated)'
         required: false
-        default: '22.04 24.04'
+        default: '22.04 24.04 26.04'
         type: string
       latest_tag:
         description: 'Which Ubuntu version should the "latest" tag point to'
         required: false
         default: '24.04'
+        type: string
+      nodejs_versions:
+        description: 'Node.js versions to build (space-separated)'
+        required: false
+        default: '22 24'
+        type: string
+      default_nodejs_version:
+        description: 'Which Node.js version should the default "nodejs" tag point to'
+        required: false
+        default: '24'
         type: string
       tz:
         description: 'Default timezone configured in the images'
@@ -34,8 +44,10 @@ on:
     - cron: '0 0 * * 6'
 
 env:
-  UPSTREAM_TAGS: ${{ github.event.inputs.upstream_tags || '22.04 24.04' }}
+  UPSTREAM_TAGS: ${{ github.event.inputs.upstream_tags || '22.04 24.04 26.04' }}
   LATEST_TAG: ${{ github.event.inputs.latest_tag || '24.04' }}
+  NODEJS_VERSIONS: ${{ github.event.inputs.nodejs_versions || '22 24' }}
+  DEFAULT_NODEJS_VERSION: ${{ github.event.inputs.default_nodejs_version || '24' }}
   TZ: ${{ github.event.inputs.tz || 'America/Vancouver' }}
   APT_MIRROR: ${{ github.event.inputs.apt_mirror || '' }}
 
@@ -212,6 +224,8 @@ jobs:
           make all-ubuntu \
             UPSTREAM_TAGS="$UPSTREAM_TAGS" \
             LATEST_TAG="$LATEST_TAG" \
+            NODEJS_VERSIONS="$NODEJS_VERSIONS" \
+            DEFAULT_NODEJS_VERSION="$DEFAULT_NODEJS_VERSION" \
             TZ="$TZ" \
             APT_MIRROR="$APT_MIRROR" \
             DOCKERHUB_USERNAME="$DOCKERHUB_USERNAME" \
@@ -219,6 +233,8 @@ jobs:
         env:
           UPSTREAM_TAGS: ${{ env.UPSTREAM_TAGS }}
           LATEST_TAG: ${{ env.LATEST_TAG }}
+          NODEJS_VERSIONS: ${{ env.NODEJS_VERSIONS }}
+          DEFAULT_NODEJS_VERSION: ${{ env.DEFAULT_NODEJS_VERSION }}
           TZ: ${{ env.TZ }}
           APT_MIRROR: ${{ env.APT_MIRROR }}
           DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
@@ -264,6 +280,15 @@ jobs:
           restore-keys: |
             maxmind-versions-
 
+      - name: Restore MaxMind databases cache
+        if: github.event_name != 'pull_request'
+        uses: actions/cache/restore@v4
+        with:
+          path: ubuntu-geoip/databases
+          key: maxmind-db-
+          restore-keys: |
+            maxmind-db-
+
       - name: Build and push ubuntu-geoip
         run: |
           make ubuntu-geoip \
@@ -294,6 +319,13 @@ jobs:
         with:
           path: ubuntu-geoip/MAXMIND_VERSIONS
           key: maxmind-versions-${{ github.run_id }}
+
+      - name: Save MaxMind databases cache
+        if: github.event_name != 'pull_request'
+        uses: actions/cache/save@v4
+        with:
+          path: ubuntu-geoip/databases
+          key: maxmind-db-${{ github.run_id }}
 
   build-other-images:
     name: Build ${{ matrix.image }}

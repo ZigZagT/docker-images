@@ -1,2 +1,3 @@
-# MaxMind version tracking (managed by GitHub Actions cache)
+# MaxMind (managed by GitHub Actions cache)
 ubuntu-geoip/MAXMIND_VERSIONS
+ubuntu-geoip/databases/

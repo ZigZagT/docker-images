@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 
 # Default arguments
-UPSTREAM_TAGS ?= 22.04 24.04
+UPSTREAM_TAGS ?= 22.04 24.04 26.04
 LATEST_TAG ?= 24.04
 NODEJS_VERSIONS ?= 22 24
 DEFAULT_NODEJS_VERSION ?= 24
@@ -98,37 +98,46 @@ ubuntu-geoip:
 		cmd="$$cmd --input $(MAXMIND_SAVED_VERSION_FILE)"; \
 	fi; \
 	MAXMIND_VERSION_CHECK_RESULTS=$$($$cmd) || true; \
+	NEED_DOWNLOAD=true; \
 	if echo "$$MAXMIND_VERSION_CHECK_RESULTS" | grep -q "fetch_failed=true"; then \
-		echo "MaxMind download failed or rate limited - must use databases from previous image"; \
-		MAXMIND_DB_NO_UPDATE=true; \
-	else \
-		echo "MaxMind versions check done"; \
-		MAXMIND_DB_NO_UPDATE=false; \
+		echo "MaxMind API rate limited, using cached databases"; \
+		NEED_DOWNLOAD=false; \
+	elif echo "$$MAXMIND_VERSION_CHECK_RESULTS" | grep -q "changed=false"; then \
+		echo "MaxMind database versions unchanged, using cached databases"; \
+		NEED_DOWNLOAD=false; \
 	fi; \
+	if [ "$$NEED_DOWNLOAD" = "true" ]; then \
+		echo "Downloading MaxMind databases..."; \
+		mkdir -p ubuntu-geoip/databases; \
+		DOWNLOAD_OK=true; \
+		for edition in GeoLite2-Country GeoLite2-City GeoLite2-ASN; do \
+			echo "Downloading $${edition}..."; \
+			wget -q "https://download.maxmind.com/app/geoip_download?edition_id=$${edition}&license_key=$(MAXMIND_LICENSE_KEY)&suffix=tar.gz" \
+				-O "/tmp/$${edition}.tar.gz" \
+			&& tar -xzf "/tmp/$${edition}.tar.gz" -C /tmp \
+			&& mv /tmp/$${edition}*/$${edition}.mmdb ubuntu-geoip/databases/ \
+			&& rm -rf /tmp/$${edition}* \
+			|| { echo "WARNING: Failed to download $${edition}" >&2; DOWNLOAD_OK=false; break; }; \
+		done; \
+		if [ "$$DOWNLOAD_OK" = "false" ]; then \
+			echo "Download failed, checking for cached databases..."; \
+		fi; \
+	fi; \
+	for db in GeoLite2-Country GeoLite2-City GeoLite2-ASN; do \
+		test -f ubuntu-geoip/databases/$$db.mmdb || { \
+			echo "ERROR: $$db.mmdb not found and cannot be downloaded" >&2; exit 1; \
+		}; \
+	done; \
+	echo "All MaxMind databases present"; \
+	ls -lh ubuntu-geoip/databases/*.mmdb; \
 	for tag in $(UPSTREAM_TAGS); do \
 		echo "Building ubuntu-geoip:$$tag"; \
 		tags="-t $(DOCKERHUB_USERNAME)/ubuntu-geoip:$$tag"; \
 		if [ "$$tag" = "$(LATEST_TAG)" ]; then \
 			tags="$$tags -t $(DOCKERHUB_USERNAME)/ubuntu-geoip:latest"; \
 		fi; \
-		CACHE_IMAGE=""; \
-		if docker buildx imagetools inspect $(DOCKERHUB_USERNAME)/ubuntu-geoip:$$tag >/dev/null 2>&1; then \
-			echo "Previous image found, maxmind databases maybe reused from this image"; \
-			CACHE_IMAGE=$(DOCKERHUB_USERNAME)/ubuntu-geoip:$$tag; \
-		else \
-			echo "No previous image found, maxmind databases must be downloaded from internet"; \
-			CACHE_IMAGE=$(DOCKERHUB_USERNAME)/ubuntu:$$tag; \
-			if [ "$$MAXMIND_DB_NO_UPDATE" = "true" ]; then \
-				echo "No previous image found and unable to download from internet, failed to obtain maxmind databases."; \
-				exit 1; \
-			fi; \
-		fi; \
 		$(BUILDX_CMD) \
-			--build-arg UPSTREAM_TAG=$$tag \
 			--build-arg BASE_IMAGE=$(DOCKERHUB_USERNAME)/ubuntu:$$tag \
-			--build-arg CACHE_IMAGE="$$CACHE_IMAGE" \
-			--build-arg MAXMIND_NO_UPDATE=$$MAXMIND_DB_NO_UPDATE \
-			--secret id=maxmind_license_key,env=MAXMIND_LICENSE_KEY \
 			$$tags \
 			--cache-from $(DOCKERHUB_USERNAME)/ubuntu-geoip:$$tag \
 			ubuntu-geoip; \
@@ -155,3 +164,4 @@ wait-for-pg:
 clean:
 	@echo "Cleaning up..."
 	-rm -f ubuntu-geoip/MAXMIND_VERSIONS
+	-rm -rf ubuntu-geoip/databases
