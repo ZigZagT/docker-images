@@ -1,5 +1,9 @@
 name: Build and Push Docker Images
 
+concurrency:
+  group: build-and-push
+  cancel-in-progress: false
+
 on:
   push:
     branches:
@@ -39,6 +43,26 @@ on:
         required: false
         default: ''
         type: string
+      qemu_versions:
+        description: 'QEMU versions to build (space-separated)'
+        required: false
+        default: '10.2.1'
+        type: string
+      qemu_latest:
+        description: 'Which QEMU version should the "latest" tag point to'
+        required: false
+        default: '10.2.1'
+        type: string
+      ch_versions:
+        description: 'Cloud Hypervisor versions to build (space-separated)'
+        required: false
+        default: '51.1'
+        type: string
+      ch_latest:
+        description: 'Which Cloud Hypervisor version should the "latest" tag point to'
+        required: false
+        default: '51.1'
+        type: string
   schedule:
     # At 00:00 on Saturday https://crontab.guru/#0_0_*_*_6
     - cron: '0 0 * * 6'
@@ -50,6 +74,10 @@ env:
   DEFAULT_NODEJS_VERSION: ${{ github.event.inputs.default_nodejs_version || '24' }}
   TZ: ${{ github.event.inputs.tz || 'America/Vancouver' }}
   APT_MIRROR: ${{ github.event.inputs.apt_mirror || '' }}
+  QEMU_VERSIONS: ${{ github.event.inputs.qemu_versions || '10.2.1' }}
+  QEMU_LATEST: ${{ github.event.inputs.qemu_latest || '10.2.1' }}
+  CH_VERSIONS: ${{ github.event.inputs.ch_versions || '51.1' }}
+  CH_LATEST: ${{ github.event.inputs.ch_latest || '51.1' }}
 
 jobs:
   detect-changes:
@@ -59,6 +87,10 @@ jobs:
     outputs:
       ubuntu: ${{ steps.changes.outputs.ubuntu }}
       ubuntu-geoip: ${{ steps.changes.outputs.ubuntu-geoip }}
+      shadowsocks: ${{ steps.changes.outputs.shadowsocks }}
+      dnsmasq: ${{ steps.changes.outputs.dnsmasq }}
+      qemu: ${{ steps.changes.outputs.qemu }}
+      cloud-hypervisor: ${{ steps.changes.outputs.cloud-hypervisor }}
       dnsmasq-exporter: ${{ steps.changes.outputs.dnsmasq-exporter }}
       sqitch-pg: ${{ steps.changes.outputs.sqitch-pg }}
       wait-for-pg: ${{ steps.changes.outputs.wait-for-pg }}
@@ -129,6 +161,10 @@ jobs:
           if [[ "${{ github.event_name }}" == "schedule" ]] || [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             echo "ubuntu=true" >> $GITHUB_OUTPUT
             echo "ubuntu-geoip=true" >> $GITHUB_OUTPUT
+            echo "shadowsocks=true" >> $GITHUB_OUTPUT
+            echo "dnsmasq=true" >> $GITHUB_OUTPUT
+            echo "qemu=true" >> $GITHUB_OUTPUT
+            echo "cloud-hypervisor=true" >> $GITHUB_OUTPUT
             echo "dnsmasq-exporter=true" >> $GITHUB_OUTPUT
             echo "sqitch-pg=true" >> $GITHUB_OUTPUT
             echo "wait-for-pg=true" >> $GITHUB_OUTPUT
@@ -150,6 +186,8 @@ jobs:
               echo "No previous successful build found, building all images"
               echo "ubuntu=true" >> $GITHUB_OUTPUT
               echo "ubuntu-geoip=true" >> $GITHUB_OUTPUT
+              echo "shadowsocks=true" >> $GITHUB_OUTPUT
+              echo "dnsmasq=true" >> $GITHUB_OUTPUT
               echo "dnsmasq-exporter=true" >> $GITHUB_OUTPUT
               echo "sqitch-pg=true" >> $GITHUB_OUTPUT
               echo "wait-for-pg=true" >> $GITHUB_OUTPUT
@@ -164,6 +202,10 @@ jobs:
           if ./scripts/has-git-diff-at-path.sh ubuntu "$BASE_REF"; then
             echo "ubuntu=true" >> $GITHUB_OUTPUT
             echo "ubuntu-geoip=true" >> $GITHUB_OUTPUT  # geoip depends on base
+            echo "shadowsocks=true" >> $GITHUB_OUTPUT    # depends on ubuntu:rust
+            echo "dnsmasq=true" >> $GITHUB_OUTPUT        # depends on ubuntu
+            echo "qemu=true" >> $GITHUB_OUTPUT           # depends on ubuntu
+            echo "cloud-hypervisor=true" >> $GITHUB_OUTPUT # depends on ubuntu
             ANY_CHANGES=true
           else
             echo "ubuntu=false" >> $GITHUB_OUTPUT
@@ -173,6 +215,34 @@ jobs:
               ANY_CHANGES=true
             else
               echo "ubuntu-geoip=false" >> $GITHUB_OUTPUT
+            fi
+
+            if ./scripts/has-git-diff-at-path.sh shadowsocks "$BASE_REF"; then
+              echo "shadowsocks=true" >> $GITHUB_OUTPUT
+              ANY_CHANGES=true
+            else
+              echo "shadowsocks=false" >> $GITHUB_OUTPUT
+            fi
+
+            if ./scripts/has-git-diff-at-path.sh dnsmasq "$BASE_REF"; then
+              echo "dnsmasq=true" >> $GITHUB_OUTPUT
+              ANY_CHANGES=true
+            else
+              echo "dnsmasq=false" >> $GITHUB_OUTPUT
+            fi
+
+            if ./scripts/has-git-diff-at-path.sh qemu "$BASE_REF"; then
+              echo "qemu=true" >> $GITHUB_OUTPUT
+              ANY_CHANGES=true
+            else
+              echo "qemu=false" >> $GITHUB_OUTPUT
+            fi
+
+            if ./scripts/has-git-diff-at-path.sh cloud-hypervisor "$BASE_REF"; then
+              echo "cloud-hypervisor=true" >> $GITHUB_OUTPUT
+              ANY_CHANGES=true
+            else
+              echo "cloud-hypervisor=false" >> $GITHUB_OUTPUT
             fi
           fi
 
@@ -326,6 +396,66 @@ jobs:
         with:
           path: ubuntu-geoip/databases
           key: maxmind-db-${{ github.run_id }}
+
+  build-ubuntu-derived:
+    name: Build ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    needs: [detect-changes, build-ubuntu]
+    if: |
+      always() &&
+      (needs.detect-changes.outputs.shadowsocks == 'true' || needs.detect-changes.outputs.dnsmasq == 'true' || needs.detect-changes.outputs.qemu == 'true' || needs.detect-changes.outputs.cloud-hypervisor == 'true') &&
+      (needs.build-ubuntu.result == 'success' || needs.build-ubuntu.result == 'skipped')
+    environment: action-build-and-push
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: shadowsocks
+            output: shadowsocks
+          - image: dnsmasq
+            output: dnsmasq
+          - image: qemu
+            output: qemu
+          - image: cloud-hypervisor
+            output: cloud-hypervisor
+    steps:
+      - name: Check if build needed
+        id: should-build
+        run: |
+          if [[ "${{ needs.detect-changes.outputs[matrix.output] }}" == "true" ]]; then
+            echo "build=true" >> $GITHUB_OUTPUT
+          else
+            echo "build=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout code
+        if: steps.should-build.outputs.build == 'true'
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        if: steps.should-build.outputs.build == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to DockerHub
+        if: steps.should-build.outputs.build == 'true' && github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build image
+        if: steps.should-build.outputs.build == 'true'
+        run: |
+          make ${{ matrix.output }} \
+            DOCKERHUB_USERNAME="${{ vars.DOCKERHUB_USERNAME }}" \
+            LATEST_TAG="$LATEST_TAG" \
+            QEMU_VERSIONS="$QEMU_VERSIONS" \
+            QEMU_LATEST="$QEMU_LATEST" \
+            CH_VERSIONS="$CH_VERSIONS" \
+            CH_LATEST="$CH_LATEST" \
+            PUSH="${{ github.event_name != 'pull_request' && 'true' || 'false' }}"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
 
   build-other-images:
     name: Build ${{ matrix.image }}

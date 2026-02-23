@@ -9,6 +9,10 @@ TZ ?= America/Vancouver
 APT_MIRROR ?=
 DOCKERHUB_USERNAME ?= deaddev
 PUSH ?= false
+QEMU_VERSIONS ?= 10.2.1
+QEMU_LATEST ?= 10.2.1
+CH_VERSIONS ?= 51.1
+CH_LATEST ?= 51.1
 
 # Buildx specific
 PLATFORM ?= linux/amd64,linux/arm64
@@ -17,10 +21,10 @@ ifeq ($(PUSH),true)
 	BUILDX_CMD += --push
 endif
 
-.PHONY: all ubuntu ubuntu-nodejs ubuntu-rust ubuntu-geoip dnsmasq-exporter sqitch-pg wait-for-pg clean
+.PHONY: all ubuntu ubuntu-nodejs ubuntu-rust ubuntu-geoip dnsmasq-exporter shadowsocks dnsmasq qemu cloud-hypervisor sqitch-pg wait-for-pg clean
 
 # Default target
-all: ubuntu ubuntu-nodejs ubuntu-rust ubuntu-geoip dnsmasq-exporter sqitch-pg wait-for-pg
+all: ubuntu ubuntu-nodejs ubuntu-rust ubuntu-geoip dnsmasq-exporter shadowsocks dnsmasq qemu cloud-hypervisor sqitch-pg wait-for-pg
 all-ubuntu: ubuntu ubuntu-nodejs ubuntu-rust
 
 ubuntu:
@@ -141,6 +145,64 @@ ubuntu-geoip:
 			$$tags \
 			--cache-from $(DOCKERHUB_USERNAME)/ubuntu-geoip:$$tag \
 			ubuntu-geoip; \
+	done
+
+shadowsocks:
+	@echo "Building shadowsocks..."
+	$(BUILDX_CMD) \
+		-t $(DOCKERHUB_USERNAME)/shadowsocks:latest \
+		shadowsocks
+
+dnsmasq:
+	@echo "Building dnsmasq..."
+	$(BUILDX_CMD) \
+		-t $(DOCKERHUB_USERNAME)/dnsmasq:latest \
+		dnsmasq
+
+qemu:
+	@EDGE_VERSION=$$(./scripts/get-latest-qemu-version.sh); \
+	ALL_VERSIONS="$(QEMU_VERSIONS)"; \
+	if ! echo " $$ALL_VERSIONS " | grep -q " $$EDGE_VERSION "; then \
+		ALL_VERSIONS="$$ALL_VERSIONS $$EDGE_VERSION"; \
+	fi; \
+	for ver in $$ALL_VERSIONS; do \
+		echo "Building qemu:$$ver"; \
+		tags="-t $(DOCKERHUB_USERNAME)/qemu:$$ver"; \
+		if [ "$$ver" = "$(QEMU_LATEST)" ]; then \
+			tags="$$tags -t $(DOCKERHUB_USERNAME)/qemu:latest"; \
+		fi; \
+		if [ "$$ver" = "$$EDGE_VERSION" ]; then \
+			tags="$$tags -t $(DOCKERHUB_USERNAME)/qemu:edge"; \
+		fi; \
+		$(BUILDX_CMD) \
+			--build-arg BASE_IMAGE=$(DOCKERHUB_USERNAME)/ubuntu:$(LATEST_TAG) \
+			--build-arg QEMU_VERSION=$$ver \
+			$$tags \
+			--cache-from $(DOCKERHUB_USERNAME)/qemu:$$ver \
+			qemu; \
+	done
+
+cloud-hypervisor:
+	@EDGE_VERSION=$$(./scripts/get-latest-cloud-hypervisor-version.sh); \
+	ALL_VERSIONS="$(CH_VERSIONS)"; \
+	if ! echo " $$ALL_VERSIONS " | grep -q " $$EDGE_VERSION "; then \
+		ALL_VERSIONS="$$ALL_VERSIONS $$EDGE_VERSION"; \
+	fi; \
+	for ver in $$ALL_VERSIONS; do \
+		echo "Building cloud-hypervisor:$$ver"; \
+		tags="-t $(DOCKERHUB_USERNAME)/cloud-hypervisor:$$ver"; \
+		if [ "$$ver" = "$(CH_LATEST)" ]; then \
+			tags="$$tags -t $(DOCKERHUB_USERNAME)/cloud-hypervisor:latest"; \
+		fi; \
+		if [ "$$ver" = "$$EDGE_VERSION" ]; then \
+			tags="$$tags -t $(DOCKERHUB_USERNAME)/cloud-hypervisor:edge"; \
+		fi; \
+		$(BUILDX_CMD) \
+			--build-arg BASE_IMAGE=$(DOCKERHUB_USERNAME)/ubuntu:$(LATEST_TAG) \
+			--build-arg CH_VERSION=$$ver \
+			$$tags \
+			--cache-from $(DOCKERHUB_USERNAME)/cloud-hypervisor:$$ver \
+			cloud-hypervisor; \
 	done
 
 dnsmasq-exporter:
