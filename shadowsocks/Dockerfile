@@ -1,5 +1,8 @@
 # Build shadowsocks-rust from source with selective features
-FROM deaddev/ubuntu:rust AS builder
+# Both ARGs in global scope — required for use in FROM directives across stages
+ARG BASE_IMAGE=deaddev/ubuntu:rust
+ARG RUNTIME_IMAGE=deaddev/ubuntu
+FROM ${BASE_IMAGE} AS builder
 
 WORKDIR /build
 RUN echo "Installing build dependencies..." \
@@ -27,7 +30,7 @@ RUN echo "Installing build dependencies..." \
         --no-default-features \
         --features "server local-redir local-tunnel local-dns local-tun hickory-dns dns-over-tls dns-over-https aead-cipher-2022 stream-cipher jemalloc"
 
-FROM deaddev/ubuntu
+FROM ${RUNTIME_IMAGE}
 
 WORKDIR /config
 

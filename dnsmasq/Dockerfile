@@ -1,4 +1,5 @@
-FROM deaddev/ubuntu
+ARG BASE_IMAGE=deaddev/ubuntu
+FROM ${BASE_IMAGE}
 
 COPY entrypoint.sh /entrypoint.sh
 ENTRYPOINT [ "/entrypoint.sh" ]
