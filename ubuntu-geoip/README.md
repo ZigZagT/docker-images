@@ -1,13 +1,21 @@
 # Ubuntu with GeoIP
 
+> **Source**: [Dockerfile](https://github.com/ZigZagT/docker-images/blob/master/ubuntu-geoip/Dockerfile)
+
 Ubuntu image with MaxMind GeoLite2 databases pre-installed.
 
 You must build the image with your own maxmind license key.
 
 ```bash
 docker pull deaddev/ubuntu-geoip
+# or
+docker pull ghcr.io/zigzagt/ubuntu-geoip
 docker pull deaddev/ubuntu-geoip:22.04
+# or
+docker pull ghcr.io/zigzagt/ubuntu-geoip:22.04
 docker pull deaddev/ubuntu-geoip:latest
+# or
+docker pull ghcr.io/zigzagt/ubuntu-geoip:latest
 ```
 
 All images are built for **linux/amd64** and **linux/arm64** platforms.

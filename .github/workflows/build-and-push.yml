@@ -314,6 +314,14 @@ jobs:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Build and push ubuntu:${{ matrix.upstream_tag }}
         run: |
           make ubuntu \
@@ -323,13 +331,11 @@ jobs:
             LATEST_TAG="$LATEST_TAG" \
             TZ="$TZ" \
             APT_MIRROR="$APT_MIRROR" \
-            DOCKERHUB_USERNAME="$DOCKERHUB_USERNAME" \
             PUSH="$PUSH"
         env:
           LATEST_TAG: ${{ env.LATEST_TAG }}
           TZ: ${{ env.TZ }}
           APT_MIRROR: ${{ env.APT_MIRROR }}
-          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
           PUSH: ${{ github.event_name != 'pull_request' && 'true' || 'false' }}
 
   merge-ubuntu-base:
@@ -351,13 +357,19 @@ jobs:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Merge manifests
         run: |
           make merge-ubuntu \
             UPSTREAM_TAGS="$UPSTREAM_TAGS" \
-            LATEST_TAG="$LATEST_TAG" \
-            DOCKERHUB_USERNAME="${{ vars.DOCKERHUB_USERNAME }}"
-
+            LATEST_TAG="$LATEST_TAG"
       - name: Sync README to DockerHub
         run: ./scripts/sync-readme.sh ubuntu/README.md ${{ vars.DOCKERHUB_USERNAME }}/ubuntu
         env:
@@ -400,6 +412,14 @@ jobs:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Build and push ubuntu-nodejs images
         run: |
           make ubuntu-nodejs \
@@ -409,14 +429,12 @@ jobs:
             LATEST_TAG="$LATEST_TAG" \
             NODEJS_VERSIONS="$NODEJS_VERSIONS" \
             DEFAULT_NODEJS_VERSION="$DEFAULT_NODEJS_VERSION" \
-            DOCKERHUB_USERNAME="$DOCKERHUB_USERNAME" \
             PUSH="$PUSH"
         env:
           UPSTREAM_TAGS: ${{ env.UPSTREAM_TAGS }}
           LATEST_TAG: ${{ env.LATEST_TAG }}
           NODEJS_VERSIONS: ${{ env.NODEJS_VERSIONS }}
           DEFAULT_NODEJS_VERSION: ${{ env.DEFAULT_NODEJS_VERSION }}
-          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
           PUSH: ${{ github.event_name != 'pull_request' && 'true' || 'false' }}
 
   merge-ubuntu-nodejs:
@@ -438,15 +456,21 @@ jobs:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Merge manifests
         run: |
           make merge-ubuntu-nodejs \
             UPSTREAM_TAGS="$UPSTREAM_TAGS" \
             LATEST_TAG="$LATEST_TAG" \
             NODEJS_VERSIONS="$NODEJS_VERSIONS" \
-            DEFAULT_NODEJS_VERSION="$DEFAULT_NODEJS_VERSION" \
-            DOCKERHUB_USERNAME="${{ vars.DOCKERHUB_USERNAME }}"
-
+            DEFAULT_NODEJS_VERSION="$DEFAULT_NODEJS_VERSION"
   build-ubuntu-rust:
     name: Build ubuntu-rust (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
@@ -481,6 +505,14 @@ jobs:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Build and push ubuntu-rust images
         run: |
           make ubuntu-rust \
@@ -488,12 +520,10 @@ jobs:
             PLATFORM="${{ matrix.platform }}" \
             TAG_SUFFIX="${{ matrix.suffix }}" \
             LATEST_TAG="$LATEST_TAG" \
-            DOCKERHUB_USERNAME="$DOCKERHUB_USERNAME" \
             PUSH="$PUSH"
         env:
           UPSTREAM_TAGS: ${{ env.UPSTREAM_TAGS }}
           LATEST_TAG: ${{ env.LATEST_TAG }}
-          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
           PUSH: ${{ github.event_name != 'pull_request' && 'true' || 'false' }}
 
   merge-ubuntu-rust:
@@ -515,13 +545,19 @@ jobs:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Merge manifests
         run: |
           make merge-ubuntu-rust \
             UPSTREAM_TAGS="$UPSTREAM_TAGS" \
-            LATEST_TAG="$LATEST_TAG" \
-            DOCKERHUB_USERNAME="${{ vars.DOCKERHUB_USERNAME }}"
-
+            LATEST_TAG="$LATEST_TAG"
   # --- GeoIP: download databases once, then build tags per-arch ---
 
   prepare-geoip-databases:
@@ -632,6 +668,14 @@ jobs:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Download GeoIP databases
         uses: actions/download-artifact@v4
         with:
@@ -645,11 +689,9 @@ jobs:
             PLATFORM="${{ matrix.platform }}" \
             TAG_SUFFIX="${{ matrix.suffix }}" \
             LATEST_TAG="$LATEST_TAG" \
-            DOCKERHUB_USERNAME="$DOCKERHUB_USERNAME" \
             PUSH="$PUSH"
         env:
           LATEST_TAG: ${{ env.LATEST_TAG }}
-          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
           PUSH: ${{ github.event_name != 'pull_request' && 'true' || 'false' }}
 
   merge-ubuntu-geoip:
@@ -671,12 +713,25 @@ jobs:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Merge manifests
         run: |
           make merge-ubuntu-geoip \
             UPSTREAM_TAGS="$UPSTREAM_TAGS" \
-            LATEST_TAG="$LATEST_TAG" \
-            DOCKERHUB_USERNAME="${{ vars.DOCKERHUB_USERNAME }}"
+            LATEST_TAG="$LATEST_TAG"
+      - name: Set ubuntu-geoip to private on GHCR
+        run: |
+          gh api -X PATCH /user/packages/container/ubuntu-geoip \
+            --field visibility=private
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Sync README to DockerHub
         run: ./scripts/sync-readme.sh ubuntu-geoip/README.md ${{ vars.DOCKERHUB_USERNAME }}/ubuntu-geoip
@@ -732,13 +787,20 @@ jobs:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Login to GHCR
+        if: steps.should-build.outputs.build == 'true' && github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Build image
         if: steps.should-build.outputs.build == 'true'
         run: |
           make ${{ matrix.image }} \
             PLATFORM="${{ matrix.platform }}" \
             TAG_SUFFIX="${{ matrix.suffix }}" \
-            DOCKERHUB_USERNAME="${{ vars.DOCKERHUB_USERNAME }}" \
             LATEST_TAG="$LATEST_TAG" \
             QEMU_VERSIONS="$QEMU_VERSIONS" \
             QEMU_LATEST="$QEMU_LATEST" \
@@ -770,20 +832,24 @@ jobs:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Merge dnsmasq
         if: needs.detect-changes.outputs.dnsmasq == 'true'
         run: |
-          make merge-dnsmasq \
-            DOCKERHUB_USERNAME="${{ vars.DOCKERHUB_USERNAME }}"
-
+          make merge-dnsmasq
       - name: Merge qemu
         if: needs.detect-changes.outputs.qemu == 'true'
         run: |
           make merge-qemu \
             QEMU_VERSIONS="$QEMU_VERSIONS" \
-            QEMU_LATEST="$QEMU_LATEST" \
-            DOCKERHUB_USERNAME="${{ vars.DOCKERHUB_USERNAME }}"
-        env:
+            QEMU_LATEST="$QEMU_LATEST"        env:
           GITHUB_TOKEN: ${{ github.token }}
 
       - name: Merge cloud-hypervisor
@@ -791,9 +857,7 @@ jobs:
         run: |
           make merge-cloud-hypervisor \
             CH_VERSIONS="$CH_VERSIONS" \
-            CH_LATEST="$CH_LATEST" \
-            DOCKERHUB_USERNAME="${{ vars.DOCKERHUB_USERNAME }}"
-        env:
+            CH_LATEST="$CH_LATEST"        env:
           GITHUB_TOKEN: ${{ github.token }}
 
       - name: Sync dnsmasq README
@@ -853,12 +917,19 @@ jobs:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Build image
         run: |
           make shadowsocks \
             PLATFORM="${{ matrix.platform }}" \
             TAG_SUFFIX="${{ matrix.suffix }}" \
-            DOCKERHUB_USERNAME="${{ vars.DOCKERHUB_USERNAME }}" \
             LATEST_TAG="$LATEST_TAG" \
             PUSH="${{ github.event_name != 'pull_request' && 'true' || 'false' }}"
         env:
@@ -883,11 +954,17 @@ jobs:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Merge manifests
         run: |
-          make merge-shadowsocks \
-            DOCKERHUB_USERNAME="${{ vars.DOCKERHUB_USERNAME }}"
-
+          make merge-shadowsocks
       - name: Sync README to DockerHub
         run: ./scripts/sync-readme.sh shadowsocks/README.md ${{ vars.DOCKERHUB_USERNAME }}/shadowsocks
         env:
@@ -938,13 +1015,20 @@ jobs:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Login to GHCR
+        if: steps.should-build.outputs.build == 'true' && github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Build image
         if: steps.should-build.outputs.build == 'true'
         run: |
           make ${{ matrix.image }} \
             PLATFORM="${{ matrix.platform }}" \
             TAG_SUFFIX="${{ matrix.suffix }}" \
-            DOCKERHUB_USERNAME="${{ vars.DOCKERHUB_USERNAME }}" \
             PUSH="${{ github.event_name != 'pull_request' && 'true' || 'false' }}"
 
   merge-other-images:
@@ -969,24 +1053,26 @@ jobs:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Merge dnsmasq-exporter
         if: needs.detect-changes.outputs.dnsmasq-exporter == 'true'
         run: |
-          make merge-dnsmasq-exporter \
-            DOCKERHUB_USERNAME="${{ vars.DOCKERHUB_USERNAME }}"
-
+          make merge-dnsmasq-exporter
       - name: Merge sqitch-pg
         if: needs.detect-changes.outputs.sqitch-pg == 'true'
         run: |
-          make merge-sqitch-pg \
-            DOCKERHUB_USERNAME="${{ vars.DOCKERHUB_USERNAME }}"
-
+          make merge-sqitch-pg
       - name: Merge wait-for-pg
         if: needs.detect-changes.outputs.wait-for-pg == 'true'
         run: |
-          make merge-wait-for-pg \
-            DOCKERHUB_USERNAME="${{ vars.DOCKERHUB_USERNAME }}"
-
+          make merge-wait-for-pg
       - name: Sync dnsmasq_exporter README
         if: needs.detect-changes.outputs.dnsmasq-exporter == 'true'
         run: ./scripts/sync-readme.sh dnsmasq_exporter/README.md ${{ vars.DOCKERHUB_USERNAME }}/dnsmasq_exporter

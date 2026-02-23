@@ -1,7 +1,11 @@
 # dnsmasq
 
+> **Source**: [Dockerfile](https://github.com/ZigZagT/docker-images/blob/master/dnsmasq/Dockerfile)
+
 ```bash
 docker pull deaddev/dnsmasq
+# or
+docker pull ghcr.io/zigzagt/dnsmasq
 ```
 
 Lightweight DNS/DHCP server based on `deaddev/ubuntu`.

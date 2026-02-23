@@ -1,7 +1,11 @@
 # Wait For PG
 
+> **Source**: [Dockerfile](https://github.com/ZigZagT/docker-images/blob/master/wait-for-pg/Dockerfile)
+
 ```
 docker pull deaddev/wait-for-pg
+# or
+docker pull ghcr.io/zigzagt/wait-for-pg
 ```
 
 Wait for PostgreSQL DB ready to execute a SQL by running `select version()` every 2 seconds.

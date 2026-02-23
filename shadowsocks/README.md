@@ -1,7 +1,11 @@
 # shadowsocks
 
+> **Source**: [Dockerfile](https://github.com/ZigZagT/docker-images/blob/master/shadowsocks/Dockerfile)
+
 ```bash
 docker pull deaddev/shadowsocks
+# or
+docker pull ghcr.io/zigzagt/shadowsocks
 ```
 
 [shadowsocks-rust](https://github.com/shadowsocks/shadowsocks-rust) built from source with explicit feature selection.

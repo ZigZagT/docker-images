@@ -1,7 +1,11 @@
 # cloud-hypervisor
 
+> **Source**: [Dockerfile](https://github.com/ZigZagT/docker-images/blob/master/cloud-hypervisor/Dockerfile)
+
 ```bash
 docker pull deaddev/cloud-hypervisor
+# or
+docker pull ghcr.io/zigzagt/cloud-hypervisor
 ```
 
 [Cloud Hypervisor](https://github.com/cloud-hypervisor/cloud-hypervisor) with pre-built static binaries and firmware.

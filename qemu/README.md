@@ -1,7 +1,11 @@
 # qemu
 
+> **Source**: [Dockerfile](https://github.com/ZigZagT/docker-images/blob/master/qemu/Dockerfile)
+
 ```bash
 docker pull deaddev/qemu
+# or
+docker pull ghcr.io/zigzagt/qemu
 ```
 
 QEMU built from source, optimized for KVM Windows guest with VFIO/PCI passthrough.

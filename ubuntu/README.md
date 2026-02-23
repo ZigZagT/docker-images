@@ -1,10 +1,14 @@
 # Ubuntu
 
+> **Source**: [Dockerfile](https://github.com/ZigZagT/docker-images/tree/master/ubuntu)
+
 Slighly unminimized Ubuntu images with quality-of-life improvements built in.
 A few variants are available offering common build tools and runtimes.
 
 ```bash
 docker pull deaddev/ubuntu
+# or
+docker pull ghcr.io/zigzagt/ubuntu
 ```
 
 All images are built for **linux/amd64** and **linux/arm64** platforms.

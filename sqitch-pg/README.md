@@ -1,9 +1,13 @@
 # Sqitch PG
 
+> **Source**: [Dockerfile](https://github.com/ZigZagT/docker-images/blob/master/sqitch-pg/Dockerfile)
+
 Alpine based [Sqitch](https://sqitch.org/) build with PostgreSQL connector.
 
 ```bash
 docker pull deaddev/sqitch-pg
+# or
+docker pull ghcr.io/zigzagt/sqitch-pg
 ```
 
 Optionally add the shell function for quick and easy CLI access:
