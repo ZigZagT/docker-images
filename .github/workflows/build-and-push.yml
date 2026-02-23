@@ -96,6 +96,7 @@ jobs:
       wait-for-pg: ${{ steps.changes.outputs.wait-for-pg }}
       any-changes: ${{ steps.changes.outputs.any-changes }}
       maxmind-fetch-failed: ${{ steps.maxmind.outputs.maxmind-fetch-failed }}
+      upstream-tags-json: ${{ steps.matrices.outputs.upstream_tags_json }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -127,7 +128,7 @@ jobs:
       - name: Restore MaxMind versions cache
         uses: actions/cache/restore@v4
         with:
-          path: /tmp/maxmind_versions_cached_last_build.txt
+          path: ubuntu-geoip/MAXMIND_VERSIONS
           key: maxmind-versions-
           restore-keys: |
             maxmind-versions-
@@ -135,11 +136,11 @@ jobs:
       - name: Check MaxMind database versions
         id: maxmind
         run: |
-          # Get current versions and compare with cached version from last successful build
+          # Fetch upstream versions into temp file, compare with cached MAXMIND_VERSIONS
           OUTPUT=$(./scripts/get-and-compare-maxmind-versions.sh \
             --key "${{ secrets.MAXMIND_LICENSE_KEY }}" \
-            --output /tmp/maxmind_versions_upstream_latest.txt \
-            --input /tmp/maxmind_versions_cached_last_build.txt)
+            --output /tmp/maxmind_versions_upstream.txt \
+            --input ubuntu-geoip/MAXMIND_VERSIONS)
 
           echo "$OUTPUT"
 
@@ -188,6 +189,8 @@ jobs:
               echo "ubuntu-geoip=true" >> $GITHUB_OUTPUT
               echo "shadowsocks=true" >> $GITHUB_OUTPUT
               echo "dnsmasq=true" >> $GITHUB_OUTPUT
+              echo "qemu=true" >> $GITHUB_OUTPUT
+              echo "cloud-hypervisor=true" >> $GITHUB_OUTPUT
               echo "dnsmasq-exporter=true" >> $GITHUB_OUTPUT
               echo "sqitch-pg=true" >> $GITHUB_OUTPUT
               echo "wait-for-pg=true" >> $GITHUB_OUTPUT
@@ -269,11 +272,71 @@ jobs:
 
           echo "any-changes=$ANY_CHANGES" >> $GITHUB_OUTPUT
 
-  build-ubuntu:
-    name: Build ubuntu
+      - name: Generate build matrices
+        id: matrices
+        run: |
+          echo "upstream_tags_json=$(echo "$UPSTREAM_TAGS" | jq -Rc 'split(" ")')" >> $GITHUB_OUTPUT
+
+  # --- Ubuntu base image (all ubuntu-derived images depend on this) ---
+
+  build-ubuntu-base:
+    name: Build ubuntu:${{ matrix.upstream_tag }}
     runs-on: ubuntu-latest
     needs: detect-changes
     if: needs.detect-changes.outputs.ubuntu == 'true'
+    environment: action-build-and-push
+    strategy:
+      fail-fast: false
+      matrix:
+        upstream_tag: ${{ fromJSON(needs.detect-changes.outputs.upstream-tags-json) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to DockerHub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push ubuntu:${{ matrix.upstream_tag }}
+        run: |
+          make ubuntu \
+            UPSTREAM_TAGS="${{ matrix.upstream_tag }}" \
+            LATEST_TAG="$LATEST_TAG" \
+            TZ="$TZ" \
+            APT_MIRROR="$APT_MIRROR" \
+            DOCKERHUB_USERNAME="$DOCKERHUB_USERNAME" \
+            PUSH="$PUSH"
+        env:
+          LATEST_TAG: ${{ env.LATEST_TAG }}
+          TZ: ${{ env.TZ }}
+          APT_MIRROR: ${{ env.APT_MIRROR }}
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          PUSH: ${{ github.event_name != 'pull_request' && 'true' || 'false' }}
+
+      - name: Sync README to DockerHub
+        if: github.event_name != 'pull_request' && matrix.upstream_tag == env.LATEST_TAG
+        run: |
+          ./scripts/sync-readme.sh ubuntu/README.md ${{ vars.DOCKERHUB_USERNAME }}/ubuntu
+        env:
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+
+  # --- Ubuntu variants (parallel, depend on base only) ---
+
+  build-ubuntu-nodejs:
+    name: Build ubuntu-nodejs
+    runs-on: ubuntu-latest
+    needs: [detect-changes, build-ubuntu-base]
+    if: |
+      always() &&
+      needs.detect-changes.outputs.ubuntu == 'true' &&
+      (needs.build-ubuntu-base.result == 'success' || needs.build-ubuntu-base.result == 'skipped')
     environment: action-build-and-push
     steps:
       - name: Checkout code
@@ -289,15 +352,13 @@ jobs:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push ubuntu images
+      - name: Build and push ubuntu-nodejs images
         run: |
-          make all-ubuntu \
+          make ubuntu-nodejs \
             UPSTREAM_TAGS="$UPSTREAM_TAGS" \
             LATEST_TAG="$LATEST_TAG" \
             NODEJS_VERSIONS="$NODEJS_VERSIONS" \
             DEFAULT_NODEJS_VERSION="$DEFAULT_NODEJS_VERSION" \
-            TZ="$TZ" \
-            APT_MIRROR="$APT_MIRROR" \
             DOCKERHUB_USERNAME="$DOCKERHUB_USERNAME" \
             PUSH="$PUSH"
         env:
@@ -305,27 +366,17 @@ jobs:
           LATEST_TAG: ${{ env.LATEST_TAG }}
           NODEJS_VERSIONS: ${{ env.NODEJS_VERSIONS }}
           DEFAULT_NODEJS_VERSION: ${{ env.DEFAULT_NODEJS_VERSION }}
-          TZ: ${{ env.TZ }}
-          APT_MIRROR: ${{ env.APT_MIRROR }}
           DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
           PUSH: ${{ github.event_name != 'pull_request' && 'true' || 'false' }}
 
-      - name: Sync README to DockerHub
-        if: github.event_name != 'pull_request'
-        run: |
-          ./scripts/sync-readme.sh ubuntu/README.md ${{ vars.DOCKERHUB_USERNAME }}/ubuntu
-        env:
-          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-
-  build-ubuntu-geoip:
-    name: Build ubuntu-geoip
+  build-ubuntu-rust:
+    name: Build ubuntu-rust
     runs-on: ubuntu-latest
-    needs: [detect-changes, build-ubuntu]
+    needs: [detect-changes, build-ubuntu-base]
     if: |
       always() &&
-      needs.detect-changes.outputs.ubuntu-geoip == 'true' &&
-      (needs.build-ubuntu.result == 'success' || needs.build-ubuntu.result == 'skipped')
+      needs.detect-changes.outputs.ubuntu == 'true' &&
+      (needs.build-ubuntu-base.result == 'success' || needs.build-ubuntu-base.result == 'skipped')
     environment: action-build-and-push
     steps:
       - name: Checkout code
@@ -341,11 +392,36 @@ jobs:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Restore MaxMind versions cache for build
+      - name: Build and push ubuntu-rust images
+        run: |
+          make ubuntu-rust \
+            UPSTREAM_TAGS="$UPSTREAM_TAGS" \
+            LATEST_TAG="$LATEST_TAG" \
+            DOCKERHUB_USERNAME="$DOCKERHUB_USERNAME" \
+            PUSH="$PUSH"
+        env:
+          UPSTREAM_TAGS: ${{ env.UPSTREAM_TAGS }}
+          LATEST_TAG: ${{ env.LATEST_TAG }}
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          PUSH: ${{ github.event_name != 'pull_request' && 'true' || 'false' }}
+
+  # --- GeoIP: download databases once, then build tags in parallel ---
+
+  prepare-geoip-databases:
+    name: Prepare GeoIP databases
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.ubuntu-geoip == 'true'
+    environment: action-build-and-push
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Restore MaxMind versions cache
         if: github.event_name != 'pull_request'
         uses: actions/cache/restore@v4
         with:
-          path: /tmp/maxmind_versions_for_build.txt
+          path: ubuntu-geoip/MAXMIND_VERSIONS
           key: maxmind-versions-
           restore-keys: |
             maxmind-versions-
@@ -359,29 +435,21 @@ jobs:
           restore-keys: |
             maxmind-db-
 
-      - name: Build and push ubuntu-geoip
+      - name: Download MaxMind databases
         run: |
-          make ubuntu-geoip \
-            UPSTREAM_TAGS="$UPSTREAM_TAGS" \
-            LATEST_TAG="$LATEST_TAG" \
-            MAXMIND_LICENSE_KEY="$MAXMIND_LICENSE_KEY" \
-            MAXMIND_SAVED_VERSION_FILE="/tmp/maxmind_versions_for_build.txt" \
-            DOCKERHUB_USERNAME="$DOCKERHUB_USERNAME" \
-            PUSH="$PUSH"
+          make ubuntu-geoip-download \
+            MAXMIND_LICENSE_KEY="$MAXMIND_LICENSE_KEY"
         env:
           MAXMIND_LICENSE_KEY: ${{ secrets.MAXMIND_LICENSE_KEY }}
-          UPSTREAM_TAGS: ${{ env.UPSTREAM_TAGS }}
-          LATEST_TAG: ${{ env.LATEST_TAG }}
-          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
-          PUSH: ${{ github.event_name != 'pull_request' && 'true' || 'false' }}
 
-      - name: Sync README to DockerHub
-        if: github.event_name != 'pull_request'
-        run: |
-          ./scripts/sync-readme.sh ubuntu-geoip/README.md ${{ vars.DOCKERHUB_USERNAME }}/ubuntu-geoip
-        env:
-          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Upload databases as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: geoip-databases
+          path: |
+            ubuntu-geoip/databases/
+            ubuntu-geoip/MAXMIND_VERSIONS
+          retention-days: 1
 
       - name: Save MaxMind versions cache
         if: github.event_name != 'pull_request'
@@ -397,21 +465,75 @@ jobs:
           path: ubuntu-geoip/databases
           key: maxmind-db-${{ github.run_id }}
 
-  build-ubuntu-derived:
-    name: Build ${{ matrix.image }}
+  build-ubuntu-geoip:
+    name: Build ubuntu-geoip:${{ matrix.upstream_tag }}
     runs-on: ubuntu-latest
-    needs: [detect-changes, build-ubuntu]
+    needs: [detect-changes, build-ubuntu-base, prepare-geoip-databases]
     if: |
       always() &&
-      (needs.detect-changes.outputs.shadowsocks == 'true' || needs.detect-changes.outputs.dnsmasq == 'true' || needs.detect-changes.outputs.qemu == 'true' || needs.detect-changes.outputs.cloud-hypervisor == 'true') &&
-      (needs.build-ubuntu.result == 'success' || needs.build-ubuntu.result == 'skipped')
+      needs.detect-changes.outputs.ubuntu-geoip == 'true' &&
+      needs.prepare-geoip-databases.result == 'success' &&
+      (needs.build-ubuntu-base.result == 'success' || needs.build-ubuntu-base.result == 'skipped')
+    environment: action-build-and-push
+    strategy:
+      fail-fast: false
+      matrix:
+        upstream_tag: ${{ fromJSON(needs.detect-changes.outputs.upstream-tags-json) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to DockerHub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Download GeoIP databases
+        uses: actions/download-artifact@v4
+        with:
+          name: geoip-databases
+          path: .
+
+      - name: Build and push ubuntu-geoip:${{ matrix.upstream_tag }}
+        run: |
+          make ubuntu-geoip-build \
+            UPSTREAM_TAGS="${{ matrix.upstream_tag }}" \
+            LATEST_TAG="$LATEST_TAG" \
+            DOCKERHUB_USERNAME="$DOCKERHUB_USERNAME" \
+            PUSH="$PUSH"
+        env:
+          LATEST_TAG: ${{ env.LATEST_TAG }}
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          PUSH: ${{ github.event_name != 'pull_request' && 'true' || 'false' }}
+
+      - name: Sync README to DockerHub
+        if: github.event_name != 'pull_request' && matrix.upstream_tag == env.LATEST_TAG
+        run: |
+          ./scripts/sync-readme.sh ubuntu-geoip/README.md ${{ vars.DOCKERHUB_USERNAME }}/ubuntu-geoip
+        env:
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+
+  # --- Images that depend on ubuntu base (not nodejs/rust) ---
+
+  build-ubuntu-base-derived:
+    name: Build ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    needs: [detect-changes, build-ubuntu-base]
+    if: |
+      always() &&
+      (needs.detect-changes.outputs.dnsmasq == 'true' || needs.detect-changes.outputs.qemu == 'true' || needs.detect-changes.outputs.cloud-hypervisor == 'true') &&
+      (needs.build-ubuntu-base.result == 'success' || needs.build-ubuntu-base.result == 'skipped')
     environment: action-build-and-push
     strategy:
       fail-fast: false
       matrix:
         include:
-          - image: shadowsocks
-            output: shadowsocks
           - image: dnsmasq
             output: dnsmasq
           - image: qemu
@@ -456,6 +578,39 @@ jobs:
             PUSH="${{ github.event_name != 'pull_request' && 'true' || 'false' }}"
         env:
           GITHUB_TOKEN: ${{ github.token }}
+
+  # --- Shadowsocks depends on ubuntu:rust ---
+
+  build-shadowsocks:
+    name: Build shadowsocks
+    runs-on: ubuntu-latest
+    needs: [detect-changes, build-ubuntu-rust]
+    if: |
+      always() &&
+      needs.detect-changes.outputs.shadowsocks == 'true' &&
+      (needs.build-ubuntu-rust.result == 'success' || needs.build-ubuntu-rust.result == 'skipped')
+    environment: action-build-and-push
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to DockerHub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build image
+        run: |
+          make shadowsocks \
+            DOCKERHUB_USERNAME="${{ vars.DOCKERHUB_USERNAME }}" \
+            PUSH="${{ github.event_name != 'pull_request' && 'true' || 'false' }}"
+
+  # --- Independent images (no ubuntu dependency) ---
 
   build-other-images:
     name: Build ${{ matrix.image }}

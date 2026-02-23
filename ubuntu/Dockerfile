@@ -33,6 +33,7 @@ RUN echo 'APT::Install-Recommends "false";' >> /etc/apt/apt.conf.d/99_norecommen
         gcc \
         libc6-dev \
     && apt-get autoremove -y --purge \
+    && rm -rf /var/lib/apt/lists/* \
     && /container-setup/setup-tz
 
 ENV CONTAINER_SETUP_LOG=warn

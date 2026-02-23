@@ -11,7 +11,6 @@ RUN if [ -z "$QEMU_VERSION" ]; then echo "QEMU_VERSION not set" && exit 1; fi \
     && BUILD_DEPS=" \
         build-essential \
         ninja-build \
-        python3-venv \
         xz-utils \
         libusb-1.0-0-dev \
         libglib2.0-dev libfdt-dev libpixman-1-dev zlib1g-dev \
@@ -35,6 +34,7 @@ RUN if [ -z "$QEMU_VERSION" ]; then echo "QEMU_VERSION not set" && exit 1; fi \
         netcat-openbsd \
         ovmf \
         python3-pip \
+        python3-venv \
         $BUILD_DEPS \
     && wget --timeout=30 --progress=dot:giga "https://download.qemu.org/qemu-${QEMU_VERSION}.tar.xz" \
     && tar xJf "qemu-${QEMU_VERSION}.tar.xz" \

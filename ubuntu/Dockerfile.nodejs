@@ -18,6 +18,7 @@ RUN if [ -z "$NODE_VERSION" ]; then echo "NODE_VERSION not set" && exit 1; fi \
         python3-setuptools \
     && apt-get purge -y gnupg \
     && apt-get autoremove -y --purge \
+    && rm -rf /var/lib/apt/lists/* \
     # Remove nodesource apt source to prevent future `apt-get update` failures.
     # deb.nodesource.com intermittently serves mismatched package metadata during
     # mirror syncs, causing errors like "File has unexpected size ... Mirror sync

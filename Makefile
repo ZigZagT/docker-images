@@ -21,7 +21,7 @@ ifeq ($(PUSH),true)
 	BUILDX_CMD += --push
 endif
 
-.PHONY: all ubuntu ubuntu-nodejs ubuntu-rust ubuntu-geoip dnsmasq-exporter shadowsocks dnsmasq qemu cloud-hypervisor sqitch-pg wait-for-pg clean
+.PHONY: all ubuntu ubuntu-nodejs ubuntu-rust ubuntu-geoip ubuntu-geoip-download ubuntu-geoip-build dnsmasq-exporter shadowsocks dnsmasq qemu cloud-hypervisor sqitch-pg wait-for-pg clean
 
 # Default target
 all: ubuntu ubuntu-nodejs ubuntu-rust ubuntu-geoip dnsmasq-exporter shadowsocks dnsmasq qemu cloud-hypervisor sqitch-pg wait-for-pg
@@ -95,19 +95,21 @@ ubuntu-rust:
 			ubuntu; \
 	done
 
-ubuntu-geoip:
+ubuntu-geoip: ubuntu-geoip-download ubuntu-geoip-build
+
+ubuntu-geoip-download:
 	@echo "Checking MaxMind database versions..."
-	@cmd="./scripts/get-and-compare-maxmind-versions.sh --key $(or $(MAXMIND_LICENSE_KEY), '') --output ubuntu-geoip/MAXMIND_VERSIONS"; \
-	if [ -n "$(MAXMIND_SAVED_VERSION_FILE)" ]; then \
-		cmd="$$cmd --input $(MAXMIND_SAVED_VERSION_FILE)"; \
-	fi; \
-	MAXMIND_VERSION_CHECK_RESULTS=$$($$cmd) || true; \
+	@MAXMIND_VERSION_CHECK_RESULTS=$$(./scripts/get-and-compare-maxmind-versions.sh \
+		--key '$(or $(MAXMIND_LICENSE_KEY),)' \
+		--output ubuntu-geoip/MAXMIND_VERSIONS.new \
+		--input ubuntu-geoip/MAXMIND_VERSIONS) || true; \
 	NEED_DOWNLOAD=true; \
 	if echo "$$MAXMIND_VERSION_CHECK_RESULTS" | grep -q "fetch_failed=true"; then \
-		echo "MaxMind API rate limited, using cached databases"; \
+		echo "MaxMind API fetch failed, using cached databases"; \
 		NEED_DOWNLOAD=false; \
 	elif echo "$$MAXMIND_VERSION_CHECK_RESULTS" | grep -q "changed=false"; then \
 		echo "MaxMind database versions unchanged, using cached databases"; \
+		rm -f ubuntu-geoip/MAXMIND_VERSIONS.new; \
 		NEED_DOWNLOAD=false; \
 	fi; \
 	if [ "$$NEED_DOWNLOAD" = "true" ]; then \
@@ -123,8 +125,11 @@ ubuntu-geoip:
 			&& rm -rf /tmp/$${edition}* \
 			|| { echo "WARNING: Failed to download $${edition}" >&2; DOWNLOAD_OK=false; break; }; \
 		done; \
-		if [ "$$DOWNLOAD_OK" = "false" ]; then \
-			echo "Download failed, checking for cached databases..."; \
+		if [ "$$DOWNLOAD_OK" = "true" ]; then \
+			mv ubuntu-geoip/MAXMIND_VERSIONS.new ubuntu-geoip/MAXMIND_VERSIONS; \
+		else \
+			echo "Download failed, reverting version file"; \
+			rm -f ubuntu-geoip/MAXMIND_VERSIONS.new; \
 		fi; \
 	fi; \
 	for db in GeoLite2-Country GeoLite2-City GeoLite2-ASN; do \
@@ -133,7 +138,14 @@ ubuntu-geoip:
 		}; \
 	done; \
 	echo "All MaxMind databases present"; \
-	ls -lh ubuntu-geoip/databases/*.mmdb; \
+	ls -lh ubuntu-geoip/databases/*.mmdb
+
+ubuntu-geoip-build:
+	@for db in GeoLite2-Country GeoLite2-City GeoLite2-ASN; do \
+		test -f ubuntu-geoip/databases/$$db.mmdb || { \
+			echo "ERROR: $$db.mmdb not found — run 'make ubuntu-geoip-download' first" >&2; exit 1; \
+		}; \
+	done; \
 	for tag in $(UPSTREAM_TAGS); do \
 		echo "Building ubuntu-geoip:$$tag"; \
 		tags="-t $(DOCKERHUB_USERNAME)/ubuntu-geoip:$$tag"; \
@@ -225,5 +237,5 @@ wait-for-pg:
 
 clean:
 	@echo "Cleaning up..."
-	-rm -f ubuntu-geoip/MAXMIND_VERSIONS
+	-rm -f ubuntu-geoip/MAXMIND_VERSIONS ubuntu-geoip/MAXMIND_VERSIONS.new
 	-rm -rf ubuntu-geoip/databases

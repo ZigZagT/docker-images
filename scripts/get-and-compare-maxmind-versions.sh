@@ -9,10 +9,10 @@ set -e
 #   --output: Path to write current versions (required)
 #   --input: Path to cached versions for comparison (optional)
 #
-# Output:
-#   Writes current versions to output file
-#   If input file provided, prints "changed=true" or "changed=false" to stdout
-#   Exit code 0 on success
+# Output (stdout, one per line):
+#   On fetch failure: "fetch_failed=true" (output file NOT written)
+#   On success with --input: "changed=true" or "changed=false"
+#   On success without --input: (nothing)
 
 # Parse arguments
 LICENSE_KEY=""
@@ -87,24 +87,9 @@ for EDITION in GeoLite2-Country GeoLite2-City GeoLite2-ASN; do
   fi
 done
 
-# If rate limited, use cached versions if available, otherwise create empty version file
+# On fetch failure, leave output file untouched (caller keeps cached version)
 if [[ "${VERSION_FETCH_FAILED}" == "true" ]]; then
-  if [[ -n "${INPUT_FILE}" ]] && [[ -f "${INPUT_FILE}" ]]; then
-    echo "Using cached versions due to rate limiting" >&2
-    CURRENT_VERSIONS=$(cat "${INPUT_FILE}")
-    echo "${CURRENT_VERSIONS}" > "${OUTPUT_FILE}"
-  else
-    echo "Warning: Rate limited or download failed, and no cached versions available, creating placeholder" >&2
-    # Create a placeholder version file to allow build to proceed with fallback
-    echo "GeoLite2-Country" > "${OUTPUT_FILE}"
-    echo "Last-Modified: Download Failed or Rate Limited - Using Previous Image" >> "${OUTPUT_FILE}"
-    echo "GeoLite2-City" >> "${OUTPUT_FILE}"
-    echo "Last-Modified: Download Failed or Rate Limited - Using Previous Image" >> "${OUTPUT_FILE}"
-    echo "GeoLite2-ASN" >> "${OUTPUT_FILE}"
-    echo "Last-Modified: Download Failed or Rate Limited - Using Previous Image" >> "${OUTPUT_FILE}"
-  fi
   echo "fetch_failed=true"
-  echo "changed=false"
   exit 0
 fi
 
