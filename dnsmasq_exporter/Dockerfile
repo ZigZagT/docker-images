@@ -1,4 +1,4 @@
-FROM golang:1-trixie AS build-env
+FROM public.ecr.aws/docker/library/golang:1-trixie AS build-env
 ENV CGO_ENABLED=0
 ENV GOPROXY=direct
 WORKDIR /src

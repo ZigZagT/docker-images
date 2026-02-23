@@ -1,5 +1,5 @@
 ARG UPSTREAM_TAG
-FROM ubuntu:${UPSTREAM_TAG}
+FROM public.ecr.aws/ubuntu/ubuntu:${UPSTREAM_TAG}
 ENV LANG=C.UTF-8 TERM=xterm-256color DEBIAN_FRONTEND=noninteractive
 ARG APT_MIRROR
 ARG TZ

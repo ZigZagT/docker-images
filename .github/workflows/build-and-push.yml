@@ -849,7 +849,8 @@ jobs:
         run: |
           make merge-qemu \
             QEMU_VERSIONS="$QEMU_VERSIONS" \
-            QEMU_LATEST="$QEMU_LATEST"        env:
+            QEMU_LATEST="$QEMU_LATEST"
+        env:
           GITHUB_TOKEN: ${{ github.token }}
 
       - name: Merge cloud-hypervisor
@@ -857,7 +858,8 @@ jobs:
         run: |
           make merge-cloud-hypervisor \
             CH_VERSIONS="$CH_VERSIONS" \
-            CH_LATEST="$CH_LATEST"        env:
+            CH_LATEST="$CH_LATEST"
+        env:
           GITHUB_TOKEN: ${{ github.token }}
 
       - name: Sync dnsmasq README
@@ -886,10 +888,11 @@ jobs:
   build-shadowsocks:
     name: Build shadowsocks (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
-    needs: [detect-changes, build-ubuntu-rust]
+    needs: [detect-changes, build-ubuntu-base, build-ubuntu-rust]
     if: |
       always() &&
       needs.detect-changes.outputs.shadowsocks == 'true' &&
+      (needs.build-ubuntu-base.result == 'success' || needs.build-ubuntu-base.result == 'skipped') &&
       (needs.build-ubuntu-rust.result == 'success' || needs.build-ubuntu-rust.result == 'skipped')
     environment: action-build-and-push
     strategy:
