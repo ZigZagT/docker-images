@@ -98,18 +98,11 @@ echo "${CURRENT_VERSIONS}" > "${OUTPUT_FILE}"
 
 # If input file provided, compare versions
 if [[ -n "${INPUT_FILE}" ]]; then
-  if [[ -f "${INPUT_FILE}" ]]; then
-    CACHED_VERSIONS=$(cat "${INPUT_FILE}")
-
-    if [[ "${CURRENT_VERSIONS}" == "${CACHED_VERSIONS}" ]]; then
-      echo "MaxMind databases unchanged"
-      echo "changed=false"
-    else
-      echo "MaxMind databases updated"
-      echo "changed=true"
-    fi
+  if [[ -f "${INPUT_FILE}" ]] && diff -q "${INPUT_FILE}" "${OUTPUT_FILE}" > /dev/null 2>&1; then
+    echo "MaxMind databases unchanged"
+    echo "changed=false"
   else
-    echo "No cached versions found, assuming changed"
+    echo "MaxMind databases updated"
     echo "changed=true"
   fi
 fi

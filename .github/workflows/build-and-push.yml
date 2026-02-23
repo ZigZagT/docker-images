@@ -95,7 +95,6 @@ jobs:
       sqitch-pg: ${{ steps.changes.outputs.sqitch-pg }}
       wait-for-pg: ${{ steps.changes.outputs.wait-for-pg }}
       any-changes: ${{ steps.changes.outputs.any-changes }}
-      maxmind-fetch-failed: ${{ steps.maxmind.outputs.maxmind-fetch-failed }}
       upstream-tags-json: ${{ steps.matrices.outputs.upstream_tags_json }}
     steps:
       - name: Checkout code
@@ -124,38 +123,6 @@ jobs:
           fi
         env:
           GH_TOKEN: ${{ github.token }}
-
-      - name: Restore MaxMind versions cache
-        if: github.event_name != 'pull_request'
-        uses: actions/cache/restore@v4
-        with:
-          path: ubuntu-geoip/MAXMIND_VERSIONS
-          key: maxmind-versions-
-          restore-keys: |
-            maxmind-versions-
-
-      - name: Check MaxMind database versions
-        if: github.event_name != 'pull_request'
-        id: maxmind
-        run: |
-          # Fetch upstream versions into temp file, compare with cached MAXMIND_VERSIONS
-          OUTPUT=$(./scripts/get-and-compare-maxmind-versions.sh \
-            --key "${{ secrets.MAXMIND_LICENSE_KEY }}" \
-            --output /tmp/maxmind_versions_upstream.txt \
-            --input ubuntu-geoip/MAXMIND_VERSIONS)
-
-          echo "$OUTPUT"
-
-          if echo "$OUTPUT" | grep -q "fetch_failed=true"; then
-            echo "maxmind-fetch-failed=true" >> $GITHUB_OUTPUT
-            echo "maxmind-changed=false" >> $GITHUB_OUTPUT
-          elif echo "$OUTPUT" | grep -q "changed=true"; then
-            echo "maxmind-fetch-failed=false" >> $GITHUB_OUTPUT
-            echo "maxmind-changed=true" >> $GITHUB_OUTPUT
-          else
-            echo "maxmind-fetch-failed=false" >> $GITHUB_OUTPUT
-            echo "maxmind-changed=false" >> $GITHUB_OUTPUT
-          fi
 
       - name: Detect changes
         id: changes
@@ -214,8 +181,7 @@ jobs:
             ANY_CHANGES=true
           else
             echo "ubuntu=false" >> $GITHUB_OUTPUT
-            # Check geoip separately (code changes or MaxMind updates)
-            if ./scripts/has-git-diff-at-path.sh ubuntu-geoip "$BASE_REF" || [[ "${{ steps.maxmind.outputs.maxmind-changed }}" == "true" ]]; then
+            if ./scripts/has-git-diff-at-path.sh ubuntu-geoip "$BASE_REF"; then
               echo "ubuntu-geoip=true" >> $GITHUB_OUTPUT
               ANY_CHANGES=true
             else
@@ -564,19 +530,15 @@ jobs:
     name: Prepare GeoIP databases
     runs-on: ubuntu-latest
     needs: detect-changes
-    if: needs.detect-changes.outputs.ubuntu-geoip == 'true'
+    if: |
+      needs.detect-changes.outputs.ubuntu-geoip == 'true' ||
+      github.event_name != 'pull_request'
     environment: action-build-and-push
+    outputs:
+      maxmind-changed: ${{ steps.maxmind.outputs.changed }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Restore MaxMind databases cache
-        uses: actions/cache/restore@v4
-        with:
-          path: ubuntu-geoip/databases
-          key: maxmind-db-
-          restore-keys: |
-            maxmind-db-
 
       - name: Restore MaxMind versions cache
         if: github.event_name != 'pull_request'
@@ -587,11 +549,41 @@ jobs:
           restore-keys: |
             maxmind-versions-
 
-      - name: Download MaxMind databases
+      - name: Check MaxMind database versions
         if: github.event_name != 'pull_request'
+        id: maxmind
         run: |
-          make ubuntu-geoip-download \
-            MAXMIND_LICENSE_KEY="$MAXMIND_LICENSE_KEY"
+          OUTPUT=$(./scripts/get-and-compare-maxmind-versions.sh \
+            --key "${{ secrets.MAXMIND_LICENSE_KEY }}" \
+            --output /tmp/maxmind_versions_upstream.txt \
+            --input ubuntu-geoip/MAXMIND_VERSIONS)
+          echo "$OUTPUT"
+          if echo "$OUTPUT" | grep -q "changed=true"; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Restore MaxMind databases cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ubuntu-geoip/databases
+          key: maxmind-db-
+          restore-keys: |
+            maxmind-db-
+
+      - name: Download MaxMind databases
+        if: steps.maxmind.outputs.changed == 'true'
+        run: |
+          mkdir -p ubuntu-geoip/databases
+          for edition in GeoLite2-Country GeoLite2-City GeoLite2-ASN; do
+            echo "Downloading ${edition}..."
+            wget -q "https://download.maxmind.com/app/geoip_download?edition_id=${edition}&license_key=${MAXMIND_LICENSE_KEY}&suffix=tar.gz" \
+              -O "/tmp/${edition}.tar.gz"
+            tar -xzf "/tmp/${edition}.tar.gz" -C /tmp
+            mv /tmp/${edition}*/${edition}.mmdb ubuntu-geoip/databases/
+            rm -rf /tmp/${edition}*
+          done
         env:
           MAXMIND_LICENSE_KEY: ${{ secrets.MAXMIND_LICENSE_KEY }}
 
@@ -609,24 +601,19 @@ jobs:
           echo "All MaxMind databases present"
           ls -lh ubuntu-geoip/databases/*.mmdb
 
-      - name: Upload databases as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: geoip-databases
-          path: |
-            ubuntu-geoip/databases/
-            ubuntu-geoip/MAXMIND_VERSIONS
-          retention-days: 1
+      - name: Update MaxMind versions file
+        if: github.event_name != 'pull_request' && steps.maxmind.outputs.changed == 'true'
+        run: cp /tmp/maxmind_versions_upstream.txt ubuntu-geoip/MAXMIND_VERSIONS
 
       - name: Save MaxMind versions cache
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && steps.maxmind.outputs.changed == 'true'
         uses: actions/cache/save@v4
         with:
           path: ubuntu-geoip/MAXMIND_VERSIONS
           key: maxmind-versions-${{ github.run_id }}
 
       - name: Save MaxMind databases cache
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && steps.maxmind.outputs.changed == 'true'
         uses: actions/cache/save@v4
         with:
           path: ubuntu-geoip/databases
@@ -638,7 +625,7 @@ jobs:
     needs: [detect-changes, build-ubuntu-base, prepare-geoip-databases]
     if: |
       always() &&
-      needs.detect-changes.outputs.ubuntu-geoip == 'true' &&
+      (needs.detect-changes.outputs.ubuntu-geoip == 'true' || needs.prepare-geoip-databases.outputs.maxmind-changed == 'true') &&
       needs.prepare-geoip-databases.result == 'success' &&
       (needs.build-ubuntu-base.result == 'success' || needs.build-ubuntu-base.result == 'skipped')
     environment: action-build-and-push
@@ -676,11 +663,21 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Download GeoIP databases
-        uses: actions/download-artifact@v4
+      - name: Restore MaxMind versions from cache
+        uses: actions/cache/restore@v4
         with:
-          name: geoip-databases
-          path: .
+          path: ubuntu-geoip/MAXMIND_VERSIONS
+          key: maxmind-versions-
+          restore-keys: |
+            maxmind-versions-
+
+      - name: Restore GeoIP databases from cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ubuntu-geoip/databases
+          key: maxmind-db-
+          restore-keys: |
+            maxmind-db-
 
       - name: Build and push ubuntu-geoip:${{ matrix.upstream_tag }}
         run: |
@@ -726,12 +723,6 @@ jobs:
           make merge-ubuntu-geoip \
             UPSTREAM_TAGS="$UPSTREAM_TAGS" \
             LATEST_TAG="$LATEST_TAG"
-      - name: Set ubuntu-geoip to private on GHCR
-        run: |
-          gh api -X PATCH /user/packages/container/ubuntu-geoip \
-            --field visibility=private
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Sync README to DockerHub
         run: ./scripts/sync-readme.sh ubuntu-geoip/README.md ${{ vars.DOCKERHUB_USERNAME }}/ubuntu-geoip
