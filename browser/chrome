@@ -1,0 +1,146 @@
+#!/bin/bash
+# chrome — Chrome + browser bridge process manager
+#
+# Foreground (default CMD):
+#   chrome [...chrome-args]     Start both, stay alive
+#
+# Management:
+#   chrome start [...chrome-args]
+#   chrome stop | restart | status
+#   chrome browser start [...chrome-args] | stop | restart | status
+#   chrome bridge start | stop | restart | status
+
+CHROME_ARGS_FILE="/tmp/chrome.args"
+CHROME_PID_FILE="/tmp/chrome.pid"
+BRIDGE_PID_FILE="/tmp/browser-bridge.pid"
+BRIDGE_DIR="/opt/browser-bridge"
+ENTRYPOINT_PID_FILE="/tmp/chrome-entrypoint.pid"
+
+is_running() { [ -f "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null; }
+
+chrome_start() {
+    if is_running "$CHROME_PID_FILE"; then
+        echo "chrome already running (pid $(cat "$CHROME_PID_FILE"))"
+        return 0
+    fi
+    printf '%s\0' "$@" > "$CHROME_ARGS_FILE"
+    ulimit -c 0
+    chrome-launcher "$@" &
+    echo $! > "$CHROME_PID_FILE"
+    echo "chrome started (pid $!)"
+}
+
+chrome_stop() {
+    if [ -f "$CHROME_PID_FILE" ]; then
+        kill "$(cat "$CHROME_PID_FILE")" 2>/dev/null
+        rm -f "$CHROME_PID_FILE"
+    else
+        pkill -f "chrome-raw" 2>/dev/null
+    fi
+    echo "chrome stopped"
+}
+
+chrome_restart() {
+    chrome_stop
+    sleep 1
+    local args=()
+    if [ -f "$CHROME_ARGS_FILE" ]; then
+        while IFS= read -r -d '' arg; do
+            args+=("$arg")
+        done < "$CHROME_ARGS_FILE"
+    fi
+    chrome_start "${args[@]}"
+}
+
+chrome_status() {
+    if is_running "$CHROME_PID_FILE"; then
+        echo "chrome: running (pid $(cat "$CHROME_PID_FILE"))"
+    else
+        echo "chrome: not running"
+    fi
+}
+
+bridge_start() {
+    if is_running "$BRIDGE_PID_FILE"; then
+        echo "bridge already running (pid $(cat "$BRIDGE_PID_FILE"))"
+        return 0
+    fi
+    cd "$BRIDGE_DIR"
+    ulimit -c 0
+    node server.mjs &
+    echo $! > "$BRIDGE_PID_FILE"
+    echo "bridge started (pid $!)"
+}
+
+bridge_stop() {
+    if [ -f "$BRIDGE_PID_FILE" ]; then
+        kill "$(cat "$BRIDGE_PID_FILE")" 2>/dev/null
+        rm -f "$BRIDGE_PID_FILE"
+    else
+        pkill -f "browser-bridge/server.mjs" 2>/dev/null
+    fi
+    echo "bridge stopped"
+}
+
+bridge_status() {
+    if is_running "$BRIDGE_PID_FILE"; then
+        echo "bridge: running (pid $(cat "$BRIDGE_PID_FILE"))"
+        curl -s "http://127.0.0.1:${BRIDGE_PORT:-6080}/health" 2>/dev/null
+    else
+        echo "bridge: not running"
+    fi
+}
+
+usage() {
+    echo "Usage: chrome [...chrome-args]"
+    echo "       chrome {start|stop|restart|status}"
+    echo "       chrome browser {start [...chrome-args]|stop|restart|status}"
+    echo "       chrome bridge {start|stop|restart|status}"
+}
+
+case "$1" in
+    browser)
+        case "$2" in
+            start)   shift 2; chrome_start "$@" ;;
+            stop)    chrome_stop ;;
+            restart) chrome_restart ;;
+            status)  chrome_status ;;
+            *)       usage ;;
+        esac ;;
+    bridge)
+        case "$2" in
+            start)   bridge_start ;;
+            stop)    bridge_stop ;;
+            restart) bridge_stop; sleep 1; bridge_start ;;
+            status)  bridge_status ;;
+            *)       usage ;;
+        esac ;;
+    start)
+        shift; chrome_start "$@"; bridge_start ;;
+    stop)
+        bridge_stop; chrome_stop
+        # Signal foreground entrypoint to exit if running
+        if [ -f "$ENTRYPOINT_PID_FILE" ]; then
+            kill -TERM "$(cat "$ENTRYPOINT_PID_FILE")" 2>/dev/null
+        fi ;;
+    restart)
+        bridge_stop; chrome_restart; bridge_start ;;
+    status)
+        chrome_status; bridge_status ;;
+    -h|--help|help)
+        usage ;;
+    *)
+        # Chrome flags (--*): exec into chrome-launcher directly.
+        # Supports executablePath usage by puppeteer/playwright.
+        if [ $# -gt 0 ] && [[ "$1" == --* ]]; then
+            exec chrome-launcher "$@"
+        fi
+
+        # No args: foreground mode, start both, stay alive for container use
+        echo $$ > "$ENTRYPOINT_PID_FILE"
+        chrome_start
+        bridge_start
+        trap 'bridge_stop; chrome_stop; rm -f "$ENTRYPOINT_PID_FILE"; exit 0' TERM INT
+        while true; do sleep 86400 & wait $!; done
+        ;;
+esac
