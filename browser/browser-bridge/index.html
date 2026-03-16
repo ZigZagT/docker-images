@@ -417,7 +417,7 @@ function connect() {
     if (msg.type === 'targetChanged') {
       urlBar.value = msg.url || '';
       currentTargetId = msg.targetId;
-      location.hash = msg.targetId;
+      location.hash = msg.stableId || msg.targetId;
       setStatus('connected', 'connected');
       // Reset loading indicator — new tab's state will arrive via CDP events
       const reloadBtn = document.getElementById('btn-reload');

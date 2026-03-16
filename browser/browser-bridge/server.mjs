@@ -83,13 +83,22 @@ function scheduleTabBroadcast() {
   }, 500);
 }
 
-async function findPageTarget(targetId) {
+async function findPageTarget(identifier) {
   const targets = await getCdpTargets();
+  const pages = targets.filter(t => t.type === 'page');
   let page;
-  if (targetId) page = targets.find(t => t.id === targetId);
-  if (!page) page = targets.find(t => t.type === 'page');
+  if (identifier) {
+    page = pages.find(t => t.id === identifier);
+    // Fall back to URL match — survives browser restarts where targetIds change
+    if (!page) page = pages.find(t => t.url === identifier);
+  }
+  if (!page) page = pages[0];
   if (!page) throw new Error('No page target found');
-  return { targetId: page.id, url: page.url, title: page.title };
+  const urlUnique = pages.filter(t => t.url === page.url).length === 1;
+  return {
+    targetId: page.id, url: page.url, title: page.title,
+    stableId: urlUnique ? page.url : page.id
+  };
 }
 
 function normalizeUrl(input) {
@@ -885,7 +894,7 @@ viewerWss.on('connection', async (client, req) => {
     log.debug('connectToTarget: total %dms', Date.now() - ct0);
     if (zoomLevel !== 1.0) await applyZoom();
 
-    clientSend({ type: 'targetChanged', targetId: currentTargetId, url: target.url, title: target.title });
+    clientSend({ type: 'targetChanged', targetId: currentTargetId, url: target.url, title: target.title, stableId: target.stableId });
 
     // Seed lastKnownOrder so reconcileTabs can compute adjacent tabs
     lastKnownOrder = [...knownTabs.entries()]
