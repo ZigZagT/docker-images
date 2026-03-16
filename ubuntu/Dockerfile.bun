@@ -1,0 +1,5 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+ENV BUN_INSTALL=/usr/local
+RUN curl -fsSL https://bun.com/install | bash

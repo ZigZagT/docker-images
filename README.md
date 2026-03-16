@@ -4,7 +4,7 @@
 
 All images are built for **linux/amd64** and **linux/arm64** platforms.
 
-- **[ubuntu](ubuntu/README.md)** - Ubuntu images with quality-of-life tweaks
+- **[ubuntu](ubuntu/README.md)** - Ubuntu images with quality-of-life tweaks (variants: nodejs, rust, bun)
 - **[ubuntu-geoip](ubuntu-geoip/README.md)** - Ubuntu image with MaxMind GeoIP databases
 - **[shadowsocks](shadowsocks/README.md)** - shadowsocks-rust client and server
 - **[dnsmasq](dnsmasq/README.md)** - Lightweight DNS/DHCP server

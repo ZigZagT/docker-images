@@ -32,6 +32,10 @@ All images are built for **linux/amd64** and **linux/arm64** platforms.
 | `rust` | Rust Stable on Latest Ubuntu (24.04) |
 | `24.04-rust` | Rust Stable on Ubuntu 24.04 |
 | `22.04-rust` | Rust Stable on Ubuntu 22.04 |
+| `bun` | Bun on Latest Ubuntu (24.04) |
+| `26.04-bun` | Bun on Ubuntu 26.04 |
+| `24.04-bun` | Bun on Ubuntu 24.04 |
+| `22.04-bun` | Bun on Ubuntu 22.04 |
 
 ### End of Life (EOL)
 

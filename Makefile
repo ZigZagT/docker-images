@@ -27,12 +27,12 @@ ifeq ($(PUSH),true)
 	BUILDX_CMD += --push
 endif
 
-.PHONY: all ubuntu ubuntu-nodejs ubuntu-rust ubuntu-geoip ubuntu-geoip-download ubuntu-geoip-build dnsmasq-exporter shadowsocks dnsmasq qemu cloud-hypervisor sqitch-pg wait-for-pg clean
-.PHONY: merge-ubuntu merge-ubuntu-nodejs merge-ubuntu-rust merge-ubuntu-geoip merge-shadowsocks merge-dnsmasq merge-qemu merge-cloud-hypervisor merge-dnsmasq-exporter merge-sqitch-pg merge-wait-for-pg
+.PHONY: all ubuntu ubuntu-nodejs ubuntu-rust ubuntu-bun ubuntu-geoip ubuntu-geoip-download ubuntu-geoip-build dnsmasq-exporter shadowsocks dnsmasq qemu cloud-hypervisor sqitch-pg wait-for-pg clean
+.PHONY: merge-ubuntu merge-ubuntu-nodejs merge-ubuntu-rust merge-ubuntu-bun merge-ubuntu-geoip merge-shadowsocks merge-dnsmasq merge-qemu merge-cloud-hypervisor merge-dnsmasq-exporter merge-sqitch-pg merge-wait-for-pg
 
 # Default target
-all: ubuntu ubuntu-nodejs ubuntu-rust ubuntu-geoip dnsmasq-exporter shadowsocks dnsmasq qemu cloud-hypervisor sqitch-pg wait-for-pg
-all-ubuntu: ubuntu ubuntu-nodejs ubuntu-rust
+all: ubuntu ubuntu-nodejs ubuntu-rust ubuntu-bun ubuntu-geoip dnsmasq-exporter shadowsocks dnsmasq qemu cloud-hypervisor sqitch-pg wait-for-pg
+all-ubuntu: ubuntu ubuntu-nodejs ubuntu-rust ubuntu-bun
 
 ubuntu:
 	@for tag in $(UPSTREAM_TAGS); do \
@@ -108,6 +108,23 @@ ubuntu-rust:
 			--build-arg RUST_VERSION=stable \
 			$$tags \
 			-f ubuntu/Dockerfile.rust \
+			ubuntu; \
+	done
+
+ubuntu-bun:
+	@for ubuntu in $(UPSTREAM_TAGS); do \
+		echo "Building ubuntu:$$ubuntu-bun$(TAG_SUFFIX)"; \
+		tags=""; \
+		for reg in $(REGISTRIES); do \
+			tags="$$tags -t $$reg/ubuntu:$$ubuntu-bun$(TAG_SUFFIX)"; \
+			if [ "$$ubuntu" = "$(LATEST_TAG)" ]; then \
+				tags="$$tags -t $$reg/ubuntu:bun$(TAG_SUFFIX)"; \
+			fi; \
+		done; \
+		$(BUILDX_CMD) \
+			--build-arg BASE_IMAGE=$(CACHE_REGISTRY)/ubuntu:$$ubuntu$(TAG_SUFFIX) \
+			$$tags \
+			-f ubuntu/Dockerfile.bun \
 			ubuntu; \
 	done
 
@@ -352,6 +369,22 @@ merge-ubuntu-rust:
 			for arch in $(ARCHS); do sources="$$sources $(CACHE_REGISTRY)/ubuntu:rust-$$arch"; done; \
 			for reg in $(REGISTRIES); do \
 				docker buildx imagetools create -t $$reg/ubuntu:rust $$sources; \
+			done; \
+		fi; \
+	done
+
+merge-ubuntu-bun:
+	@for ubuntu in $(UPSTREAM_TAGS); do \
+		sources=""; \
+		for arch in $(ARCHS); do sources="$$sources $(CACHE_REGISTRY)/ubuntu:$$ubuntu-bun-$$arch"; done; \
+		for reg in $(REGISTRIES); do \
+			docker buildx imagetools create -t $$reg/ubuntu:$$ubuntu-bun $$sources; \
+		done; \
+		if [ "$$ubuntu" = "$(LATEST_TAG)" ]; then \
+			sources=""; \
+			for arch in $(ARCHS); do sources="$$sources $(CACHE_REGISTRY)/ubuntu:bun-$$arch"; done; \
+			for reg in $(REGISTRIES); do \
+				docker buildx imagetools create -t $$reg/ubuntu:bun $$sources; \
 			done; \
 		fi; \
 	done
