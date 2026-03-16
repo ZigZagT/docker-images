@@ -34,8 +34,8 @@ FROM ${RUNTIME_IMAGE}
 
 WORKDIR /config
 
-COPY --from=builder /root/.cargo/bin/sslocal /usr/bin/
-COPY --from=builder /root/.cargo/bin/ssserver /usr/bin/
+COPY --from=builder /usr/local/cargo/bin/sslocal /usr/bin/
+COPY --from=builder /usr/local/cargo/bin/ssserver /usr/bin/
 
 RUN apt-get update \
     && apt-get install -y \
