@@ -1,0 +1,37 @@
+#!/bin/bash
+# chromium-launcher — run Chrome with sane defaults
+# Wraps chromium-raw with viewport, rendering, and anti-detection flags.
+# Extra args are appended (Chrome uses last value for duplicate flags).
+
+VIEWPORT_WIDTH="${VIEWPORT_WIDTH:-1920}"
+VIEWPORT_HEIGHT="${VIEWPORT_HEIGHT:-1080}"
+CDP_PORT="${CDP_PORT:-18800}"
+
+UA_FILE="/usr/local/etc/chrome-ua"
+UA=""
+if [ -f "$UA_FILE" ]; then
+    UA=$(cat "$UA_FILE")
+fi
+
+filtered=()
+for arg in "$@"; do
+    case "$arg" in
+        --disable-sync|--disable-background-networking|about:blank) ;;
+        *) filtered+=("$arg") ;;
+    esac
+done
+
+exec chromium-raw \
+    --headless \
+    --no-sandbox \
+    --remote-debugging-port="$CDP_PORT" \
+    --window-size="${VIEWPORT_WIDTH},${VIEWPORT_HEIGHT}" \
+    --screen-info="{0,0 ${VIEWPORT_WIDTH}x${VIEWPORT_HEIGHT}}" \
+    --disable-renderer-backgrounding \
+    --disable-background-timer-throttling \
+    --disable-backgrounding-occluded-windows \
+    --font-render-hinting=none \
+    --force-device-scale-factor=1 \
+    --force-color-profile=srgb \
+    ${UA:+--user-agent="$UA"} \
+    "${filtered[@]}"

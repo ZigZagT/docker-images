@@ -27,11 +27,11 @@ ifeq ($(PUSH),true)
 	BUILDX_CMD += --push
 endif
 
-.PHONY: all ubuntu ubuntu-nodejs ubuntu-rust ubuntu-bun ubuntu-geoip ubuntu-geoip-download ubuntu-geoip-build dnsmasq-exporter shadowsocks dnsmasq qemu cloud-hypervisor sqitch-pg wait-for-pg clean
+.PHONY: all ubuntu ubuntu-nodejs ubuntu-rust ubuntu-bun ubuntu-geoip ubuntu-geoip-download ubuntu-geoip-build dnsmasq-exporter shadowsocks dnsmasq qemu cloud-hypervisor browser sqitch-pg wait-for-pg clean
 .PHONY: merge-ubuntu merge-ubuntu-nodejs merge-ubuntu-rust merge-ubuntu-bun merge-ubuntu-geoip merge-shadowsocks merge-dnsmasq merge-qemu merge-cloud-hypervisor merge-dnsmasq-exporter merge-sqitch-pg merge-wait-for-pg
 
 # Default target
-all: ubuntu ubuntu-nodejs ubuntu-rust ubuntu-bun ubuntu-geoip dnsmasq-exporter shadowsocks dnsmasq qemu cloud-hypervisor sqitch-pg wait-for-pg
+all: ubuntu ubuntu-nodejs ubuntu-rust ubuntu-bun ubuntu-geoip dnsmasq-exporter shadowsocks dnsmasq qemu cloud-hypervisor browser sqitch-pg wait-for-pg
 all-ubuntu: ubuntu ubuntu-nodejs ubuntu-rust ubuntu-bun
 
 ubuntu:
@@ -206,6 +206,18 @@ shadowsocks:
 		--build-arg RUNTIME_IMAGE=$(CACHE_REGISTRY)/ubuntu:$(LATEST_TAG)$(TAG_SUFFIX) \
 		$$tags \
 		shadowsocks
+
+browser:
+	@echo "Building browser:chrome..."
+	@tags=""; \
+	for reg in $(REGISTRIES); do \
+		tags="$$tags -t $$reg/browser:chrome"; \
+	done; \
+	docker buildx build --platform linux/amd64 \
+		$(if $(filter true,$(PUSH)),--push) \
+		--build-arg BASE_IMAGE=$(CACHE_REGISTRY)/ubuntu:nodejs$(TAG_SUFFIX) \
+		$$tags \
+		browser
 
 dnsmasq:
 	@echo "Building dnsmasq$(TAG_SUFFIX)..."

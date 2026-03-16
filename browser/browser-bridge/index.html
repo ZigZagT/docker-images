@@ -1,0 +1,1007 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Browser Bridge</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #1a1a1a;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    font-family: -apple-system, system-ui, sans-serif;
+    color: #ccc;
+    overflow: hidden;
+  }
+  #tabs {
+    display: flex;
+    align-items: center;
+    background: #252525;
+    border-bottom: 1px solid #333;
+    min-height: 32px;
+    overflow-x: auto;
+    scrollbar-width: thin;
+  }
+  .tab {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 10px;
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+    max-width: 220px;
+    border-right: 1px solid #333;
+    border-bottom: 2px solid transparent;
+    flex-shrink: 0;
+  }
+  .tab:hover { background: #333; }
+  .tab.active { background: #2a2a2a; color: #fff; border-bottom-color: #FF4500; }
+  .tab-title {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .tab-close {
+    font-size: 14px;
+    color: #888;
+    cursor: pointer;
+    padding: 0 2px;
+    line-height: 1;
+    flex-shrink: 0;
+  }
+  .tab-close:hover { color: #f66; }
+  .tab.closing { opacity: 0.4; pointer-events: none; }
+  .tab.closing .tab-close { display: none; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .tab-spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid #555; border-top-color: #ccc; border-radius: 50%; animation: spin 0.6s linear infinite; flex-shrink: 0; }
+  .tab-new {
+    padding: 6px 12px;
+    font-size: 16px;
+    cursor: pointer;
+    color: #888;
+    flex-shrink: 0;
+  }
+  .tab-new:hover { color: #fff; background: #333; }
+  .tab:focus { outline: 2px solid #FF4500; outline-offset: -2px; }
+  .tab-new:focus { outline: 2px solid #FF4500; outline-offset: -2px; }
+  #toolbar {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 8px;
+    background: #2a2a2a;
+    border-bottom: 1px solid #444;
+  }
+  .btn {
+    background: #333;
+    border: 1px solid #555;
+    color: #ccc;
+    padding: 4px 10px;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 14px;
+    line-height: 1;
+    min-width: 32px;
+    min-height: 28px;
+    box-sizing: border-box;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .btn:hover { background: #444; color: #fff; }
+  .btn:active { background: #555; }
+  .btn:focus { outline: none; border-color: #FF4500; }
+  /* nav icon buttons: uniform size, scaled arrows to match reload/grid */
+  #btn-back, #btn-forward { font-size: 12px; }
+  #btn-reload { font-size: 16px; }
+  #btn-site-info { font-size: 15px; }
+  .btn-devtools {
+    font-size: 11px;
+    padding: 4px 8px;
+  }
+  #url-bar {
+    flex: 1;
+    padding: 5px 10px;
+    background: #1a1a1a;
+    border: 1px solid #555;
+    border-radius: 3px;
+    color: #eee;
+    font-size: 13px;
+  }
+  #url-bar:focus { outline: none; border-color: #FF4500; }
+  #status {
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 3px;
+    flex-shrink: 0;
+  }
+  .connected { background: #2d5a2d; color: #6f6; }
+  .disconnected { background: #5a2d2d; color: #f66; }
+  .connecting { background: #5a5a2d; color: #ff6; }
+  #viewer {
+    flex: 1;
+    overflow: hidden;
+    position: relative;
+    cursor: default;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  #screen { display: block; outline: none; border: 2px solid transparent; }
+  #screen:focus { border-color: #FF4500; }
+  .menu-wrap { position: relative; }
+  .menu {
+    display: none;
+    position: absolute;
+    top: 100%;
+    right: 0;
+    background: #2a2a2a;
+    border: 1px solid #555;
+    border-radius: 3px;
+    min-width: 170px;
+    z-index: 100;
+    padding: 4px 0;
+  }
+  .menu.open { display: block; }
+  .menu-item {
+    display: block;
+    width: 100%;
+    padding: 6px 14px;
+    font-size: 12px;
+    color: #ccc;
+    background: none;
+    border: none;
+    text-align: left;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .menu-item:hover { background: #444; color: #fff; }
+  .menu-sep { border-top: 1px solid #444; margin: 4px 0; }
+  #ext-bar {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    padding: 0 2px;
+  }
+  #ext-bar:not(:empty) {
+    border-left: 1px solid #555;
+    margin-left: 4px;
+  }
+  .ext-icon {
+    width: 20px;
+    height: 20px;
+    border-radius: 3px;
+    cursor: pointer;
+    opacity: 0.7;
+    flex-shrink: 0;
+  }
+  .ext-icon:hover { opacity: 1; }
+  #btn-profile {
+    position: relative;
+    width: 26px;
+    height: 26px;
+    border-radius: 50%;
+    background: #555;
+    color: #fff;
+    font-size: 12px;
+    font-weight: bold;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    border: 2px solid #666;
+    padding: 0;
+    flex-shrink: 0;
+  }
+  #btn-profile:hover { border-color: #FF4500; }
+  #btn-profile.profile-ok { border-color: #666; }
+  #btn-profile.profile-error {
+    border-color: #f44336;
+    animation: pulse-border 1.5s ease-in-out infinite;
+  }
+  #btn-profile.profile-warning { border-color: #ff9800; }
+  #btn-profile.profile-signed-out { border-color: #666; }
+  @keyframes pulse-border {
+    0%, 100% { border-color: #f44336; }
+    50% { border-color: #ff8a80; }
+  }
+  #profile-badge {
+    position: absolute;
+    top: -6px;
+    right: -8px;
+    background: #f44336;
+    color: #fff;
+    font-size: 8px;
+    font-weight: bold;
+    padding: 1px 3px;
+    border-radius: 3px;
+    white-space: nowrap;
+    display: none;
+  }
+  #toast {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    background: #333;
+    color: #eee;
+    padding: 12px 20px;
+    border-radius: 6px;
+    border: 1px solid #555;
+    font-size: 13px;
+    line-height: 1.5;
+    z-index: 999;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.2s;
+    text-align: center;
+    max-width: 420px;
+  }
+  #toast.visible { opacity: 1; }
+  #find-bar {
+    display: none;
+    position: absolute;
+    top: 0;
+    right: 20px;
+    background: #333;
+    border: 1px solid #555;
+    border-radius: 0 0 6px 6px;
+    padding: 6px 8px;
+    z-index: 50;
+    align-items: center;
+    gap: 6px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+  }
+  #find-bar.open { display: flex; }
+  #find-input {
+    padding: 3px 8px;
+    background: #1a1a1a;
+    border: 1px solid #555;
+    border-radius: 3px;
+    color: #eee;
+    font-size: 13px;
+    width: 220px;
+  }
+  #find-input:focus { outline: none; border-color: #FF4500; }
+  #find-count {
+    font-size: 11px;
+    color: #999;
+    white-space: nowrap;
+    min-width: 50px;
+    text-align: center;
+  }
+  .find-btn {
+    background: none;
+    border: none;
+    color: #999;
+    cursor: pointer;
+    font-size: 12px;
+    padding: 2px 4px;
+    border-radius: 3px;
+  }
+  .find-btn:hover { color: #fff; background: #444; }
+</style>
+</head>
+<body>
+<div id="tabs"><div class="tab-new" id="btn-new-tab" title="New tab">+</div></div>
+<div id="toolbar">
+  <button class="btn" id="btn-back" title="Back">&#9664;</button>
+  <button class="btn" id="btn-forward" title="Forward">&#9654;</button>
+  <button class="btn" id="btn-reload" title="Reload">&#8635;</button>
+  <button class="btn btn-devtools" id="btn-site-info" title="Site settings">⊞</button>
+  <input id="url-bar" type="text" placeholder="URL..." />
+  <div id="ext-bar"></div>
+  <button class="btn" id="btn-zoom-out" title="Zoom Out">-</button>
+  <button class="btn" id="btn-zoom-reset" title="Reset Zoom">Fit</button>
+  <button class="btn" id="btn-zoom-in" title="Zoom In">+</button>
+  <button class="btn btn-devtools" id="btn-devtools" title="Open DevTools">DevTools</button>
+  <button id="btn-profile" class="profile-signed-out" title="Not signed in">
+    <span id="profile-initial">?</span>
+    <span id="profile-badge">!</span>
+  </button>
+  <div class="menu-wrap">
+    <button class="btn btn-devtools" id="btn-menu" title="Chrome pages">☰</button>
+    <div class="menu" id="chrome-menu">
+      <button class="menu-item" data-url="chrome://bookmarks">Bookmarks</button>
+      <button class="menu-item" data-url="chrome://history">History</button>
+      <button class="menu-item" data-url="chrome://downloads">Downloads</button>
+      <button class="menu-item" data-url="chrome://extensions">Extensions</button>
+      <button class="menu-item" data-url="chrome://password-manager/passwords">Passwords</button>
+      <div class="menu-sep"></div>
+      <button class="menu-item" data-url="chrome://settings">Settings</button>
+      <button class="menu-item" data-url="chrome://settings/syncSetup">Sync</button>
+      <button class="menu-item" data-url="chrome://policy">Policies</button>
+      <div class="menu-sep"></div>
+      <button class="menu-item" data-url="chrome://version">Version</button>
+      <button class="menu-item" data-url="chrome://profile-internals">Profile Internals</button>
+      <button class="menu-item" data-url="chrome://net-internals">Net Internals</button>
+      <button class="menu-item" data-url="chrome://components">Components</button>
+      <button class="menu-item" data-url="chrome://sync-internals">Sync Internals</button>
+      <div class="menu-sep"></div>
+      <button class="menu-item" data-action="copyInternalState">Copy Internal State</button>
+      <div class="menu-sep"></div>
+      <button class="menu-item" data-action="browserStart">Start Browser</button>
+      <button class="menu-item" data-action="browserStop">Shutdown Browser</button>
+      <button class="menu-item" data-action="browserRestart">Restart Browser</button>
+      <button class="menu-item" data-action="bridgeRestart">Restart Bridge</button>
+    </div>
+  </div>
+  <span id="status" class="disconnected">disconnected</span>
+</div>
+<div id="viewer">
+  <div id="find-bar">
+    <input id="find-input" type="text" placeholder="Find..." spellcheck="false" />
+    <span id="find-count"></span>
+    <button class="find-btn" id="find-prev" title="Previous (Shift+Enter)">&#9650;</button>
+    <button class="find-btn" id="find-next" title="Next (Enter)">&#9660;</button>
+    <button class="find-btn" id="find-close" title="Close (Esc)">&#10005;</button>
+  </div>
+  <canvas id="screen" tabindex="0"></canvas>
+</div>
+<div id="toast"></div>
+<script>
+const canvas = document.getElementById('screen');
+const ctx = canvas.getContext('2d');
+const statusEl = document.getElementById('status');
+const urlBar = document.getElementById('url-bar');
+const viewer = document.getElementById('viewer');
+const tabsEl = document.getElementById('tabs');
+
+let ws;
+let img = new Image();
+let frameWidth = 0;
+let frameHeight = 0;
+let scale = 1;
+let zoomLevel = 1.0;
+let currentTabs = [];
+let currentTargetId = null;
+let pendingNewTabFocus = false;
+const closingTabs = new Set();
+let tabRefreshInterval;
+let profileInterval;
+
+const extBar = document.getElementById('ext-bar');
+const findBar = document.getElementById('find-bar');
+const findInput = document.getElementById('find-input');
+const findCountEl = document.getElementById('find-count');
+const basePath = location.pathname.replace(/\/index\.html$/, '').replace(/\/$/, '');
+
+function setStatus(text, cls) {
+  statusEl.textContent = text;
+  statusEl.className = cls;
+}
+
+function connect() {
+  setStatus('connecting...', 'connecting');
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const hashTarget = location.hash.slice(1);
+  const wsParams = hashTarget ? '?target=' + encodeURIComponent(hashTarget) : '';
+  ws = new WebSocket(`${proto}://${location.host}${basePath}/ws${wsParams}`);
+
+  ws.onopen = () => {
+    setStatus('connecting...', 'connecting');
+    requestTabs();
+    send({ type: 'getExtensions' });
+    send({ type: 'getProfileStatus' });
+    tabRefreshInterval = setInterval(() => { requestTabs(); send({ type: 'getExtensions' }); }, 3000);
+    profileInterval = setInterval(() => send({ type: 'getProfileStatus' }), 60000);
+  };
+  ws.onclose = () => {
+    setStatus('disconnected', 'disconnected');
+    clearInterval(tabRefreshInterval);
+    clearInterval(profileInterval);
+    setTimeout(connect, 2000);
+  };
+  ws.onerror = () => {};
+
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+
+    if (msg.type === 'frame') {
+      img.onload = () => {
+        if (img.naturalWidth !== frameWidth || img.naturalHeight !== frameHeight) {
+          frameWidth = img.naturalWidth;
+          frameHeight = img.naturalHeight;
+          resize();
+        }
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      };
+      img.src = 'data:image/jpeg;base64,' + msg.data;
+    }
+
+    if (msg.type === 'navigated' && msg.url) {
+      urlBar.value = msg.url;
+    }
+
+    if (msg.type === 'targetChanged') {
+      urlBar.value = msg.url || '';
+      currentTargetId = msg.targetId;
+      location.hash = msg.targetId;
+      setStatus('connected', 'connected');
+      // Reset loading indicator — new tab's state will arrive via CDP events
+      const reloadBtn = document.getElementById('btn-reload');
+      reloadBtn.textContent = '↻';
+      reloadBtn.title = 'Reload';
+      reloadBtn.dataset.loading = '';
+      requestTabs();
+      if (pendingNewTabFocus) {
+        pendingNewTabFocus = false;
+        urlBar.focus();
+        urlBar.select();
+      }
+    }
+
+    if (msg.type === 'tabs') {
+      // Preserve closing tabs at their original position.
+      // Server omits them (already gone from /json/list) but client
+      // keeps showing the spinner until tabCloseComplete arrives.
+      for (const id of closingTabs) {
+        if (!msg.tabs.find(t => t.id === id)) {
+          const prev = currentTabs.find(t => t.id === id);
+          if (prev) {
+            const prevIdx = currentTabs.indexOf(prev);
+            const insertAt = Math.min(prevIdx, msg.tabs.length);
+            msg.tabs.splice(insertAt, 0, prev);
+          }
+        }
+      }
+      currentTabs = msg.tabs;
+      renderTabs();
+    }
+
+    if (msg.type === 'tabCloseComplete') {
+      closingTabs.delete(msg.targetId);
+      renderTabs();
+    }
+
+    if (msg.type === 'tabsChanged') {
+      requestTabs();
+      send({ type: 'getExtensions' });
+    }
+
+    if (msg.type === 'tabClosing') {
+      closingTabs.add(msg.targetId);
+      renderTabs();
+    }
+
+    if (msg.type === 'loading') {
+      const btn = document.getElementById('btn-reload');
+      if (msg.loading) {
+        btn.textContent = '✕';
+        btn.title = 'Stop';
+        btn.dataset.loading = '1';
+      } else {
+        btn.textContent = '↻';
+        btn.title = 'Reload';
+        btn.dataset.loading = '';
+      }
+    }
+
+    if (msg.type === 'extensions') {
+      renderExtensions(msg.extensions);
+    }
+
+    if (msg.type === 'profileStatus') {
+      const btn = document.getElementById('btn-profile');
+      const initialEl = document.getElementById('profile-initial');
+      const badge = document.getElementById('profile-badge');
+      if (msg.avatar) {
+        btn.style.backgroundImage = 'url(' + msg.avatar + ')';
+        btn.style.backgroundSize = 'cover';
+        initialEl.style.display = 'none';
+      } else {
+        btn.style.backgroundImage = '';
+        initialEl.style.display = '';
+        initialEl.textContent = msg.email ? msg.email.charAt(0).toUpperCase() : '?';
+      }
+      btn.className = '';
+      badge.style.display = 'none';
+      if (msg.status === 'ok') {
+        btn.classList.add('profile-ok');
+      } else if (msg.status === 'error') {
+        btn.classList.add('profile-error');
+        badge.textContent = (msg.transport || 'ERROR').toUpperCase();
+        badge.style.display = 'block';
+      } else {
+        btn.classList.add('profile-signed-out');
+      }
+      const name = msg.fullName || msg.email || 'Not signed in';
+      btn.title = msg.summary ? name + ' — ' + msg.summary : name;
+    }
+
+    if (msg.type === 'clipboard' && msg.text) {
+      navigator.clipboard.writeText(msg.text).catch(() => {});
+    }
+
+    if (msg.type === 'browserStopped') {
+      setStatus('browser stopped', 'disconnected');
+      showToast('Browser shut down. Use menu to start it again.', 5000);
+    }
+
+    if (msg.type === 'findResult') {
+      findTotal = msg.count;
+      if (msg.count > 0) {
+        if (findLastFromStart) {
+          findIndex = 1;
+        } else if (findLastBackwards) {
+          findIndex = findIndex <= 1 ? findTotal : findIndex - 1;
+        } else {
+          findIndex = findIndex >= findTotal ? 1 : findIndex + 1;
+        }
+        findCountEl.textContent = findIndex + ' of ' + findTotal;
+        findCountEl.style.color = '#999';
+      } else {
+        findIndex = 0;
+        findCountEl.textContent = 'No matches';
+        findCountEl.style.color = '#f66';
+      }
+    }
+
+    if (msg.type === 'status') {
+      setStatus(msg.message, 'connecting');
+    }
+
+    if (msg.type === 'error') {
+      setStatus(msg.message, 'disconnected');
+    }
+
+    if (msg.type === 'internalState') {
+      navigator.clipboard.writeText(JSON.stringify(msg.data, null, 2))
+        .then(() => showToast('Internal state copied to clipboard', 2000))
+        .catch(() => showToast('Failed to copy to clipboard', 2000));
+    }
+  };
+}
+
+function send(obj) {
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
+}
+
+function requestTabs() { send({ type: 'getTabs' }); }
+
+const _decodeEl = document.createElement('textarea');
+function decodeEntities(s) { _decodeEl.innerHTML = s; return _decodeEl.value; }
+
+const newTabBtn = document.getElementById('btn-new-tab');
+newTabBtn.addEventListener('click', () => { send({ type: 'newTab' }); pendingNewTabFocus = true; });
+
+function createTabEl(tab) {
+  const el = document.createElement('div');
+  el.className = 'tab';
+  el.setAttribute('data-tab-id', tab.id);
+  el.title = tab.url;
+  el.addEventListener('click', (e) => {
+    if (el.classList.contains('closing')) return;
+    if (e.target.closest('.tab-close')) return;
+    send({ type: 'switchTab', targetId: tab.id });
+  });
+
+  const title = document.createElement('span');
+  title.className = 'tab-title';
+  el.appendChild(title);
+
+  const close = document.createElement('span');
+  close.className = 'tab-close';
+  close.textContent = '×';
+  close.addEventListener('click', () => send({ type: 'closeTab', targetId: tab.id }));
+  el.appendChild(close);
+
+  return el;
+}
+
+function updateTabEl(el, tab) {
+  const isClosing = closingTabs.has(tab.id);
+  const isActive = tab.id === currentTargetId;
+
+  const wantClass = 'tab' + (isActive ? ' active' : '') + (isClosing ? ' closing' : '');
+  if (el.className !== wantClass) el.className = wantClass;
+  if (el.title !== tab.url) el.title = tab.url;
+
+  const titleEl = el.querySelector('.tab-title');
+  const decoded = decodeEntities(tab.title || tab.url || '(empty)');
+  if (titleEl.textContent !== decoded) titleEl.textContent = decoded;
+
+  // Swap close button / spinner based on closing state
+  const closeEl = el.querySelector('.tab-close');
+  const spinnerEl = el.querySelector('.tab-spinner');
+  if (isClosing) {
+    if (closeEl) closeEl.style.display = 'none';
+    if (!spinnerEl) {
+      const spinner = document.createElement('span');
+      spinner.className = 'tab-spinner';
+      el.appendChild(spinner);
+    }
+  } else {
+    if (closeEl) closeEl.style.display = '';
+    if (spinnerEl) spinnerEl.remove();
+  }
+}
+
+function renderTabs() {
+  const tabIds = new Set(currentTabs.map(t => t.id));
+  for (const id of closingTabs) {
+    if (!tabIds.has(id)) closingTabs.delete(id);
+  }
+
+  const existing = new Map();
+  for (const el of tabsEl.querySelectorAll('.tab[data-tab-id]')) {
+    existing.set(el.getAttribute('data-tab-id'), el);
+  }
+
+  // Remove tabs no longer in list
+  for (const [id, el] of existing) {
+    if (!tabIds.has(id)) {
+      el.remove();
+      existing.delete(id);
+    }
+  }
+
+  // Insert/update/reorder — all tabs go before newTabBtn
+  let insertRef = newTabBtn;
+  for (let i = currentTabs.length - 1; i >= 0; i--) {
+    const tab = currentTabs[i];
+    let el = existing.get(tab.id);
+    if (!el) {
+      el = createTabEl(tab);
+      tabsEl.insertBefore(el, insertRef);
+    } else if (el.nextElementSibling !== insertRef) {
+      tabsEl.insertBefore(el, insertRef);
+    }
+    updateTabEl(el, tab);
+    insertRef = el;
+  }
+}
+
+function resize() {
+  const rect = viewer.getBoundingClientRect();
+  if (!frameWidth || !frameHeight) return;
+  const border = 4; // 2px canvas border on each side
+  const scaleX = (rect.width - border) / frameWidth;
+  const scaleY = (rect.height - border) / frameHeight;
+  scale = Math.min(scaleX, scaleY, 1);
+  canvas.width = frameWidth * scale;
+  canvas.height = frameHeight * scale;
+
+  // Also redraw current image if we have it
+  if (img.complete && img.src) {
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  }
+}
+
+window.addEventListener('resize', resize);
+
+function toChrome(e) {
+  const rect = canvas.getBoundingClientRect();
+  return {
+    x: Math.round((e.clientX - rect.left) / scale),
+    y: Math.round((e.clientY - rect.top) / scale)
+  };
+}
+
+function modifiers(e) {
+  let m = 0;
+  if (e.altKey) m |= 1;
+  if (e.ctrlKey) m |= 2;
+  // Map Mac Cmd (meta) to Ctrl so Linux Chrome handles shortcuts like Cmd+C/V
+  if (e.metaKey) m |= 2;
+  if (e.shiftKey) m |= 8;
+  return m;
+}
+
+function buttonName(b) {
+  return b === 2 ? 'right' : b === 1 ? 'middle' : 'left';
+}
+
+// Mouse — track multi-click for double-click word select, triple-click line select
+let lastClickTime = 0;
+let lastClickX = 0;
+let lastClickY = 0;
+let clickCount = 0;
+
+canvas.addEventListener('mousemove', (e) => {
+  send({ type: 'mouse', action: 'mouseMoved', ...toChrome(e), modifiers: modifiers(e) });
+});
+canvas.addEventListener('mousedown', (e) => {
+  e.preventDefault();
+  canvas.focus();
+  const now = Date.now();
+  const pos = toChrome(e);
+  if (now - lastClickTime < 400 && Math.abs(pos.x - lastClickX) < 5 && Math.abs(pos.y - lastClickY) < 5) {
+    clickCount++;
+  } else {
+    clickCount = 1;
+  }
+  lastClickTime = now;
+  lastClickX = pos.x;
+  lastClickY = pos.y;
+  send({ type: 'mouse', action: 'mousePressed', ...pos, button: buttonName(e.button), clickCount, modifiers: modifiers(e) });
+});
+canvas.addEventListener('mouseup', (e) => {
+  e.preventDefault();
+  send({ type: 'mouse', action: 'mouseReleased', ...toChrome(e), button: buttonName(e.button), clickCount, modifiers: modifiers(e) });
+});
+canvas.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  if (e.ctrlKey) {
+    zoomLevel *= e.deltaY > 0 ? 0.95 : 1.05;
+    zoomLevel = Math.max(0.25, Math.min(5, zoomLevel));
+    send({ type: 'zoom', level: zoomLevel });
+    return;
+  }
+  send({ type: 'scroll', ...toChrome(e), deltaX: e.deltaX, deltaY: e.deltaY });
+}, { passive: false });
+
+// Global keyboard shortcuts — capture phase so they fire before element handlers
+window.addEventListener('keydown', (e) => {
+  const mod = e.metaKey || e.ctrlKey;
+  if (mod && e.key === 't') {
+    e.preventDefault();
+    send({ type: 'newTab' });
+    pendingNewTabFocus = true;
+  }
+  if (mod && e.key === 'w') {
+    e.preventDefault();
+    if (currentTargetId) send({ type: 'closeTab', targetId: currentTargetId });
+  }
+  if (mod && e.key === 'd') {
+    e.preventDefault();
+    send({ type: 'duplicateTab' });
+  }
+}, true);
+
+// Keyboard
+document.addEventListener('keydown', (e) => {
+  if (document.activeElement !== canvas) return;
+  // Cmd+C/V: sync with host clipboard (macOS user's native shortcut)
+  // Ctrl+C/V: forward to Chrome as-is (Linux Chrome's native shortcut,
+  // also Ctrl+C for SIGINT in web terminals)
+  if (e.metaKey && e.key === 'v') return; // let browser paste event fire
+  if (e.metaKey && e.key === 'c') {
+    e.preventDefault();
+    send({ type: 'copy' });
+    return;
+  }
+  if ((e.metaKey || e.ctrlKey) && e.key === 'f') {
+    e.preventDefault();
+    openFindBar();
+    return;
+  }
+  if (e.key === 'Escape' && findBar.classList.contains('open')) {
+    closeFindBar();
+    return;
+  }
+  e.preventDefault();
+  send({ type: 'key', action: 'keyDown', key: e.key, code: e.code, keyCode: e.keyCode, modifiers: modifiers(e) });
+  if (e.key.length === 1) {
+    send({ type: 'key', action: 'char', key: e.key, code: e.code, text: e.key, keyCode: e.keyCode, modifiers: modifiers(e) });
+  }
+});
+document.addEventListener('keyup', (e) => {
+  if (document.activeElement !== canvas) return;
+  if (e.metaKey && (e.key === 'v' || e.key === 'c')) return;
+  e.preventDefault();
+  send({ type: 'key', action: 'keyUp', key: e.key, code: e.code, keyCode: e.keyCode, modifiers: modifiers(e) });
+});
+
+// Clipboard Paste
+document.addEventListener('paste', (e) => {
+  if (document.activeElement !== canvas) return;
+  const text = e.clipboardData.getData('text/plain');
+  if (text) send({ type: 'paste', text });
+});
+
+// URL bar
+urlBar.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    canvas.focus();
+    return;
+  }
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    send({ type: 'navigate', url: urlBar.value });
+    canvas.focus();
+  }
+});
+
+// Toolbar buttons
+document.getElementById('btn-back').addEventListener('click', () => send({ type: 'back' }));
+document.getElementById('btn-forward').addEventListener('click', () => send({ type: 'forward' }));
+document.getElementById('btn-reload').addEventListener('click', () => {
+  const btn = document.getElementById('btn-reload');
+  send({ type: btn.dataset.loading ? 'stop' : 'reload' });
+});
+document.getElementById('btn-zoom-in').addEventListener('click', () => {
+  zoomLevel = Math.min(5, zoomLevel * 1.25);
+  send({ type: 'zoom', level: zoomLevel });
+});
+document.getElementById('btn-zoom-out').addEventListener('click', () => {
+  zoomLevel = Math.max(0.25, zoomLevel / 1.25);
+  send({ type: 'zoom', level: zoomLevel });
+});
+document.getElementById('btn-zoom-reset').addEventListener('click', () => {
+  zoomLevel = 1.0;
+  send({ type: 'zoom', level: 1.0 });
+});
+
+// Chrome pages menu
+const chromeMenu = document.getElementById('chrome-menu');
+document.getElementById('btn-menu').addEventListener('click', () => {
+  chromeMenu.classList.toggle('open');
+});
+chromeMenu.addEventListener('click', (e) => {
+  const item = e.target.closest('.menu-item');
+  if (!item) return;
+  if (item.dataset.url) {
+    send({ type: 'newTab', url: item.dataset.url });
+  } else if (item.dataset.action) {
+    send({ type: item.dataset.action });
+  }
+  chromeMenu.classList.remove('open');
+});
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('.menu-wrap')) chromeMenu.classList.remove('open');
+});
+
+// DevTools — devtools:// URLs can't be opened via window.open, copy to clipboard with instructions
+function showToast(html, duration) {
+  const toast = document.getElementById('toast');
+  toast.innerHTML = html;
+  toast.classList.add('visible');
+  if (duration) setTimeout(() => toast.classList.remove('visible'), duration);
+}
+
+document.getElementById('btn-devtools').addEventListener('click', () => {
+  if (!currentTargetId) { showToast('No active target.', 2000); return; }
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  // Route through the bridge's /devtools WebSocket proxy since Chrome CDP is localhost-only
+  const wsPath = `${location.host}${basePath}/devtools?target=${currentTargetId}`;
+  const devtoolsUrl = `devtools://devtools/bundled/inspector.html?${proto}=${encodeURIComponent(wsPath)}`;
+  navigator.clipboard.writeText(devtoolsUrl).then(() => {
+    showToast('DevTools URL copied.<br>Paste it into a <b>Chrome address bar</b> to connect.', 3000);
+  }).catch(() => {
+    prompt('Copy this URL and paste in Chrome address bar:', devtoolsUrl);
+  });
+});
+
+// Profile button — opens Chrome account/sync settings
+document.getElementById('btn-profile').addEventListener('click', () => {
+  send({ type: 'newTab', url: 'chrome://settings/people' });
+});
+
+// Extension bar
+function renderExtensions(extensions) {
+  extBar.innerHTML = '';
+  for (const ext of extensions) {
+    const el = document.createElement('img');
+    el.className = 'ext-icon';
+    el.title = ext.name;
+    el.addEventListener('click', () => {
+      send({ type: 'openExtensionPopup', extensionId: ext.id, popup: ext.popup });
+    });
+    if (ext.icon) {
+      el.src = ext.icon;
+    } else {
+      const letter = ext.name.charAt(0).toUpperCase();
+      const hue = [...ext.id].reduce((h, c) => c.charCodeAt(0) + ((h << 5) - h), 0) % 360;
+      el.src = 'data:image/svg+xml,' + encodeURIComponent(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20">' +
+        '<rect width="20" height="20" rx="3" fill="hsl(' + hue + ',50%,40%)"/>' +
+        '<text x="10" y="15" text-anchor="middle" font-size="13" font-family="sans-serif" fill="white">' + letter + '</text>' +
+        '</svg>');
+    }
+    extBar.appendChild(el);
+  }
+}
+
+// Site settings — opens Chrome's built-in per-site settings for the current origin
+document.getElementById('btn-site-info').addEventListener('click', () => {
+  try {
+    const origin = new URL(urlBar.value).origin;
+    send({ type: 'navigate', url: 'chrome://settings/content/siteDetails?site=' + encodeURIComponent(origin) });
+  } catch {
+    showToast('No valid URL', 2000);
+  }
+});
+
+// Find on page — bridge-level find using CDP window.find() for native highlighting
+let findDebounce = null;
+let findIndex = 0;
+let findTotal = 0;
+let findLastFromStart = false;
+let findLastBackwards = false;
+
+function openFindBar() {
+  findBar.classList.add('open');
+  findInput.focus();
+  findInput.select();
+}
+
+function closeFindBar() {
+  findBar.classList.remove('open');
+  findInput.value = '';
+  findCountEl.textContent = '';
+  findIndex = 0;
+  findTotal = 0;
+  send({ type: 'findClear' });
+  canvas.focus();
+}
+
+function doFind(backwards, fromStart) {
+  const text = findInput.value;
+  if (!text) {
+    findCountEl.textContent = '';
+    findIndex = 0;
+    findTotal = 0;
+    send({ type: 'findClear' });
+    return;
+  }
+  findLastFromStart = fromStart;
+  findLastBackwards = backwards;
+  send({ type: 'find', text, backwards, caseSensitive: false, fromStart });
+}
+
+findInput.addEventListener('input', () => {
+  clearTimeout(findDebounce);
+  findDebounce = setTimeout(() => doFind(false, true), 150);
+});
+
+findInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    closeFindBar();
+    return;
+  }
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    doFind(e.shiftKey, false);
+    return;
+  }
+  if ((e.metaKey || e.ctrlKey) && e.key === 'f') {
+    e.preventDefault();
+    findInput.select();
+    return;
+  }
+});
+
+document.getElementById('find-next').addEventListener('click', () => doFind(false, false));
+document.getElementById('find-prev').addEventListener('click', () => doFind(true, false));
+document.getElementById('find-close').addEventListener('click', closeFindBar);
+
+canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+// Intercept browser back/forward and forward to remote Chrome.
+// Push a history entry so back/forward don't leave the page.
+// On popstate, detect direction, send command, and restore the entry.
+let histIdx = 1;
+history.replaceState({ idx: 0 }, '');
+history.pushState({ idx: 1 }, '');
+window.addEventListener('popstate', (e) => {
+  const newIdx = e.state?.idx ?? 0;
+  if (newIdx < histIdx) {
+    send({ type: 'back' });
+  } else {
+    send({ type: 'forward' });
+  }
+  histIdx = newIdx;
+  // Re-push so back/forward keep working
+  if (newIdx === 0) {
+    history.pushState({ idx: 1 }, '');
+    histIdx = 1;
+  }
+});
+
+// Background tabs get throttled — screencast frames stop arriving.
+// Re-switch to current tab on foreground to restart screencast.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && currentTargetId) {
+    send({ type: 'switchTab', targetId: currentTargetId });
+  }
+});
+
+connect();
+canvas.focus();
+</script>
+</body>
+</html>
