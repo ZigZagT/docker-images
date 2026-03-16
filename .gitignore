@@ -1,3 +1,4 @@
+.DS_Store
 # MaxMind (managed by GitHub Actions cache)
 ubuntu-geoip/MAXMIND_VERSIONS
 ubuntu-geoip/databases/

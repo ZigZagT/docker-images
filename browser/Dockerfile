@@ -1,0 +1,43 @@
+ARG BASE_IMAGE=deaddev/ubuntu:nodejs
+FROM ${BASE_IMAGE}
+
+# Fonts + full browser in one layer to avoid duplicate apt-get update.
+# Full browser (not --only-shell) required for Page.startScreencast (bridge rendering).
+# Playwright installs Chrome for Testing; binary is named "chrome" under chrome-linux/.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        fonts-liberation fonts-noto-core fontconfig \
+    && fc-cache -fv \
+    && npm install -g playwright-core \
+    && PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \
+       playwright-core install --with-deps chromium \
+    && find /opt/ms-playwright -name "chrome" -path "*/chrome-linux*/*" -type f \
+       -exec ln -sf "{}" /usr/local/bin/chrome-raw ";" \
+    && npm rm -g playwright-core \
+    && npm cache clean --force \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /root/.cache
+
+# Extract real (non-headless) UA via CDP — --dump-dom is unreliable on headless shell.
+RUN chrome-raw --no-sandbox --disable-gpu --remote-debugging-port=19222 & \
+    CHROME_PID=$!; \
+    sleep 2; \
+    UA=$(node -e " \
+      const http = require('http'); \
+      http.get('http://127.0.0.1:19222/json/version', res => { \
+        let d=''; res.on('data',c=>d+=c); \
+        res.on('end', () => { \
+          process.stdout.write(JSON.parse(d)['User-Agent'].replace('Headless','')); \
+        }); \
+      }); \
+    "); \
+    kill $CHROME_PID 2>/dev/null; \
+    echo "$UA" > /usr/local/etc/chrome-ua
+
+COPY --chmod=755 chrome-launcher /usr/local/bin/chrome-launcher
+COPY --chmod=755 chrome /usr/local/bin/chrome
+
+COPY browser-bridge/package.json browser-bridge/package-lock.json /opt/browser-bridge/
+RUN cd /opt/browser-bridge && npm install --omit=dev && npm cache clean --force
+COPY browser-bridge/server.mjs browser-bridge/index.html /opt/browser-bridge/
+
+CMD ["chrome"]

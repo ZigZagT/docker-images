@@ -94,11 +94,12 @@ jobs:
       dnsmasq-exporter: ${{ steps.changes.outputs.dnsmasq-exporter }}
       sqitch-pg: ${{ steps.changes.outputs.sqitch-pg }}
       wait-for-pg: ${{ steps.changes.outputs.wait-for-pg }}
+      browser: ${{ steps.changes.outputs.browser }}
       any-changes: ${{ steps.changes.outputs.any-changes }}
       upstream-tags-json: ${{ steps.matrices.outputs.upstream_tags_json }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -135,6 +136,7 @@ jobs:
             echo "dnsmasq=true" >> $GITHUB_OUTPUT
             echo "qemu=true" >> $GITHUB_OUTPUT
             echo "cloud-hypervisor=true" >> $GITHUB_OUTPUT
+            echo "browser=true" >> $GITHUB_OUTPUT
             echo "dnsmasq-exporter=true" >> $GITHUB_OUTPUT
             echo "sqitch-pg=true" >> $GITHUB_OUTPUT
             echo "wait-for-pg=true" >> $GITHUB_OUTPUT
@@ -160,6 +162,7 @@ jobs:
               echo "dnsmasq=true" >> $GITHUB_OUTPUT
               echo "qemu=true" >> $GITHUB_OUTPUT
               echo "cloud-hypervisor=true" >> $GITHUB_OUTPUT
+              echo "browser=true" >> $GITHUB_OUTPUT
               echo "dnsmasq-exporter=true" >> $GITHUB_OUTPUT
               echo "sqitch-pg=true" >> $GITHUB_OUTPUT
               echo "wait-for-pg=true" >> $GITHUB_OUTPUT
@@ -178,6 +181,7 @@ jobs:
             echo "dnsmasq=true" >> $GITHUB_OUTPUT        # depends on ubuntu
             echo "qemu=true" >> $GITHUB_OUTPUT           # depends on ubuntu
             echo "cloud-hypervisor=true" >> $GITHUB_OUTPUT # depends on ubuntu
+            echo "browser=true" >> $GITHUB_OUTPUT        # depends on ubuntu:nodejs
             ANY_CHANGES=true
           else
             echo "ubuntu=false" >> $GITHUB_OUTPUT
@@ -214,6 +218,13 @@ jobs:
               ANY_CHANGES=true
             else
               echo "cloud-hypervisor=false" >> $GITHUB_OUTPUT
+            fi
+
+            if ./scripts/has-git-diff-at-path.sh browser "$BASE_REF"; then
+              echo "browser=true" >> $GITHUB_OUTPUT
+              ANY_CHANGES=true
+            else
+              echo "browser=false" >> $GITHUB_OUTPUT
             fi
           fi
 
@@ -268,21 +279,21 @@ jobs:
             suffix: -arm64
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Login to DockerHub
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Login to GHCR
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -312,20 +323,20 @@ jobs:
     environment: action-build-and-push
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Login to DockerHub
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Login to GHCR
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -366,21 +377,21 @@ jobs:
             suffix: -arm64
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Login to DockerHub
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Login to GHCR
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -411,20 +422,20 @@ jobs:
     environment: action-build-and-push
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Login to DockerHub
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Login to GHCR
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -459,21 +470,21 @@ jobs:
             suffix: -arm64
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Login to DockerHub
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Login to GHCR
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -500,20 +511,20 @@ jobs:
     environment: action-build-and-push
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Login to DockerHub
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Login to GHCR
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -547,21 +558,21 @@ jobs:
             suffix: -arm64
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Login to DockerHub
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Login to GHCR
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -588,20 +599,20 @@ jobs:
     environment: action-build-and-push
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Login to DockerHub
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Login to GHCR
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -627,11 +638,11 @@ jobs:
       maxmind-changed: ${{ steps.maxmind.outputs.changed }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Restore MaxMind versions cache
         if: github.event_name != 'pull_request'
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: ubuntu-geoip/MAXMIND_VERSIONS
           key: maxmind-versions-
@@ -654,7 +665,7 @@ jobs:
           fi
 
       - name: Restore MaxMind databases cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: ubuntu-geoip/databases
           key: maxmind-db-
@@ -696,14 +707,14 @@ jobs:
 
       - name: Save MaxMind versions cache
         if: github.event_name != 'pull_request' && steps.maxmind.outputs.changed == 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: ubuntu-geoip/MAXMIND_VERSIONS
           key: maxmind-versions-${{ github.run_id }}
 
       - name: Save MaxMind databases cache
         if: github.event_name != 'pull_request' && steps.maxmind.outputs.changed == 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: ubuntu-geoip/databases
           key: maxmind-db-${{ github.run_id }}
@@ -732,28 +743,28 @@ jobs:
             suffix: -arm64
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Login to DockerHub
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Login to GHCR
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Restore MaxMind versions from cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: ubuntu-geoip/MAXMIND_VERSIONS
           key: maxmind-versions-
@@ -761,7 +772,7 @@ jobs:
             maxmind-versions-
 
       - name: Restore GeoIP databases from cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: ubuntu-geoip/databases
           key: maxmind-db-
@@ -784,24 +795,27 @@ jobs:
     name: Merge ubuntu-geoip manifests
     runs-on: ubuntu-latest
     needs: build-ubuntu-geoip
-    if: needs.build-ubuntu-geoip.result == 'success' && github.event_name != 'pull_request'
+    if: |
+      always() &&
+      needs.build-ubuntu-geoip.result == 'success' &&
+      github.event_name != 'pull_request'
     environment: action-build-and-push
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Login to DockerHub
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Login to GHCR
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -854,22 +868,22 @@ jobs:
 
       - name: Checkout code
         if: steps.should-build.outputs.build == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Docker Buildx
         if: steps.should-build.outputs.build == 'true'
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Login to DockerHub
         if: steps.should-build.outputs.build == 'true' && github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Login to GHCR
         if: steps.should-build.outputs.build == 'true' && github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -901,20 +915,20 @@ jobs:
     environment: action-build-and-push
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Login to DockerHub
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Login to GHCR
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -988,21 +1002,21 @@ jobs:
             suffix: -arm64
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Login to DockerHub
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Login to GHCR
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -1022,24 +1036,27 @@ jobs:
     name: Merge shadowsocks manifests
     runs-on: ubuntu-latest
     needs: build-shadowsocks
-    if: needs.build-shadowsocks.result == 'success' && github.event_name != 'pull_request'
+    if: |
+      always() &&
+      needs.build-shadowsocks.result == 'success' &&
+      github.event_name != 'pull_request'
     environment: action-build-and-push
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Login to DockerHub
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Login to GHCR
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -1050,6 +1067,96 @@ jobs:
           make merge-shadowsocks
       - name: Sync README to DockerHub
         run: ./scripts/sync-readme.sh shadowsocks/README.md ${{ vars.DOCKERHUB_USERNAME }}/shadowsocks
+        env:
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+
+  # --- Browser depends on ubuntu:nodejs ---
+
+  build-browser:
+    name: Build browser (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    needs: [detect-changes, build-ubuntu-nodejs]
+    if: |
+      always() &&
+      needs.detect-changes.outputs.browser == 'true' &&
+      (needs.build-ubuntu-nodejs.result == 'success' || needs.build-ubuntu-nodejs.result == 'skipped')
+    environment: action-build-and-push
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            suffix: -amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            suffix: -arm64
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to DockerHub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push browser
+        run: |
+          make browser \
+            PLATFORM="${{ matrix.platform }}" \
+            TAG_SUFFIX="${{ matrix.suffix }}" \
+            PUSH="${{ github.event_name != 'pull_request' && 'true' || 'false' }}"
+
+  merge-browser:
+    name: Merge browser manifests
+    runs-on: ubuntu-latest
+    needs: build-browser
+    if: |
+      always() &&
+      needs.build-browser.result == 'success' &&
+      github.event_name != 'pull_request'
+    environment: action-build-and-push
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge manifests
+        run: make merge-browser
+
+      - name: Sync README to DockerHub
+        run: ./scripts/sync-readme.sh browser/README.md ${{ vars.DOCKERHUB_USERNAME }}/browser
         env:
           DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -1085,22 +1192,22 @@ jobs:
 
       - name: Checkout code
         if: steps.should-build.outputs.build == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Docker Buildx
         if: steps.should-build.outputs.build == 'true'
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Login to DockerHub
         if: steps.should-build.outputs.build == 'true' && github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Login to GHCR
         if: steps.should-build.outputs.build == 'true' && github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -1125,20 +1232,20 @@ jobs:
     environment: action-build-and-push
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Login to DockerHub
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Login to GHCR
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}

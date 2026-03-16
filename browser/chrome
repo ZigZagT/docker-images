@@ -1,0 +1,116 @@
+#!/bin/bash
+# chrome — Chrome + browser bridge process manager
+#
+# Foreground:   chrome [...chrome-args]
+# Detached:     chrome start-detached [...chrome-args]
+# Restart:      chrome restart
+# Stop:         chrome stop
+#
+# When called with --* flags, execs into chrome-launcher directly
+# (puppeteer/playwright executablePath compatibility).
+
+CHROME_ARGS_FILE="/tmp/chrome.args"
+CHROME_PID_FILE="/tmp/chrome.pid"
+BRIDGE_PID_FILE="/tmp/browser-bridge.pid"
+BRIDGE_DIR="/opt/browser-bridge"
+FOREGROUND_PID_FILE="/tmp/chrome-foreground.pid"
+
+save_args() {
+    if [ $# -gt 0 ]; then
+        printf '%s\0' "$@" > "$CHROME_ARGS_FILE"
+    else
+        rm -f "$CHROME_ARGS_FILE"
+    fi
+}
+
+load_args() {
+    local args=()
+    if [ -f "$CHROME_ARGS_FILE" ]; then
+        while IFS= read -r -d '' arg; do
+            args+=("$arg")
+        done < "$CHROME_ARGS_FILE"
+    fi
+    printf '%s\0' "${args[@]}"
+}
+
+is_running() { [ -f "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null; }
+
+start_chrome() {
+    ulimit -c 0
+    chrome-launcher "$@" &
+    echo $! > "$CHROME_PID_FILE"
+    echo "chrome started (pid $!)"
+}
+
+start_bridge() {
+    cd "$BRIDGE_DIR"
+    ulimit -c 0
+    node server.mjs &
+    echo $! > "$BRIDGE_PID_FILE"
+    echo "bridge started (pid $!)"
+}
+
+stop_all() {
+    if [ -f "$BRIDGE_PID_FILE" ]; then
+        kill "$(cat "$BRIDGE_PID_FILE")" 2>/dev/null
+        rm -f "$BRIDGE_PID_FILE"
+    else
+        pkill -f "browser-bridge/server.mjs" 2>/dev/null
+    fi
+    if [ -f "$CHROME_PID_FILE" ]; then
+        kill "$(cat "$CHROME_PID_FILE")" 2>/dev/null
+        rm -f "$CHROME_PID_FILE"
+    else
+        pkill -f "chrome-raw" 2>/dev/null
+    fi
+    echo "stopped"
+}
+
+case "$1" in
+    start-detached)
+        shift
+        save_args "$@"
+        start_chrome "$@"
+        start_bridge
+        ;;
+    restart)
+        stop_all
+        sleep 1
+        local_args=()
+        if [ -f "$CHROME_ARGS_FILE" ]; then
+            while IFS= read -r -d '' arg; do
+                local_args+=("$arg")
+            done < "$CHROME_ARGS_FILE"
+        fi
+        start_chrome "${local_args[@]}"
+        start_bridge
+        ;;
+    stop)
+        stop_all
+        if [ -f "$FOREGROUND_PID_FILE" ]; then
+            kill -TERM "$(cat "$FOREGROUND_PID_FILE")" 2>/dev/null
+        fi
+        ;;
+    -h|--help|help)
+        echo "Usage: chrome [...chrome-args]"
+        echo "       chrome start-detached [...chrome-args]"
+        echo "       chrome restart"
+        echo "       chrome stop"
+        ;;
+    *)
+        # --* flags: start bridge, then exec into chrome-launcher (puppeteer/playwright executablePath)
+        if [ $# -gt 0 ] && [[ "$1" == --* ]]; then
+            save_args "$@"
+            start_bridge
+            exec chrome-launcher "$@"
+        fi
+
+        # Foreground mode: start both, block until signal
+        echo $$ > "$FOREGROUND_PID_FILE"
+        save_args "$@"
+        start_chrome "$@"
+        start_bridge
+        trap 'stop_all; rm -f "$FOREGROUND_PID_FILE"; exit 0' TERM INT
+        while true; do sleep 86400 & wait; done
+        ;;
+esac
