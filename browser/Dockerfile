@@ -1,18 +1,20 @@
 ARG BASE_IMAGE=deaddev/ubuntu:nodejs
 FROM ${BASE_IMAGE}
 
-# Fonts + full browser in one layer to avoid duplicate apt-get update.
 # Full browser (not --only-shell) required for Page.startScreencast (bridge rendering).
-# Playwright installs Chrome for Testing; binary is named "chrome" under chrome-linux/.
+# --no-shell: skip headless shell (~254MB) since we use the full browser.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         fonts-liberation fonts-noto-core fontconfig \
     && fc-cache -fv \
     && npm install -g playwright-core \
     && PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \
-       playwright-core install --with-deps chromium \
+       playwright-core install --with-deps --no-shell chromium \
     && find /opt/ms-playwright -name "chrome" -path "*/chrome-linux*/*" -type f \
        -exec ln -sf "{}" /usr/local/bin/chrome-raw ";" \
+    && rm -rf /opt/ms-playwright/ffmpeg-* \
+    && find /opt/ms-playwright -path "*/locales/*.pak" ! -name "en-US.pak" -delete \
+    && apt-get purge -y xvfb && apt-get autoremove -y --purge \
     && npm rm -g playwright-core \
     && npm cache clean --force \
     && rm -rf /var/lib/apt/lists/* /tmp/* /root/.cache
