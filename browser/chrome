@@ -24,13 +24,12 @@ save_args() {
 }
 
 load_args() {
-    local args=()
+    LOADED_ARGS=()
     if [ -f "$CHROME_ARGS_FILE" ]; then
         while IFS= read -r -d '' arg; do
-            args+=("$arg")
+            LOADED_ARGS+=("$arg")
         done < "$CHROME_ARGS_FILE"
     fi
-    printf '%s\0' "${args[@]}"
 }
 
 is_running() { [ -f "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null; }
@@ -76,13 +75,8 @@ case "$1" in
     restart)
         stop_all
         sleep 1
-        local_args=()
-        if [ -f "$CHROME_ARGS_FILE" ]; then
-            while IFS= read -r -d '' arg; do
-                local_args+=("$arg")
-            done < "$CHROME_ARGS_FILE"
-        fi
-        start_chrome "${local_args[@]}"
+        load_args
+        start_chrome "${LOADED_ARGS[@]}"
         start_bridge
         ;;
     stop)

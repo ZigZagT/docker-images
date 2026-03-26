@@ -20,19 +20,25 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* /tmp/* /root/.cache
 
 # Extract real (non-headless) UA via CDP — --dump-dom is unreliable on headless shell.
+# Polls CDP endpoint with retries instead of a fixed sleep, and fails the build if
+# UA extraction doesn't succeed within 30 attempts.
 RUN chrome-raw --no-sandbox --disable-gpu --remote-debugging-port=19222 & \
     CHROME_PID=$!; \
-    sleep 2; \
-    UA=$(node -e " \
-      const http = require('http'); \
-      http.get('http://127.0.0.1:19222/json/version', res => { \
-        let d=''; res.on('data',c=>d+=c); \
-        res.on('end', () => { \
-          process.stdout.write(JSON.parse(d)['User-Agent'].replace('Headless','')); \
-        }); \
-      }); \
-    "); \
+    UA=""; \
+    for i in $(seq 1 30); do \
+        UA=$(node -e " \
+          const http = require('http'); \
+          http.get('http://127.0.0.1:19222/json/version', res => { \
+            let d=''; res.on('data',c=>d+=c); \
+            res.on('end', () => { \
+              process.stdout.write(JSON.parse(d)['User-Agent'].replace('Headless','')); \
+            }); \
+          }).on('error', () => process.exit(1)); \
+        " 2>/dev/null) && [ -n "$UA" ] && break; \
+        sleep 1; \
+    done; \
     kill $CHROME_PID 2>/dev/null; \
+    [ -n "$UA" ] || { echo "ERROR: Failed to extract Chrome UA after 30 attempts" >&2; exit 1; }; \
     echo "$UA" > /usr/local/etc/chrome-ua
 
 COPY --chmod=755 chrome-launcher /usr/local/bin/chrome-launcher

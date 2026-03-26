@@ -436,7 +436,6 @@ function ensureBrowserConnection() {
         sessionHandlers.clear();
         // Invalidate caches — stale after browser restart
         extensionCache = null;
-        extensionCacheTime = 0;
         profileCache = null;
         profileCacheTime = 0;
         profileDir = null;

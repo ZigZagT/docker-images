@@ -218,6 +218,7 @@ browser:
 	$(BUILDX_CMD) \
 		--build-arg BASE_IMAGE=$(CACHE_REGISTRY)/ubuntu:nodejs$(TAG_SUFFIX) \
 		$$tags \
+		--cache-from $(CACHE_REGISTRY)/browser:latest$(TAG_SUFFIX) \
 		browser
 
 dnsmasq:
