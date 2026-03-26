@@ -93,7 +93,9 @@ function ensureAtLeastOnePage() {
     const targets = await getCdpTargets();
     const pages = targets.filter(t => t.type === 'page');
     if (pages.length > 0) return pages[0];
-    return await cdpFetch('/json/new?about:blank', 'PUT');
+    const resp = await browserCommand('Target.createTarget', { url: 'about:blank', background: true });
+    if (resp.error) throw new Error(resp.error.message);
+    return { id: resp.result.targetId, url: 'about:blank', type: 'page' };
   })().finally(() => { ensurePageLock = null; });
   return ensurePageLock;
 }
@@ -418,7 +420,7 @@ function ensureBrowserConnection() {
             if (ti?.type === 'page') {
               scheduleTabBroadcast();
               poolAttach(ti.targetId).catch(err =>
-                log.error('poolAttach failed for %s: %s', ti.targetId, err.message));
+                log.error('poolAttach failed for', ti.targetId, err.message));
             }
             // Extension installed/enabled — invalidate cache so next
             // getExtensions fetches fresh data
@@ -558,9 +560,26 @@ function activeSession() {
   return sessionPool.get(activeTargetId) || null;
 }
 
+// Dedup concurrent poolAttach for the same target. Stores the in-flight promise
+// so callers can await the existing attach instead of silently skipping.
+const poolAttaching = new Map(); // targetId -> Promise
+
 async function poolAttach(targetId) {
   if (sessionPool.has(targetId)) return;
-  const sessionId = await attachToTarget(targetId);
+  if (poolAttaching.has(targetId)) return poolAttaching.get(targetId);
+  const promise = (async () => {
+    const sessionId = await attachToTarget(targetId);
+    return sessionId;
+  })();
+  poolAttaching.set(targetId, promise);
+  let sessionId;
+  try {
+    sessionId = await promise;
+  } catch (err) {
+    poolAttaching.delete(targetId);
+    throw err;
+  }
+  poolAttaching.delete(targetId);
   const entry = { sessionId, mainFrameId: null };
   sessionPool.set(targetId, entry);
 
@@ -571,7 +590,7 @@ async function poolAttach(targetId) {
   sessionHandlers.set(sessionId, (msg) => {
     poolSessionHandler(targetId, entry, msg);
   });
-  log.debug('poolAttach: target=%s session=%s', targetId, sessionId);
+  log.debug('poolAttach: target=' + targetId + ' session=' + sessionId);
 }
 
 function poolDetach(targetId) {
@@ -579,7 +598,7 @@ function poolDetach(targetId) {
   if (!entry) return;
   sessionPool.delete(targetId);
   detachSession(entry.sessionId);
-  log.debug('poolDetach: target=%s', targetId);
+  log.debug('poolDetach: target=' + targetId);
 }
 
 function poolSessionHandler(targetId, entry, msg) {
@@ -625,7 +644,7 @@ function poolSessionHandler(targetId, entry, msg) {
 
   // Session killed by Chrome (target crashed, etc.)
   if (msg.method === 'Inspector.detached') {
-    log.debug('pool session detached for target %s: %s', targetId, msg.params?.reason);
+    log.debug('pool session detached for target', targetId, msg.params?.reason);
     sessionPool.delete(targetId);
     sessionHandlers.delete(entry.sessionId);
     if (targetId === activeTargetId) {
@@ -663,11 +682,11 @@ async function switchToTarget(targetId) {
     let t1 = Date.now();
     const activateResp = await browserCommand('Target.activateTarget', { targetId });
     if (activateResp.error) log.error('activateTarget failed:', activateResp.error.message);
-    log.debug('switchToTarget: activateTarget %dms', Date.now() - t1);
+    log.debug('switchToTarget: activateTarget', Date.now() - t1 + 'ms');
 
     t1 = Date.now();
     await sessionCommand(entry.sessionId, 'Page.bringToFront');
-    log.debug('switchToTarget: bringToFront %dms', Date.now() - t1);
+    log.debug('switchToTarget: bringToFront', Date.now() - t1 + 'ms');
 
     t1 = Date.now();
     const scResp = await sessionCommand(entry.sessionId, 'Page.startScreencast', {
@@ -676,7 +695,7 @@ async function switchToTarget(targetId) {
     });
     if (scResp.error) log.error('startScreencast failed:', scResp.error.message);
     screencastActive = true;
-    log.debug('switchToTarget: startScreencast %dms', Date.now() - t1);
+    log.debug('switchToTarget: startScreencast', Date.now() - t1 + 'ms');
 
     if (globalZoomLevel !== 1.0) await applyZoomGlobal();
 
@@ -692,7 +711,7 @@ async function switchToTarget(targetId) {
       title: target.title
     });
 
-    log.debug('switchToTarget: total %dms', Date.now() - t0);
+    log.debug('switchToTarget: total', Date.now() - t0 + 'ms');
   } finally {
     globalSwitching = false;
   }
@@ -739,8 +758,8 @@ async function reconcileTabsGlobal() {
           }
         }
       }
-      log.debug('reconcile: active tab %s gone, next=%s (old %d tabs, now %d)',
-        lostId, nextId, lastKnownOrder.length, pages.length);
+      log.debug('reconcile: active tab', lostId, 'gone, next=' + nextId,
+        '(old', lastKnownOrder.length, 'tabs, now', pages.length + ')');
 
       activeTargetId = null;
       screencastActive = false;
@@ -782,7 +801,7 @@ function globalReconnect() {
         const pages = targets.filter(t => t.type === 'page');
         for (const page of pages) {
           await poolAttach(page.id).catch(err =>
-            log.error('globalReconnect poolAttach failed: %s', err.message));
+            log.error('globalReconnect poolAttach failed:', err.message));
         }
         if (pages.length === 0) {
           const page = await ensureAtLeastOnePage();
@@ -1114,7 +1133,7 @@ viewerWss.on('connection', async (client, req) => {
         case 'closeTab':
           if (msg.targetId) {
             if (!knownTabs.has(msg.targetId)) {
-              log.debug('closeTab: %s not in knownTabs, ignoring', msg.targetId);
+              log.debug('closeTab:', msg.targetId, 'not in knownTabs, ignoring');
               break;
             }
             const t0 = Date.now();
@@ -1128,7 +1147,7 @@ viewerWss.on('connection', async (client, req) => {
             } finally {
               broadcastToViewers({ type: 'tabCloseComplete', targetId: msg.targetId });
             }
-            log.debug('closeTab: e2e %dms', Date.now() - t0);
+            log.debug('closeTab: e2e', Date.now() - t0 + 'ms');
           }
           break;
 
@@ -1181,7 +1200,9 @@ viewerWss.on('connection', async (client, req) => {
           if (!extId) break;
           let opened = false;
 
-          // Try native popup API via service worker session (independent of pool)
+          // Try native popup API so the popup gets correct active-tab context.
+          // After openPopup(), poll using both /json/list (HTTP endpoint) and
+          // Target.getTargets (browser WS) — popups may only appear in one.
           try {
             const targets = await cdpFetch('/json/list');
             const sw = targets.find(t =>
@@ -1228,7 +1249,8 @@ viewerWss.on('connection', async (client, req) => {
             }
           } catch {}
 
-          // Fallback: open popup URL in a new tab
+          // Fallback: open popup URL in a new tab (loses tab context).
+          // If msg.popup is null (manifest fetch missed it), read manifest on the fly.
           if (!opened) {
             let popupPath = msg.popup;
             if (!popupPath) {
@@ -1253,8 +1275,9 @@ viewerWss.on('connection', async (client, req) => {
             if (popupPath) {
               try {
                 const url = 'chrome-extension://' + extId + '/' + popupPath;
-                const target = await cdpFetch('/json/new?' + url, 'PUT');
-                await switchToTarget(target.id);
+                const createResp = await browserCommand('Target.createTarget', { url, background: true });
+                if (createResp.error) throw new Error(createResp.error.message);
+                await switchToTarget(createResp.result.targetId);
               } catch (err) {
                 clientSend({ type: 'error', message: 'Popup failed: ' + err.message });
               }
@@ -1328,12 +1351,14 @@ viewerWss.on('connection', async (client, req) => {
             const cs = !!msg.caseSensitive;
             const bw = !!msg.backwards;
 
+            // Reset selection to search from page top when search text changes
             if (msg.fromStart) {
               await sessionCommand(entry.sessionId, 'Runtime.evaluate', {
                 expression: 'window.getSelection().removeAllRanges()'
               }).catch(() => {});
             }
 
+            // Count matches using indexOf (avoids regex escaping complexity)
             const countResp = await sessionCommand(entry.sessionId, 'Runtime.evaluate', {
               expression: `(() => {
                 const q = ${textJson}${cs ? '' : '.toLowerCase()'};
@@ -1345,6 +1370,8 @@ viewerWss.on('connection', async (client, req) => {
               })()`
             }).catch(() => null);
 
+            // window.find() highlights and scrolls to the match natively,
+            // visible through screencast without any custom overlay
             const findResp = await sessionCommand(entry.sessionId, 'Runtime.evaluate', {
               expression: `window.find(${textJson}, ${cs}, ${bw}, true)`
             }).catch(() => null);
