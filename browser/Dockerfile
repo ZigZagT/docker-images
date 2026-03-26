@@ -22,7 +22,7 @@ RUN apt-get update \
 # Extract real (non-headless) UA via CDP — --dump-dom is unreliable on headless shell.
 # Polls CDP endpoint with retries instead of a fixed sleep, and fails the build if
 # UA extraction doesn't succeed within 30 attempts.
-RUN chrome-raw --no-sandbox --disable-gpu --remote-debugging-port=19222 & \
+RUN chrome-raw --headless --no-sandbox --disable-gpu --remote-debugging-port=19222 & \
     CHROME_PID=$!; \
     UA=""; \
     for i in $(seq 1 30); do \

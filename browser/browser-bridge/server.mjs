@@ -1,10 +1,15 @@
 // Browser Bridge — lightweight CDP screencast proxy
-// No X11, no VNC. Uses Chrome's built-in rendering via CDP.
 //
 // Both the viewer (screencast) and DevTools connect through a single
 // browser-level WebSocket using Target.attachToTarget with flatten:true.
 // Each gets an independent sessionId so they don't evict each other.
 // (Page-level webSocketDebuggerUrl is exclusive — a second client kills the first.)
+//
+// Session pool: CDP sessions stay attached to all known page targets permanently,
+// preventing Chrome from discarding background tabs. Tab switching only
+// stops/starts screencast (~3 round trips) instead of detach/reattach (~7).
+// All viewers share one active target and receive broadcast frames.
+// DevTools connections are independent — each gets its own session outside the pool.
 
 import http from 'node:http';
 import fs from 'node:fs';
@@ -70,16 +75,12 @@ async function getCdpTargets() {
 }
 
 // Debounced broadcast: notify all viewers to refresh tabs when targets change.
-// Used by Target.setDiscoverTargets events (targetCreated/Destroyed/InfoChanged).
 let tabBroadcastTimer = null;
 function scheduleTabBroadcast() {
   if (tabBroadcastTimer) return;
   tabBroadcastTimer = setTimeout(() => {
     tabBroadcastTimer = null;
-    const msg = JSON.stringify({ type: 'tabsChanged' });
-    for (const client of viewerWss.clients) {
-      if (client.readyState === WebSocket.OPEN) client.send(msg);
-    }
+    broadcastToViewers({ type: 'tabsChanged' });
   }, 500);
 }
 
@@ -115,14 +116,13 @@ function normalizeUrl(input) {
 }
 
 // --- Extension discovery ---
-// Attaches to each extension's service worker / background page via CDP to call
-// chrome.runtime.getManifest() (returns i18n-resolved names) and fetch the toolbar
-// icon as a data URL from within the extension context. No filesystem paths needed.
+// Reads extension info from Chrome's Preferences file on disk.
+// Icon files are read directly from extension directories and converted to data URLs.
+// Falls back to attaching to service workers via CDP for i18n-resolved names.
 
 let extensionCache = null;
 let extensionPrefsMtimeMs = 0;
 
-// Read icon file from extension directory and convert to data URL
 async function readExtensionIcon(extPath, manifest) {
   const ai = manifest.action?.default_icon || manifest.browser_action?.default_icon;
   const fi = manifest.icons || {};
@@ -261,7 +261,7 @@ async function getProfileStatus() {
     helperSid = await attachToTarget(helperId);
     await sessionCommand(helperSid, 'Page.enable');
 
-    // Poll for sync-internals data (replaces fixed 2s delay)
+    // Poll for sync-internals data
     let syncData = {};
     for (let i = 0; i < 10; i++) {
       await new Promise(r => setTimeout(r, 500));
@@ -337,13 +337,23 @@ async function getProfileStatus() {
 
 let browserWs = null;
 let browserCmdId = 1;
-let downloadBehaviorSet = false;
 let pendingBrowserCmds = new Map(); // id → { resolve, reject, sessionId }
 let sessionHandlers = new Map();    // sessionId → fn(msg)
 let browserConnecting = null;       // dedup concurrent connect attempts
-const viewerReconnectors = new Set(); // reconnect callbacks for each viewer
-const viewerTargetDestroyedHandlers = new Set(); // called when a page target is destroyed
 let browserExplicitlyStopped = false; // suppress auto-reconnect after explicit stop
+
+// --- Global session pool ---
+// Sessions attached to ALL known page targets. Prevents Chrome from discarding
+// background tabs and eliminates detach/attach overhead on tab switch.
+const sessionPool = new Map(); // targetId -> { sessionId, mainFrameId }
+let activeTargetId = null;
+let screencastActive = false;
+let globalSwitching = false;
+let globalZoomLevel = 1.0;
+let globalZoomScriptId = null;
+let lastKnownOrder = [];
+let globalReconciling = false;
+let globalReconnecting = false;
 
 async function getBrowserWsUrl() {
   const version = await cdpFetch('/json/version');
@@ -368,10 +378,14 @@ function ensureBrowserConnection() {
       ws.on('open', () => {
         browserWs = ws;
         browserConnecting = null;
-        downloadBehaviorSet = false;
         log.info('browser-level CDP connected');
         // Push target lifecycle events so viewers get real-time tab updates
         browserCommand('Target.setDiscoverTargets', { discover: true }).catch(() => {});
+        // Download behavior — set once per browser connection
+        const dlPath = process.env.DOWNLOAD_DIR || (process.env.HOME || '/home/node') + '/downloads';
+        browserCommand('Browser.setDownloadBehavior', {
+          behavior: 'allow', downloadPath: dlPath
+        }).then(() => { log.debug('download behavior set:', dlPath); }).catch(() => {});
         resolve();
       });
 
@@ -398,10 +412,14 @@ function ensureBrowserConnection() {
             return;
           }
 
-          // Target lifecycle events → push tab updates to all viewers
+          // Target lifecycle events
           if (msg.method === 'Target.targetCreated') {
             const ti = msg.params?.targetInfo;
-            if (ti?.type === 'page') scheduleTabBroadcast();
+            if (ti?.type === 'page') {
+              scheduleTabBroadcast();
+              poolAttach(ti.targetId).catch(err =>
+                log.error('poolAttach failed for %s: %s', ti.targetId, err.message));
+            }
             // Extension installed/enabled — invalidate cache so next
             // getExtensions fetches fresh data
             if (ti?.type === 'service_worker' || ti?.type === 'background_page') {
@@ -410,13 +428,16 @@ function ensureBrowserConnection() {
             }
           }
           if (msg.method === 'Target.targetDestroyed') {
-            // targetDestroyed only has params.targetId, no targetInfo —
-            // can't filter by type for pages. Always notify viewers for
-            // known tabs; always invalidate extension cache (cheap check).
             const destroyedId = msg.params?.targetId;
             if (destroyedId) {
               if (knownTabs.has(destroyedId)) scheduleTabBroadcast();
-              for (const fn of viewerTargetDestroyedHandlers) fn(destroyedId);
+              poolDetach(destroyedId);
+              if (destroyedId === activeTargetId) {
+                activeTargetId = null;
+                screencastActive = false;
+                globalZoomScriptId = null;
+                reconcileTabsGlobal();
+              }
             }
             extensionCache = null;
           }
@@ -434,15 +455,19 @@ function ensureBrowserConnection() {
         for (const [, { reject: rej }] of pendingBrowserCmds) rej(new Error('browser WS closed'));
         pendingBrowserCmds.clear();
         sessionHandlers.clear();
-        // Invalidate caches — stale after browser restart
+        // All pooled sessions are invalid after disconnect
+        sessionPool.clear();
+        activeTargetId = null;
+        screencastActive = false;
+        globalZoomScriptId = null;
+        // Invalidate caches
         extensionCache = null;
         profileCache = null;
         profileCacheTime = 0;
         profileDir = null;
         extensionPrefsMtimeMs = 0;
-        // Auto-reconnect viewers unless browser was explicitly stopped
         if (!browserExplicitlyStopped) {
-          for (const fn of viewerReconnectors) fn();
+          globalReconnect();
         }
       });
 
@@ -519,6 +544,284 @@ function detachSession(sessionId) {
   }
 }
 
+// --- Session pool management ---
+
+function broadcastToViewers(obj) {
+  const msg = JSON.stringify(obj);
+  for (const client of viewerWss.clients) {
+    if (client.readyState === WebSocket.OPEN) client.send(msg);
+  }
+}
+
+function activeSession() {
+  if (!activeTargetId) return null;
+  return sessionPool.get(activeTargetId) || null;
+}
+
+async function poolAttach(targetId) {
+  if (sessionPool.has(targetId)) return;
+  const sessionId = await attachToTarget(targetId);
+  const entry = { sessionId, mainFrameId: null };
+  sessionPool.set(targetId, entry);
+
+  await sessionCommand(sessionId, 'Page.enable').catch(() => {});
+  const frameTree = await sessionCommand(sessionId, 'Page.getFrameTree').catch(() => null);
+  entry.mainFrameId = frameTree?.result?.frameTree?.frame?.id || null;
+
+  sessionHandlers.set(sessionId, (msg) => {
+    poolSessionHandler(targetId, entry, msg);
+  });
+  log.debug('poolAttach: target=%s session=%s', targetId, sessionId);
+}
+
+function poolDetach(targetId) {
+  const entry = sessionPool.get(targetId);
+  if (!entry) return;
+  sessionPool.delete(targetId);
+  detachSession(entry.sessionId);
+  log.debug('poolDetach: target=%s', targetId);
+}
+
+function poolSessionHandler(targetId, entry, msg) {
+  // Screencast frames — only from active target, broadcast to all viewers
+  if (msg.method === 'Page.screencastFrame') {
+    if (targetId === activeTargetId) {
+      broadcastToViewers({
+        type: 'frame',
+        data: msg.params.data,
+        metadata: msg.params.metadata,
+        sessionId: msg.params.sessionId
+      });
+      sessionSend(entry.sessionId, 'Page.screencastFrameAck', {
+        sessionId: msg.params.sessionId
+      });
+    }
+    return;
+  }
+
+  // Page events — only forward from active target
+  if (targetId === activeTargetId) {
+    if (msg.method === 'Page.frameNavigated' && !msg.params.frame?.parentId) {
+      entry.mainFrameId = msg.params.frame?.id;
+      broadcastToViewers({ type: 'navigated', url: msg.params.frame?.url });
+    }
+    // JS-driven URL changes (history.pushState / replaceState)
+    if (msg.method === 'Page.navigatedWithinDocument') {
+      if (!entry.mainFrameId || msg.params.frameId === entry.mainFrameId) {
+        broadcastToViewers({ type: 'navigated', url: msg.params.url });
+      }
+    }
+    if (msg.method === 'Page.frameStartedLoading') {
+      if (!entry.mainFrameId || msg.params.frameId === entry.mainFrameId) {
+        broadcastToViewers({ type: 'loading', loading: true });
+      }
+    }
+    if (msg.method === 'Page.frameStoppedLoading') {
+      if (!entry.mainFrameId || msg.params.frameId === entry.mainFrameId) {
+        broadcastToViewers({ type: 'loading', loading: false });
+      }
+    }
+  }
+
+  // Session killed by Chrome (target crashed, etc.)
+  if (msg.method === 'Inspector.detached') {
+    log.debug('pool session detached for target %s: %s', targetId, msg.params?.reason);
+    sessionPool.delete(targetId);
+    sessionHandlers.delete(entry.sessionId);
+    if (targetId === activeTargetId) {
+      screencastActive = false;
+      globalZoomScriptId = null;
+      reconcileTabsGlobal();
+    }
+  }
+}
+
+async function switchToTarget(targetId) {
+  if (targetId === activeTargetId && screencastActive) return;
+  if (globalSwitching) return;
+  globalSwitching = true;
+  const t0 = Date.now();
+  try {
+    // Stop screencast on old active session
+    if (activeTargetId && screencastActive) {
+      const oldEntry = sessionPool.get(activeTargetId);
+      if (oldEntry) sessionSend(oldEntry.sessionId, 'Page.stopScreencast');
+      screencastActive = false;
+    }
+    globalZoomScriptId = null;
+
+    // Ensure target is in the pool
+    if (!sessionPool.has(targetId)) {
+      await poolAttach(targetId);
+    }
+    const entry = sessionPool.get(targetId);
+    if (!entry) throw new Error('Failed to attach to target ' + targetId);
+
+    activeTargetId = targetId;
+
+    // Activate so Chrome treats it as foreground (required for screencast)
+    let t1 = Date.now();
+    const activateResp = await browserCommand('Target.activateTarget', { targetId });
+    if (activateResp.error) log.error('activateTarget failed:', activateResp.error.message);
+    log.debug('switchToTarget: activateTarget %dms', Date.now() - t1);
+
+    t1 = Date.now();
+    await sessionCommand(entry.sessionId, 'Page.bringToFront');
+    log.debug('switchToTarget: bringToFront %dms', Date.now() - t1);
+
+    t1 = Date.now();
+    const scResp = await sessionCommand(entry.sessionId, 'Page.startScreencast', {
+      format: 'jpeg', quality: SCREENCAST_QUALITY,
+      maxWidth: VIEWPORT_WIDTH, maxHeight: VIEWPORT_HEIGHT
+    });
+    if (scResp.error) log.error('startScreencast failed:', scResp.error.message);
+    screencastActive = true;
+    log.debug('switchToTarget: startScreencast %dms', Date.now() - t1);
+
+    if (globalZoomLevel !== 1.0) await applyZoomGlobal();
+
+    lastKnownOrder = [...knownTabs.entries()]
+      .sort((a, b) => a[1] - b[1])
+      .map(([id]) => id);
+
+    const target = await findPageTarget(targetId);
+    broadcastToViewers({
+      type: 'targetChanged',
+      targetId: activeTargetId,
+      url: target.url,
+      title: target.title
+    });
+
+    log.debug('switchToTarget: total %dms', Date.now() - t0);
+  } finally {
+    globalSwitching = false;
+  }
+}
+
+async function reconcileTabsGlobal() {
+  if (globalReconciling || globalSwitching) return;
+  globalReconciling = true;
+  try {
+    const targets = await getCdpTargets();
+    const pages = targets.filter(t => t.type === 'page');
+    const currentIds = new Set(pages.map(t => t.id));
+    const newOrder = pages.map(t => t.id);
+
+    // Clean up pool entries for destroyed targets
+    for (const [targetId] of sessionPool) {
+      if (!currentIds.has(targetId)) poolDetach(targetId);
+    }
+
+    // Attach new targets not in pool
+    for (const page of pages) {
+      if (!sessionPool.has(page.id)) {
+        await poolAttach(page.id).catch(() => {});
+      }
+    }
+
+    if (activeTargetId && !currentIds.has(activeTargetId)) {
+      // Active tab gone — find adjacent from old order
+      const oldSet = new Set(lastKnownOrder);
+      const searchOrder = [...lastKnownOrder];
+      for (const id of newOrder) {
+        if (!oldSet.has(id)) searchOrder.push(id);
+      }
+      const lostId = activeTargetId;
+      const oldIdx = searchOrder.indexOf(lostId);
+      let nextId = null;
+      if (oldIdx >= 0) {
+        for (let i = oldIdx + 1; i < searchOrder.length; i++) {
+          if (currentIds.has(searchOrder[i])) { nextId = searchOrder[i]; break; }
+        }
+        if (!nextId) {
+          for (let i = oldIdx - 1; i >= 0; i--) {
+            if (currentIds.has(searchOrder[i])) { nextId = searchOrder[i]; break; }
+          }
+        }
+      }
+      log.debug('reconcile: active tab %s gone, next=%s (old %d tabs, now %d)',
+        lostId, nextId, lastKnownOrder.length, pages.length);
+
+      activeTargetId = null;
+      screencastActive = false;
+      globalZoomScriptId = null;
+
+      if (pages.length === 0) {
+        const page = await ensureAtLeastOnePage();
+        await switchToTarget(page.id);
+      } else {
+        await switchToTarget(nextId || pages[0].id);
+      }
+    } else {
+      lastKnownOrder = newOrder;
+    }
+
+    const freshPages = pages.map(t => ({
+      id: t.id, url: t.url, title: t.title,
+      active: t.id === activeTargetId
+    }));
+    broadcastToViewers({ type: 'tabs', tabs: freshPages });
+  } catch (err) {
+    log.error('reconcileTabsGlobal error:', err.message);
+  } finally {
+    globalReconciling = false;
+  }
+}
+
+function globalReconnect() {
+  if (globalReconnecting || browserExplicitlyStopped) return;
+  globalReconnecting = true;
+
+  (async () => {
+    while (true) {
+      broadcastToViewers({ type: 'status', message: 'Reconnecting to browser...' });
+      await new Promise(r => setTimeout(r, 2000));
+      try {
+        await ensureBrowserConnection();
+        const targets = await getCdpTargets();
+        const pages = targets.filter(t => t.type === 'page');
+        for (const page of pages) {
+          await poolAttach(page.id).catch(err =>
+            log.error('globalReconnect poolAttach failed: %s', err.message));
+        }
+        if (pages.length === 0) {
+          const page = await ensureAtLeastOnePage();
+          await switchToTarget(page.id);
+        } else {
+          const resume = pages.find(t => t.id === activeTargetId) || pages[0];
+          await switchToTarget(resume.id);
+        }
+        globalReconnecting = false;
+        break;
+      } catch (err) {
+        log.error('globalReconnect attempt failed:', err.message);
+      }
+    }
+  })();
+}
+
+async function applyZoomGlobal() {
+  const entry = activeSession();
+  if (!entry) return;
+  const sid = entry.sessionId;
+  if (globalZoomScriptId) {
+    await sessionCommand(sid, 'Page.removeScriptToEvaluateOnNewDocument', {
+      identifier: globalZoomScriptId
+    }).catch(() => {});
+    globalZoomScriptId = null;
+  }
+  const zoomValue = globalZoomLevel === 1.0 ? '' : String(globalZoomLevel);
+  await sessionCommand(sid, 'Runtime.evaluate', {
+    expression: `document.documentElement.style.zoom='${zoomValue}'`
+  }).catch(() => {});
+  if (globalZoomLevel !== 1.0) {
+    const resp = await sessionCommand(sid, 'Page.addScriptToEvaluateOnNewDocument', {
+      source: `document.documentElement.style.zoom='${globalZoomLevel}'`
+    }).catch(() => null);
+    if (resp?.result?.identifier) globalZoomScriptId = resp.result.identifier;
+  }
+}
+
 // --- HTTP server ---
 
 const KNOWN_ENDPOINTS = new Set(['health', 'tabs', 'devtools-check']);
@@ -544,8 +847,6 @@ const server = http.createServer(async (req, res) => {
   } else if (p === '/health') {
     jsonResponse(res, { ok: true });
   } else if (p === '/devtools-check') {
-    // Diagnostic: tests the full devtools proxy chain without WebSocket.
-    // Hit /devtools-check?target=<id> to verify target exists and session attaches.
     const reqUrl = new URL(req.url, 'http://localhost');
     const targetId = reqUrl.searchParams.get('target');
     try {
@@ -602,8 +903,7 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 // --- DevTools proxy ---
-// Attaches a new session to the target, relays messages bidirectionally.
-// DevTools frontend doesn't know about sessionId — proxy adds/strips it.
+// Independent sessions outside the pool. Each DevTools client gets its own session.
 
 devtoolsWss.on('connection', async (client, req) => {
   log.info('devtools client connected');
@@ -612,9 +912,6 @@ devtoolsWss.on('connection', async (client, req) => {
   const targetId = url.searchParams.get('target');
   log.debug('devtools requested target:', targetId);
 
-  // Buffer messages from DevTools frontend while we attach to the target.
-  // DevTools sends commands immediately on connect — without buffering,
-  // early commands (Runtime.enable, Page.enable, etc.) are silently dropped.
   let sessionId = null;
   const earlyMessages = [];
 
@@ -648,7 +945,6 @@ devtoolsWss.on('connection', async (client, req) => {
     return;
   }
 
-  // Chrome → DevTools: strip sessionId before forwarding
   sessionHandlers.set(sessionId, (msg) => {
     if (client.readyState !== WebSocket.OPEN) return;
     const fwd = Object.assign({}, msg);
@@ -656,7 +952,6 @@ devtoolsWss.on('connection', async (client, req) => {
     client.send(JSON.stringify(fwd));
   });
 
-  // Replay buffered messages now that sessionId is set
   const bufferedCount = earlyMessages.length;
   for (const raw of earlyMessages) {
     try {
@@ -670,308 +965,53 @@ devtoolsWss.on('connection', async (client, req) => {
 });
 
 // --- Viewer: screencast + input ---
+// Thin client: receives broadcast frames, sends input to active session.
+// All state is server-side. Multiple viewers share one active target.
 // Viewport is fixed at Chrome launch via --window-size=1920,1080.
-// No Emulation.setDeviceMetricsOverride needed — that was causing white
-// frames by creating a virtual viewport that screencast couldn't capture from.
 
 viewerWss.on('connection', async (client, req) => {
   const reqUrl = new URL(req.url, 'http://localhost');
   const preferredTarget = reqUrl.searchParams.get('target');
-  log.info('viewer client connected', preferredTarget ? `(preferred: ${preferredTarget})` : '');
-
-  let sessionId = null;
-  let screencastStarted = false;
-  let currentTargetId = null;
-  let connectGen = 0;
-  let switching = false;
-  let zoomLevel = 1.0;
-  let mainFrameId = null;
-  let lastKnownOrder = []; // ordered tab IDs from last snapshot, for adjacent-tab selection
+  log.info('viewer connected', preferredTarget ? `(preferred: ${preferredTarget})` : '');
 
   function clientSend(obj) {
     if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify(obj));
   }
 
-  // Single reconciliation path for all "tab disappeared" scenarios.
-  // Compares current tabs against lastKnownOrder to detect if the active tab
-  // is gone, then picks adjacent tab from the OLD order (before removal).
-  let reconciling = false;
-  async function reconcileTabs() {
-    if (reconciling || switching) return;
-    reconciling = true;
+  // Send current state snapshot so the viewer catches up immediately
+  if (activeTargetId) {
     try {
-      const targets = await getCdpTargets();
-      const pages = targets.filter(t => t.type === 'page');
-      const currentIds = new Set(pages.map(t => t.id));
+      const target = await findPageTarget(activeTargetId);
+      clientSend({ type: 'targetChanged', targetId: activeTargetId, url: target.url, title: target.title });
+    } catch {}
+  }
 
-      // Update lastKnownOrder for next reconcile
-      const newOrder = pages.map(t => t.id);
-
-      if (currentTargetId && !currentIds.has(currentTargetId)) {
-        // Active tab is gone — find adjacent from merged order.
-        // Merge old snapshot with live state so newly created tabs (not yet
-        // in lastKnownOrder due to race) appear after the old tabs.
-        const oldSet = new Set(lastKnownOrder);
-        const searchOrder = [...lastKnownOrder];
-        for (const id of newOrder) {
-          if (!oldSet.has(id)) searchOrder.push(id);
-        }
-        const lostId = currentTargetId;
-        const oldIdx = searchOrder.indexOf(lostId);
-        let nextId = null;
-        if (oldIdx >= 0) {
-          for (let i = oldIdx + 1; i < searchOrder.length; i++) {
-            if (currentIds.has(searchOrder[i])) { nextId = searchOrder[i]; break; }
-          }
-          if (!nextId) {
-            for (let i = oldIdx - 1; i >= 0; i--) {
-              if (currentIds.has(searchOrder[i])) { nextId = searchOrder[i]; break; }
-            }
-          }
-        }
-        log.debug('reconcile: active tab %s gone, next=%s (old order had %d tabs, now %d)',
-          lostId, nextId, lastKnownOrder.length, pages.length);
-
-        sessionId = null;
-        currentTargetId = null;
-        screencastStarted = false;
-
-        if (pages.length === 0) {
-          const page = await ensureAtLeastOnePage();
-          await connectToTarget(page.id);
-        } else {
-          await connectToTarget(nextId || pages[0].id);
-        }
-        // connectToTarget already seeded lastKnownOrder from fresh knownTabs
-      } else {
-        lastKnownOrder = newOrder;
-      }
-
-      // Broadcast fresh tab list to client
-      const freshPages = pages.map(t => ({
-        id: t.id, url: t.url, title: t.title, active: t.id === currentTargetId
-      }));
-      clientSend({ type: 'tabs', tabs: freshPages });
+  // Bootstrap: first viewer when no active target
+  if (!activeTargetId && !globalSwitching && !globalReconnecting) {
+    try {
+      await ensureBrowserConnection();
+      const target = await findPageTarget(preferredTarget || null);
+      await switchToTarget(target.targetId);
     } catch (err) {
-      log.error('reconcileTabs error:', err.message);
-    } finally {
-      reconciling = false;
+      log.error('viewer bootstrap failed:', err.message);
+      clientSend({ type: 'status', message: 'Waiting for browser to start...' });
+      globalReconnect();
     }
   }
-
-  // CSS zoom: viewport stays 1920x1080, content scales via document.documentElement.style.zoom.
-  // addScriptToEvaluateOnNewDocument persists across navigations within the session.
-  let zoomScriptId = null;
-
-  async function applyZoom() {
-    if (!sessionId) return;
-    if (zoomScriptId) {
-      await sessionCommand(sessionId, 'Page.removeScriptToEvaluateOnNewDocument', {
-        identifier: zoomScriptId
-      }).catch(() => {});
-      zoomScriptId = null;
-    }
-    const zoomValue = zoomLevel === 1.0 ? '' : String(zoomLevel);
-    await sessionCommand(sessionId, 'Runtime.evaluate', {
-      expression: `document.documentElement.style.zoom='${zoomValue}'`
-    }).catch(() => {});
-    if (zoomLevel !== 1.0) {
-      const resp = await sessionCommand(sessionId, 'Page.addScriptToEvaluateOnNewDocument', {
-        source: `document.documentElement.style.zoom='${zoomLevel}'`
-      }).catch(() => null);
-      if (resp?.result?.identifier) zoomScriptId = resp.result.identifier;
-    }
-  }
-
-  async function connectToTarget(targetId) {
-    const ct0 = Date.now();
-    const gen = ++connectGen;
-    switching = true;
-
-    if (sessionId) {
-      if (screencastStarted) {
-        sessionSend(sessionId, 'Page.stopScreencast');
-      }
-      screencastStarted = false;
-      detachSession(sessionId);
-      sessionId = null;
-      zoomScriptId = null;
-      log.debug('connectToTarget: detach old %dms', Date.now() - ct0);
-    }
-
-    if (gen !== connectGen) return; // preempted by newer connectToTarget call
-
-    let ct1 = Date.now();
-    await ensureBrowserConnection();
-    log.debug('connectToTarget: ensureBrowser %dms', Date.now() - ct1);
-    if (!downloadBehaviorSet) {
-      const dlPath = process.env.DOWNLOAD_DIR || (process.env.HOME || '/home/node') + '/downloads';
-      await browserCommand('Browser.setDownloadBehavior', {
-        behavior: 'allow', downloadPath: dlPath
-      }).catch(() => {});
-      downloadBehaviorSet = true;
-      log.debug('download behavior set:', dlPath);
-    }
-    ct1 = Date.now();
-    const target = await findPageTarget(targetId);
-    currentTargetId = target.targetId;
-    log.debug('connectToTarget: findPageTarget %dms', Date.now() - ct1);
-    ct1 = Date.now();
-    sessionId = await attachToTarget(currentTargetId);
-    log.debug('connectToTarget: attach %dms (session=%s target=%s)', Date.now() - ct1, sessionId, currentTargetId);
-
-    if (gen !== connectGen) {
-      detachSession(sessionId);
-      sessionId = null;
-      return;
-    }
-
-    // Route session events to the viewer
-    sessionHandlers.set(sessionId, (msg) => {
-      if (msg.method === 'Page.screencastFrame') {
-        clientSend({
-          type: 'frame',
-          data: msg.params.data,
-          metadata: msg.params.metadata,
-          sessionId: msg.params.sessionId
-        });
-        sessionSend(sessionId, 'Page.screencastFrameAck', { sessionId: msg.params.sessionId });
-      }
-
-      if (msg.method === 'Page.frameNavigated' && !msg.params.frame?.parentId) {
-        mainFrameId = msg.params.frame?.id;
-        clientSend({ type: 'navigated', url: msg.params.frame?.url });
-      }
-
-      // JS-driven URL changes (history.pushState / replaceState)
-      if (msg.method === 'Page.navigatedWithinDocument') {
-        if (!mainFrameId || msg.params.frameId === mainFrameId) {
-          clientSend({ type: 'navigated', url: msg.params.url });
-        }
-      }
-
-      if (msg.method === 'Page.frameStartedLoading') {
-        if (!mainFrameId || msg.params.frameId === mainFrameId) {
-          clientSend({ type: 'loading', loading: true });
-        }
-      }
-
-      if (msg.method === 'Page.frameStoppedLoading') {
-        if (!mainFrameId || msg.params.frameId === mainFrameId) {
-          clientSend({ type: 'loading', loading: false });
-        }
-      }
-
-      if (msg.method === 'Inspector.detached') {
-        log.debug('viewer session detached:', msg.params?.reason);
-        screencastStarted = false;
-        if (!switching) reconcileTabs();
-      }
-    });
-
-    switching = false;
-
-    // Activate the target so Chrome treats it as the foreground tab.
-    // Without this, headless=new won't produce composited frames for screencast.
-    let t1 = Date.now();
-    const activateResp = await browserCommand('Target.activateTarget', { targetId: currentTargetId });
-    if (activateResp.error) log.error('activateTarget failed:', activateResp.error.message);
-    log.debug('connectToTarget: activateTarget %dms', Date.now() - t1);
-    t1 = Date.now();
-    await sessionCommand(sessionId, 'Page.bringToFront');
-    log.debug('connectToTarget: bringToFront %dms', Date.now() - t1);
-    t1 = Date.now();
-    await sessionCommand(sessionId, 'Page.enable');
-    log.debug('connectToTarget: Page.enable %dms', Date.now() - t1);
-    t1 = Date.now();
-    const frameTree = await sessionCommand(sessionId, 'Page.getFrameTree').catch(() => null);
-    mainFrameId = frameTree?.result?.frameTree?.frame?.id || null;
-    log.debug('connectToTarget: getFrameTree %dms', Date.now() - t1);
-    t1 = Date.now();
-    const scResp = await sessionCommand(sessionId, 'Page.startScreencast', {
-      format: 'jpeg', quality: SCREENCAST_QUALITY,
-      maxWidth: VIEWPORT_WIDTH, maxHeight: VIEWPORT_HEIGHT
-    });
-    if (scResp.error) log.error('startScreencast failed:', scResp.error.message);
-    screencastStarted = true;
-    log.debug('connectToTarget: startScreencast %dms', Date.now() - t1);
-    log.debug('connectToTarget: total %dms', Date.now() - ct0);
-    if (zoomLevel !== 1.0) await applyZoom();
-
-    clientSend({ type: 'targetChanged', targetId: currentTargetId, url: target.url, title: target.title });
-
-    // Seed lastKnownOrder so reconcileTabs can compute adjacent tabs
-    lastKnownOrder = [...knownTabs.entries()]
-      .sort((a, b) => a[1] - b[1])
-      .map(([id]) => id);
-  }
-
-  let isClosed = false;
-  let reconnecting = false;
-
-  function startReconnectLoop() {
-    if (reconnecting || isClosed) return;
-    reconnecting = true;
-    sessionId = null;
-    screencastStarted = false;
-    (async () => {
-      while (!isClosed) {
-        clientSend({ type: 'status', message: 'Reconnecting to browser...' });
-        await new Promise(r => setTimeout(r, 2000));
-        try {
-          await connectToTarget(currentTargetId || preferredTarget || null);
-          reconnecting = false;
-          break;
-        } catch {}
-      }
-    })();
-  }
-
-  function onTargetDestroyed(destroyedId) {
-    if (destroyedId !== currentTargetId || switching) return;
-    log.debug('current target destroyed externally:', destroyedId);
-    reconcileTabs();
-  }
-
-  viewerReconnectors.add(startReconnectLoop);
-  viewerTargetDestroyedHandlers.add(onTargetDestroyed);
 
   client.on('close', () => {
-    isClosed = true;
-    viewerReconnectors.delete(startReconnectLoop);
-    viewerTargetDestroyedHandlers.delete(onTargetDestroyed);
-    log.info('viewer client disconnected');
-    switching = true;
-    if (sessionId) {
-      if (screencastStarted) sessionSend(sessionId, 'Page.stopScreencast');
-      detachSession(sessionId);
-    }
+    log.info('viewer disconnected');
+    // Nothing to clean up — session pool is independent of viewer lifecycle
   });
-
-  (async function connectLoop() {
-    let attempts = 0;
-    while (!isClosed) {
-      try {
-        await connectToTarget(preferredTarget || null);
-        break;
-      } catch (err) {
-        if (attempts === 0) {
-          log.error('initial connect failed, will retry:', err.message);
-        }
-        clientSend({ type: 'status', message: 'Waiting for browser to start...' });
-        await new Promise(r => setTimeout(r, 2000));
-        attempts++;
-      }
-    }
-  })();
 
   client.on('message', async (data) => {
     try {
       const msg = JSON.parse(data.toString());
+      const entry = activeSession();
 
       switch (msg.type) {
         case 'mouse':
-          if (sessionId) sessionSend(sessionId, 'Input.dispatchMouseEvent', {
+          if (entry) sessionSend(entry.sessionId, 'Input.dispatchMouseEvent', {
             type: msg.action, x: msg.x, y: msg.y,
             button: msg.button || 'left',
             clickCount: msg.clickCount || 0,
@@ -980,7 +1020,7 @@ viewerWss.on('connection', async (client, req) => {
           break;
 
         case 'key':
-          if (sessionId) sessionSend(sessionId, 'Input.dispatchKeyEvent', {
+          if (entry) sessionSend(entry.sessionId, 'Input.dispatchKeyEvent', {
             type: msg.action, key: msg.key, code: msg.code,
             text: msg.text || '',
             windowsVirtualKeyCode: msg.keyCode || 0,
@@ -989,22 +1029,22 @@ viewerWss.on('connection', async (client, req) => {
           break;
 
         case 'scroll':
-          if (sessionId) sessionSend(sessionId, 'Input.dispatchMouseEvent', {
+          if (entry) sessionSend(entry.sessionId, 'Input.dispatchMouseEvent', {
             type: 'mouseWheel', x: msg.x, y: msg.y,
             deltaX: msg.deltaX || 0, deltaY: msg.deltaY || 0
           });
           break;
 
         case 'paste':
-          if (sessionId && msg.text) {
-            sessionSend(sessionId, 'Input.insertText', { text: msg.text });
+          if (entry && msg.text) {
+            sessionSend(entry.sessionId, 'Input.insertText', { text: msg.text });
           }
           break;
 
         case 'copy':
-          if (sessionId) {
+          if (entry) {
             try {
-              const resp = await sessionCommand(sessionId, 'Runtime.evaluate', {
+              const resp = await sessionCommand(entry.sessionId, 'Runtime.evaluate', {
                 expression: 'window.getSelection().toString()'
               });
               const text = resp?.result?.result?.value;
@@ -1015,35 +1055,35 @@ viewerWss.on('connection', async (client, req) => {
 
         case 'zoom':
           if (typeof msg.level === 'number') {
-            zoomLevel = Math.max(0.25, Math.min(5, msg.level));
-            await applyZoom();
+            globalZoomLevel = Math.max(0.25, Math.min(5, msg.level));
+            await applyZoomGlobal();
           }
           break;
 
         case 'navigate':
-          if (sessionId) sessionSend(sessionId, 'Page.navigate', { url: normalizeUrl(msg.url) });
+          if (entry) sessionSend(entry.sessionId, 'Page.navigate', { url: normalizeUrl(msg.url) });
           break;
 
         case 'reload':
-          if (sessionId) sessionSend(sessionId, 'Page.reload');
+          if (entry) sessionSend(entry.sessionId, 'Page.reload');
           break;
 
         case 'stop':
-          if (sessionId) sessionSend(sessionId, 'Page.stopLoading');
+          if (entry) sessionSend(entry.sessionId, 'Page.stopLoading');
           break;
 
         case 'back':
-          if (sessionId) sessionSend(sessionId, 'Runtime.evaluate', { expression: 'history.back()' });
+          if (entry) sessionSend(entry.sessionId, 'Runtime.evaluate', { expression: 'history.back()' });
           break;
 
         case 'forward':
-          if (sessionId) sessionSend(sessionId, 'Runtime.evaluate', { expression: 'history.forward()' });
+          if (entry) sessionSend(entry.sessionId, 'Runtime.evaluate', { expression: 'history.forward()' });
           break;
 
         case 'switchTab':
           if (msg.targetId) {
             try {
-              await connectToTarget(msg.targetId);
+              await switchToTarget(msg.targetId);
             } catch (err) {
               clientSend({ type: 'error', message: 'Failed to switch tab: ' + err.message });
             }
@@ -1054,7 +1094,7 @@ viewerWss.on('connection', async (client, req) => {
           try {
             const newUrl = normalizeUrl(msg.url || '');
             const target = await cdpFetch('/json/new?' + newUrl, 'PUT');
-            await connectToTarget(target.id);
+            await switchToTarget(target.id);
           } catch (err) {
             clientSend({ type: 'error', message: 'Failed to create tab: ' + err.message });
           }
@@ -1062,10 +1102,10 @@ viewerWss.on('connection', async (client, req) => {
 
         case 'duplicateTab':
           try {
-            if (!currentTargetId) throw new Error('No active tab');
-            const curTarget = await findPageTarget(currentTargetId);
+            if (!activeTargetId) throw new Error('No active tab');
+            const curTarget = await findPageTarget(activeTargetId);
             const dup = await cdpFetch('/json/new?' + encodeURI(curTarget.url), 'PUT');
-            await connectToTarget(dup.id);
+            await switchToTarget(dup.id);
           } catch (err) {
             clientSend({ type: 'error', message: 'Failed to duplicate tab: ' + err.message });
           }
@@ -1078,26 +1118,22 @@ viewerWss.on('connection', async (client, req) => {
               break;
             }
             const t0 = Date.now();
-            clientSend({ type: 'tabClosing', targetId: msg.targetId });
+            broadcastToViewers({ type: 'tabClosing', targetId: msg.targetId });
             try {
-              const tClose = Date.now();
               await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/close/${msg.targetId}`);
-              log.debug('closeTab: /json/close %dms', Date.now() - tClose);
-              // reconcileTabs detects the missing tab, picks adjacent, activates
-              await reconcileTabs();
+              await reconcileTabsGlobal();
             } catch (err) {
               log.error('closeTab error:', err.message);
-              clientSend({ type: 'error', message: 'Failed to close tab: ' + err.message });
+              broadcastToViewers({ type: 'error', message: 'Failed to close tab: ' + err.message });
             } finally {
-              clientSend({ type: 'tabCloseComplete', targetId: msg.targetId });
+              broadcastToViewers({ type: 'tabCloseComplete', targetId: msg.targetId });
             }
             log.debug('closeTab: e2e %dms', Date.now() - t0);
           }
           break;
 
         case 'getTabs':
-          // Full reconcile: updates lastKnownOrder, detects missing active tab
-          await reconcileTabs();
+          await reconcileTabsGlobal();
           break;
 
         case 'copyInternalState':
@@ -1107,11 +1143,14 @@ viewerWss.on('connection', async (client, req) => {
               jsonList,
               knownTabs: Object.fromEntries(knownTabs),
               helperTargets: [...helperTargets],
-              currentTargetId,
-              sessionId,
+              activeTargetId,
+              sessionPool: Object.fromEntries(
+                [...sessionPool].map(([tid, e]) => [tid, { sessionId: e.sessionId, mainFrameId: e.mainFrameId }])
+              ),
               tabCounter,
-              screencastStarted,
-              switching,
+              screencastActive,
+              globalSwitching,
+              globalZoomLevel,
               browserConnected: !!(browserWs && browserWs.readyState === WebSocket.OPEN)
             }});
           } catch (err) {
@@ -1142,9 +1181,7 @@ viewerWss.on('connection', async (client, req) => {
           if (!extId) break;
           let opened = false;
 
-          // Try native popup API so the popup gets correct active-tab context.
-          // After openPopup(), poll using both /json/list (HTTP endpoint) and
-          // Target.getTargets (browser WS) — popups may only appear in one.
+          // Try native popup API via service worker session (independent of pool)
           try {
             const targets = await cdpFetch('/json/list');
             const sw = targets.find(t =>
@@ -1169,8 +1206,6 @@ viewerWss.on('connection', async (client, req) => {
               if (resp && !resp.result?.exceptionDetails) {
                 for (let i = 0; i < 6 && !opened; i++) {
                   await new Promise(r => setTimeout(r, 500));
-                  // Check both HTTP and WS target lists — popup targets may only
-                  // appear in the browser-level Target.getTargets response
                   const [httpTargets, wsResp] = await Promise.all([
                     cdpFetch('/json/list'),
                     browserCommand('Target.getTargets').catch(() => null)
@@ -1185,7 +1220,7 @@ viewerWss.on('connection', async (client, req) => {
                     t.url?.startsWith('chrome-extension://' + extId + '/') &&
                     !prevIds.has(t.id || t.targetId));
                   if (popup) {
-                    await connectToTarget(popup.id);
+                    await switchToTarget(popup.id);
                     opened = true;
                   }
                 }
@@ -1193,8 +1228,7 @@ viewerWss.on('connection', async (client, req) => {
             }
           } catch {}
 
-          // Fallback: open popup URL in a new tab (loses tab context).
-          // If msg.popup is null (manifest fetch missed it), read manifest on the fly.
+          // Fallback: open popup URL in a new tab
           if (!opened) {
             let popupPath = msg.popup;
             if (!popupPath) {
@@ -1220,7 +1254,7 @@ viewerWss.on('connection', async (client, req) => {
               try {
                 const url = 'chrome-extension://' + extId + '/' + popupPath;
                 const target = await cdpFetch('/json/new?' + url, 'PUT');
-                await connectToTarget(target.id);
+                await switchToTarget(target.id);
               } catch (err) {
                 clientSend({ type: 'error', message: 'Popup failed: ' + err.message });
               }
@@ -1232,55 +1266,53 @@ viewerWss.on('connection', async (client, req) => {
         }
 
         case 'browserRestart':
-          clientSend({ type: 'status', message: 'Restarting browser...' });
-          if (sessionId) {
-            sessionHandlers.delete(sessionId);
-            sessionId = null;
-            screencastStarted = false;
-          }
+          broadcastToViewers({ type: 'status', message: 'Restarting browser...' });
+          sessionPool.clear();
+          activeTargetId = null;
+          screencastActive = false;
+          globalZoomScriptId = null;
           browserExplicitlyStopped = true;
           if (browserWs) { browserWs.close(); browserWs = null; }
           try {
             await execFileAsync(CHROME_CMD, ['stop'], { timeout: 15000 }).catch(() => {});
             await execFileAsync(CHROME_CMD, ['start-detached'], { timeout: 15000 });
             browserExplicitlyStopped = false;
-            for (const fn of viewerReconnectors) fn();
+            globalReconnect();
           } catch (err) {
             browserExplicitlyStopped = false;
-            clientSend({ type: 'error', message: 'Browser restart failed: ' + err.message });
+            broadcastToViewers({ type: 'error', message: 'Browser restart failed: ' + err.message });
           }
           break;
 
         case 'browserStop':
-          clientSend({ type: 'status', message: 'Shutting down browser...' });
-          if (sessionId) {
-            sessionHandlers.delete(sessionId);
-            sessionId = null;
-            screencastStarted = false;
-          }
+          broadcastToViewers({ type: 'status', message: 'Shutting down browser...' });
+          sessionPool.clear();
+          activeTargetId = null;
+          screencastActive = false;
+          globalZoomScriptId = null;
           browserExplicitlyStopped = true;
           if (browserWs) { browserWs.close(); browserWs = null; }
           try {
             await execFileAsync(CHROME_CMD, ['stop'], { timeout: 15000 });
-            clientSend({ type: 'browserStopped' });
+            broadcastToViewers({ type: 'browserStopped' });
           } catch (err) {
-            clientSend({ type: 'error', message: 'Browser stop failed: ' + err.message });
+            broadcastToViewers({ type: 'error', message: 'Browser stop failed: ' + err.message });
           }
           break;
 
         case 'browserStart':
-          clientSend({ type: 'status', message: 'Starting browser...' });
+          broadcastToViewers({ type: 'status', message: 'Starting browser...' });
           browserExplicitlyStopped = false;
           try {
             await execFileAsync(CHROME_CMD, ['start-detached'], { timeout: 15000 });
-            for (const fn of viewerReconnectors) fn();
+            globalReconnect();
           } catch (err) {
-            clientSend({ type: 'error', message: 'Browser start failed: ' + err.message });
+            broadcastToViewers({ type: 'error', message: 'Browser start failed: ' + err.message });
           }
           break;
 
         case 'bridgeRestart': {
-          clientSend({ type: 'error', message: 'Restarting bridge...' });
+          broadcastToViewers({ type: 'error', message: 'Restarting bridge...' });
           setTimeout(() => {
             const child = execFile(CHROME_CMD, ['restart'], {
               detached: true, stdio: 'ignore'
@@ -1291,20 +1323,18 @@ viewerWss.on('connection', async (client, req) => {
         }
 
         case 'find':
-          if (sessionId && msg.text) {
+          if (entry && msg.text) {
             const textJson = JSON.stringify(msg.text);
             const cs = !!msg.caseSensitive;
             const bw = !!msg.backwards;
 
-            // Reset selection to search from page top when search text changes
             if (msg.fromStart) {
-              await sessionCommand(sessionId, 'Runtime.evaluate', {
+              await sessionCommand(entry.sessionId, 'Runtime.evaluate', {
                 expression: 'window.getSelection().removeAllRanges()'
               }).catch(() => {});
             }
 
-            // Count matches using indexOf (avoids regex escaping complexity)
-            const countResp = await sessionCommand(sessionId, 'Runtime.evaluate', {
+            const countResp = await sessionCommand(entry.sessionId, 'Runtime.evaluate', {
               expression: `(() => {
                 const q = ${textJson}${cs ? '' : '.toLowerCase()'};
                 const t = document.body.innerText${cs ? '' : '.toLowerCase()'};
@@ -1315,9 +1345,7 @@ viewerWss.on('connection', async (client, req) => {
               })()`
             }).catch(() => null);
 
-            // window.find() highlights and scrolls to the match natively,
-            // visible through screencast without any custom overlay
-            const findResp = await sessionCommand(sessionId, 'Runtime.evaluate', {
+            const findResp = await sessionCommand(entry.sessionId, 'Runtime.evaluate', {
               expression: `window.find(${textJson}, ${cs}, ${bw}, true)`
             }).catch(() => null);
 
@@ -1330,8 +1358,8 @@ viewerWss.on('connection', async (client, req) => {
           break;
 
         case 'findClear':
-          if (sessionId) {
-            sessionCommand(sessionId, 'Runtime.evaluate', {
+          if (entry) {
+            sessionCommand(entry.sessionId, 'Runtime.evaluate', {
               expression: 'window.getSelection().removeAllRanges()'
             }).catch(() => {});
           }
