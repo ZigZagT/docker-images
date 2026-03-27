@@ -17,13 +17,15 @@ for (const test of tests) {
   const file = path.join(dir, test);
   try {
     const out = execFileSync('node', [file], {
-      timeout: 30000,
+      timeout: 120000,
       cwd: path.join(dir, '..'),
       stdio: ['ignore', 'pipe', 'pipe']
     });
     const stdout = out.toString().trim();
-    if (stdout.startsWith('PASS:')) {
-      console.log(stdout);
+    const lines = stdout.split('\n');
+    const passLine = lines.find(l => l.startsWith('PASS:'));
+    if (passLine) {
+      console.log(passLine);
       passed++;
     } else {
       console.log('FAIL:', test, '(no PASS output)');

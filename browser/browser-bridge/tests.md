@@ -1,197 +1,242 @@
-# Browser Bridge Test Cases
+# Browser Bridge
 
-## UA Extraction (build time)
+Automated tests: `tests/*.mjs`, run via `node tests/run-all.mjs` (120s timeout each).
 
-### UA extracted without Headless
-1. Build the image
-2. Run: `docker exec <container> cat /usr/local/etc/chrome-ua`
-3. Output must be a valid User-Agent string (starts with `Mozilla/5.0`)
-4. Output must NOT contain the word `Headless`
+## Status
 
-### Build fails if Chrome cannot start
+- **System State**: Revert guard added in poolSessionHandler. Incorrect assumptions corrected in code comments.
+- **Last Action**: Chromium source research debunked "creation URL revert" theory. Navigate handler unchanged (simple Page.navigate).
+- **Next Step**: Root-cause the actual mechanism behind about:blank revert — it's NOT renderer discard + creation URL.
+- **Open leads**: viewer's `visibilitychange` handler interaction with bridge; race between viewer switchTab and test-driven switchTab; NavigationEntry commit timing when `Page.navigate` is called immediately after `Target.createTarget`.
+
+## Code Changes (this session)
+
+### server.mjs
+- Fixed incorrect comments: session pool does NOT prevent renderer discard
+- Removed speculative "early attachment causes revert" comment
+- Added `lastKnownUrls` Map: tracks last non-blank URL per target
+- Added revert guard in poolSessionHandler: suppresses about:blank broadcast + re-navigates
+- Cleanup in poolDetach, targetDestroyed, WS close
+
+## Chromium Internals Research
+
+Research conducted against Chromium source to debunk incorrect assumptions
+that were driving the wrong fix direction. Each finding cites the specific
+source file in the Chromium tree.
+
+### CDP Page.navigate is browser-initiated
+
+`Page.navigate` in the content-layer DevTools handler calls
+`NavigationController::LoadURLWithParams()` — the same code path as omnibox
+(address bar) navigation. It is **not** renderer-initiated.
+
+```cpp
+// content/browser/devtools/protocol/page_handler.cc
+void PageHandler::Navigate(...) {
+  // ...
+  NavigationController::LoadURLParams params(gurl);
+  // When navigation_initiator_origin_ is NOT set (default for
+  // browser-level CDP sessions via Target.attachToTarget):
+  // params.is_renderer_initiated stays false (browser-initiated).
+  if (navigation_initiator_origin_.has_value()) {
+    params.is_renderer_initiated = true;
+    params.initiator_origin = *navigation_initiator_origin_;
+    params.source_site_instance = SiteInstance::CreateForURL(
+        host_->GetBrowserContext(),
+        navigation_initiator_origin_->GetURL());
+  }
+  web_contents->GetController().LoadURLWithParams(params);
+}
+```
+
+The `navigation_initiator_origin_` constructor parameter is set only when the
+CDP session is associated with a specific origin (e.g. extension-initiated).
+For browser-level sessions created via `Target.attachToTarget({ flatten: true })`
+(our case), it is empty — making `Page.navigate` fully browser-initiated.
+
+Source: [page_handler.cc](https://chromium.googlesource.com/chromium/src/+/refs/heads/main/content/browser/devtools/protocol/page_handler.cc),
+[page_handler.h](https://chromium.googlesource.com/chromium/src/+/refs/heads/main/content/browser/devtools/protocol/page_handler.h)
+
+### Page.navigate creates a committed NavigationEntry
+
+`LoadURLWithParams()` delegates to `NavigateWithoutEntry()` which calls
+`CreateNavigationEntry()`, sets it as pending via `SetPendingEntry()`, and
+commits it when the navigation finishes. The resulting `NavigationEntry` is
+structurally identical to one created by typing a URL in the omnibox.
+
+`Target.createTarget({ url })` also navigates via `LoadURLWithParams()` but
+its entry **replaces** the initial empty document entry. A subsequent
+`Page.navigate` **appends** a new entry to the session history.
+
+Source: [navigation_concepts.md](https://chromium.googlesource.com/chromium/src/+/main/docs/navigation_concepts.md),
+[session_history.md](https://chromium.googlesource.com/chromium/src.git/+/main/docs/session_history.md),
+[target_handler.cc](https://chromium.googlesource.com/chromium/src/+/refs/heads/main/content/browser/devtools/protocol/target_handler.cc)
+
+### No "creation URL" concept in Chromium
+
+There is no persistent "creation URL" metadata on a tab. When
+`Target.createTarget` is called with a URL, that URL becomes the first
+committed NavigationEntry. After `Page.navigate` commits a new entry,
+the "creation URL" is just another history entry — not privileged.
+
+The `NavigationController` tracks:
+- `GetLastCommittedEntry()` — the current document
+- `GetPendingEntry()` — in-flight navigation
+- `GetVisibleEntry()` — what the address bar shows
+
+Source: [navigation_controller.h](https://github.com/nicedoc/chromium/blob/master/content/public/browser/navigation_controller.h),
+[navigation_concepts.md](https://chromium.googlesource.com/chromium/src/+/main/docs/navigation_concepts.md)
+
+### Renderer discard reloads from last committed entry
+
+When a renderer is discarded (tab discard, crash, OOM), the
+`NavigationController` and its `entries_` vector survive in the browser
+process. On reactivation, `NavigationController::Reload()` loads from
+`entries_[last_committed_entry_index_]`:
+
+```cpp
+// content/browser/renderer_host/navigation_controller_impl.cc
+void NavigationControllerImpl::Reload(ReloadType reload_type, ...) {
+  // ...
+  NavigationEntryImpl* entry = GetEntryAtIndex(current_index);
+  // ... sets pending_entry_ to this existing entry
+  NavigateToExistingPendingEntry(reload_type, ...);
+}
+```
+
+This means after `Page.navigate(browserscan)` commits, a renderer discard
+would reload **browserscan** (last committed), NOT about:blank.
+
+Source: [navigation_controller_impl.cc](https://chromium.googlesource.com/chromium/src/+/main/content/browser/renderer_host/navigation_controller_impl.cc),
+[tab-discarding-and-reloading](https://www.chromium.org/chromium-os/chromiumos-design-docs/tab-discarding-and-reloading/)
+
+### Screencast has no effect on renderer lifecycle
+
+`Page.stopScreencast` resets the encoder, calls `video_consumer_->StopCapture()`,
+and returns `Response::FallThrough()`. No renderer lifecycle, visibility, or
+RenderFrameHost manipulation occurs:
+
+```cpp
+// content/browser/devtools/protocol/page_handler.cc
+Response PageHandler::StopScreencast() {
+  screencast_enabled_ = false;
+  screencast_encoder_.reset();
+  if (video_consumer_)
+    video_consumer_->StopCapture();
+  return Response::FallThrough();
+}
+```
+
+Critically, screencast never calls `WebContents::IncrementCapturerCount()`.
+Only `Page.captureScreenshot` does:
+
+```cpp
+// Same file, in CaptureScreenshot:
+web_contents->IncrementCapturerCount(gfx::Size(), stay_hidden, stay_awake);
+```
+
+`IncrementCapturerCount` is Chromium's mechanism for keeping hidden tabs alive
+and producing frames. Screencast does not use it. Starting screencast does not
+protect the renderer; stopping it does not destroy it.
+
+Source: [page_handler.cc](https://chromium.googlesource.com/chromium/src/+/refs/heads/main/content/browser/devtools/protocol/page_handler.cc),
+[devtools_video_consumer.cc](https://chromium.googlesource.com/chromium/src/+/refs/heads/main/content/browser/devtools/devtools_video_consumer.cc)
+
+### CDP sessions do not prevent renderer discard
+
+CDP sessions (`Target.attachToTarget`) are browser-process objects. They
+provide a message channel to the renderer but do not keep the renderer process
+alive. Tab discard (`TabLifecycleUnit`) operates independently of CDP session
+state. The session pool's value is eliminating attach/detach overhead on tab
+switch, not preventing discard.
+
+Source: [Chromium bug 775644](https://bugs.chromium.org/p/chromium/issues/detail?id=775644),
+[tab-discarding-and-reloading](https://www.chromium.org/chromium-os/chromiumos-design-docs/tab-discarding-and-reloading/)
+
+### BrowsingInstanceNotSwapped is a secondary bfcache reason
+
+`Page.backForwardCacheNotUsed` CDP event fires on **history navigations only**
+(back/forward), NOT on `Target.activateTarget` (tab switch).
+
+A `BrowsingInstance` is Chromium's implementation of the HTML5 "unit of related
+browsing contexts" — tabs/frames that can script each other. For bfcache to
+work, Chrome must swap the BrowsingInstance during navigation to isolate the
+frozen page.
+
+`BrowsingInstanceNotSwapped` means Chrome skipped this swap. It is a
+**secondary optimization reason** — Chrome skips the expensive swap when
+bfcache is already ineligible for another reason. Per the Chromium bfcache-dev
+mailing list: "If you see BrowsingInstanceNotSwapped and nothing else, that's
+a bug." There should always be an accompanying root cause.
+
+The `ShouldSwapBrowsingInstance` enum lists all skip reasons:
+
+| Enum value | Meaning |
+|---|---|
+| `kNo_SourceURLSchemeIsNotHTTPOrHTTPS` (5) | Source URL is `about:`, `chrome:`, `file:`, etc. |
+| `kNo_HasRelatedActiveContents` (3) | Other tabs share this BrowsingInstance (window.opener) |
+| `kNo_NotNeededForBackForwardCache` (11) | bfcache already ineligible for another reason |
+| `kNo_SameSiteNavigation` (7) | Same-site, proactive swap not triggered |
+
+For tabs created from `about:blank`, the `about:` scheme triggers
+`kNo_SourceURLSchemeIsNotHTTPOrHTTPS`, disabling the BrowsingInstance swap
+and therefore bfcache. The bfcache fallback is a full network navigation to the
+URL from the session history entry (last committed — NOT "creation URL").
+
+Source: [should_swap_browsing_instance.h](https://chromium.googlesource.com/chromium/src/+/main/content/browser/renderer_host/should_swap_browsing_instance.h),
+[back_forward_cache_metrics.cc](https://chromium.googlesource.com/chromium/src/+/main/content/browser/renderer_host/back_forward_cache_metrics.cc),
+[bfcache-dev mailing list](https://groups.google.com/a/chromium.org/g/bfcache-dev/c/HkgtcRIdjso),
+[CDP Page.backForwardCacheNotUsed](https://chromedevtools.github.io/devtools-protocol/tot/Page/#event-backForwardCacheNotUsed)
+
+### Chrome flags in use and their actual effects
+
+| Flag | What it actually does | What it does NOT do |
+|---|---|---|
+| `--disable-renderer-backgrounding` | Prevents lower process priority for non-foreground tabs | Does NOT prevent renderer destruction or discard |
+| `--disable-background-timer-throttling` | Prevents timer throttling in background tabs | Does NOT affect renderer lifecycle |
+| `--disable-backgrounding-occluded-windows` | Prevents throttling of occluded windows | Does NOT apply in headless (no OS windows) |
+
+Source: [chrome-flags-for-tools.md](https://github.com/GoogleChrome/chrome-launcher/blob/main/docs/chrome-flags-for-tools.md)
+
+## Revert Guard
+
+poolSessionHandler tracks last non-blank URL per target (`lastKnownUrls`).
+If `Page.frameNavigated` fires with about:blank on the active target and a real
+URL is known, the broadcast is suppressed and `Page.navigate` re-fires.
+
+## Unimplemented Tests
+
+### Build fails if Chrome cannot start (manual)
 1. Modify Dockerfile: change `--remote-debugging-port=19222` to `19999`
    but keep the retry polling on port `19222`
 2. Build must fail with: `ERROR: Failed to extract Chrome UA after 30 attempts`
 
-## Navigation Correctness
-
-Chrome headless resets background tab renderers to the tab's creation URL on
-reactivation. `Page.navigate` changes the displayed page but not the creation
-URL, so navigated tabs revert on switch. The navigate handler works around this
-by replacing the tab via `/json/new?<url>` instead of calling `Page.navigate`.
-
-### "+" button → type URL → switch away → switch back
-Simulates the exact address bar flow: new blank tab, then navigate.
-
-1. Connect viewer, wait for `targetChanged` (bootstrap)
-2. Send `{ type: 'newTab' }` (no URL) — creates about:blank tab
-3. Wait for `targetChanged` confirming about:blank
-4. Send `{ type: 'navigate', url: 'https://example.com' }`
-5. Wait for `targetChanged` (navigate handler replaces the tab)
-6. Send `{ type: 'newTab', url: 'https://www.iana.org/' }` — switch to a different tab
-7. Wait for `targetChanged`
-8. Send `getTabs`, find the example.com tab (inactive), send `switchTab` to it
-9. Wait for `targetChanged`, then wait 2 seconds
-
-**Pass**: `targetChanged` URL is example.com, no `navigated` event to `about:blank`
-**Fail**: `navigated` event to `about:blank` after switching back
-
-### Navigate on default tab does not revert
-The initial tab is chrome://newtab/. Navigating it must not revert on switch.
-
-1. Connect viewer (bootstrap tab is chrome://newtab/)
-2. Send `{ type: 'navigate', url: 'https://example.com' }`
-3. Wait for `targetChanged`
-4. Create second tab, switch back to first
-5. Wait 2 seconds
-
-**Pass**: no `navigated` event to `chrome://newtab/`
-**Fail**: `navigated` event to `chrome://newtab/`
-
-### Tab created with URL survives switch
-Tabs created via `newTab` with a URL use `/json/new?<url>` directly.
-These should survive switching without any reload.
-
-1. Send `{ type: 'newTab', url: 'https://example.com' }`
-2. Wait for `targetChanged`
-3. Switch to another tab, wait, switch back
-4. Wait 2 seconds
-
-**Pass**: no `navigated` event after switching back
-**Fail**: `navigated` event fires (Chrome reloaded the tab)
-
-### Page.navigate causes revert (regression guard)
-This test proves the underlying Chrome behavior exists. It must FAIL to confirm
-the navigate handler workaround is necessary. If it starts passing, Chrome may
-have fixed the behavior and the workaround can be simplified.
-
-1. Connect viewer, wait for bootstrap
-2. Create blank tab via bridge: `{ type: 'newTab' }` (pool will attach a session)
-3. Wait for `targetChanged`
-4. Attach a NEW session to the tab directly via Chrome's browser-level CDP WebSocket
-   (do NOT reuse pool session IDs — they are scoped to the bridge's WS connection)
-5. Call `Page.navigate` with `https://example.com` on the new session
-6. Wait for navigation to commit (poll `/json/list` until URL is example.com)
-7. Switch to another tab via bridge `switchTab`
-8. Wait 3 seconds
-9. Switch back via bridge `switchTab`
-10. Check URL via `/json/list`
-
-**Expected FAIL**: URL is `about:blank` — Chrome reset the renderer to creation URL
-**Unexpected PASS**: URL is `example.com` — Chrome behavior changed
-
-## Session Pool
-
-### poolAttach race on newTab
-`Target.targetCreated` triggers `poolAttach` concurrently with the `newTab` handler's
-`switchToTarget`. The `poolAttaching` Map must allow the second caller to await the
-in-flight promise.
-
-1. Send `{ type: 'newTab', url: 'https://example.com' }`
-2. Wait up to 5 seconds for `targetChanged`
-
-**Pass**: `targetChanged` arrives with example.com URL
-**Fail**: no `targetChanged`, or error message about failed attach
-
-### No duplicate session attach
-1. Send `{ type: 'newTab', url: 'https://example.com' }`
-2. Check `BRIDGE_LOG=debug` output for `poolAttach` lines
-
-**Pass**: each target ID appears in poolAttach logs exactly once
-**Fail**: same target ID appears twice with different session IDs
-
-### Close active tab switches to adjacent tab
-1. Create tabs A, B, C (via three `newTab` calls)
-2. Switch to tab B
-3. Send `{ type: 'closeTab', targetId: <B> }`
-4. Wait for `targetChanged`
-
-**Pass**: active tab is C (next in order)
-**Fail**: active tab is A, or a new blank tab
-
-### Close last remaining tab creates a blank tab
-1. Close all tabs until one remains
-2. Close it via `closeTab`
-
-**Pass**: `targetChanged` with about:blank — new tab auto-created
-**Fail**: error, or no tab exists
-
-## Multiple Viewers
-
-### Second viewer receives current state on connect
-1. Connect viewer 1, navigate to a URL, open multiple tabs
-2. Connect viewer 2
-
-**Pass**: viewer 2 immediately receives `targetChanged` matching viewer 1's active tab
-**Fail**: viewer 2 gets no `targetChanged`, or gets a different tab
-
-### Tab switch in one viewer affects the other
-1. Connect two viewers
-2. From viewer 1, send `switchTab` to a different tab
-3. Observe viewer 2
-
-**Pass**: viewer 2 receives `targetChanged` for the same target
-**Fail**: viewer 2 stays on old tab
-
-### Viewer disconnect does not affect pool or other viewers
-1. Connect viewer 1, create multiple tabs
-2. Disconnect viewer 1
-3. Connect viewer 2
-
-**Pass**: all tabs still exist, same active tab, debug logs show no session re-creation
-**Fail**: tabs lost, or sessions re-created
-
 ### Navigate from either viewer broadcasts to both
 1. Connect two viewers
 2. From viewer 1, send `navigate` to URL A
-3. Both viewers receive `targetChanged` for URL A
+3. Both viewers receive `navigated` for URL A
 4. From viewer 2, send `navigate` to URL B
-5. Both viewers receive `targetChanged` for URL B
-
-## Browser Lifecycle
+5. Both viewers receive `navigated` for URL B
 
 ### Browser restart reconnects
 1. Connect viewer
 2. Send `{ type: 'browserRestart' }`
 
 **Pass**: viewer receives `status: 'Reconnecting...'`, then `targetChanged` when reconnected
-**Fail**: viewer stuck on reconnecting, or no `targetChanged`
 
 ### Bridge survives Chrome crash
 1. Connect viewer, navigate to a page
 2. Inside container: `kill $(cat /tmp/chrome.pid)`
 
-**Pass**: bridge broadcasts reconnecting status, Chrome restarts (via process manager),
-bridge reconnects and resumes with a `targetChanged`
-**Fail**: bridge hangs or crashes
+**Pass**: bridge broadcasts reconnecting status, then `targetChanged`
 
 ### Browser stop and start
 1. Send `browserStop` — confirm `browserStopped` received
 2. Send `browserStart` — confirm `targetChanged` received
 
-## Renderer Preservation
+## Key Files
 
-The session pool keeps CDP sessions attached to all known page targets. For tabs
-created via `/json/new?<url>`, this prevents Chrome from resetting renderers on
-background tab reactivation.
-
-If these tests start failing, Chrome's headless renderer lifecycle behavior changed.
-Known mitigation: add `--disable-features=BackForwardCache,TabFreezing,TabDiscarding`
-to chrome-launcher (trades memory for stability).
-
-### Background tab not reloaded after immediate switch
-1. Send `newTab` with URL, wait for page to load (no more `loading` events)
-2. Switch to another tab
-3. Switch back immediately
-
-**Pass**: no `navigated` event after `targetChanged`
-**Fail**: `navigated` event fires
-
-### Background tab not reloaded after 30 seconds
-1. Send `newTab` with URL, wait for page to load
-2. Switch to another tab
-3. Wait 30 seconds
-4. Switch back
-
-**Pass**: no `navigated` event
-**Fail**: `navigated` event fires
+- `server.mjs` — bridge (session pool, switchToTarget, navigate handler, revert guard)
+- `index.html` — viewer (`visibilitychange` sends switchTab with `currentTargetId`)
+- `tests/13-browser-viewer-navigate.mjs` — reproduces the bug via Chrome-hosted viewer
+- `tests/run-all.mjs` — sequential runner, 120s timeout per test
