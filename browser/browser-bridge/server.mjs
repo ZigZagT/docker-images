@@ -20,6 +20,7 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { WebSocketServer, WebSocket } from 'ws';
+import { createMcpHandler, getMcpState, noteTabClosed, onMcpStateChange, clearAttention } from './mcp.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -145,16 +146,31 @@ function scheduleTabBroadcast() {
     tabBroadcastTimer = null;
     try {
       const targets = await getCdpTargets();
+      // Per-tab MCP metadata (mcpOwned + attention) is overlaid here so the
+      // viewer gets a single tabs payload with everything it needs to render.
+      // mcp.mjs notifies us via onMcpStateChange when this metadata changes
+      // even if the underlying CDP target list hasn't moved.
+      const mcpState = getMcpState();
       const tabPages = targets.filter(t => t.type === 'page').map(t => ({
         id: t.id, url: t.url, title: t.title,
-        active: t.id === activeTargetId
+        active: t.id === activeTargetId,
+        mcpOwned: !!mcpState.owned[t.id],
+        attention: mcpState.attention[t.id] || null,
       }));
-      broadcastToViewers({ type: 'tabs', tabs: tabPages });
+      broadcastToViewers({
+        type: 'tabs',
+        tabs: tabPages,
+        mcpLimits: mcpState.limits,
+      });
     } catch (err) {
       log.error('scheduleTabBroadcast error:', err.message);
     }
   }, 50);
 }
+
+// Repaint when MCP-side state changes (new owned tab, attention add/clear)
+// without waiting for an unrelated tab event.
+onMcpStateChange(scheduleTabBroadcast);
 
 let extBroadcastTimer = null;
 function scheduleExtBroadcast() {
@@ -536,6 +552,7 @@ function ensureBrowserConnection() {
             if (destroyedId) {
               if (knownTabs.has(destroyedId)) scheduleTabBroadcast();
               poolDetach(destroyedId);
+              noteTabClosed(destroyedId);
               // Don't null activeTargetId here — let reconcileTabsGlobal
               // detect the missing tab and pick an adjacent one.
               if (destroyedId === activeTargetId) {
@@ -865,6 +882,93 @@ async function switchToTarget(targetId) {
   }
 }
 
+// --- Bridge event dispatcher ---
+//
+// The bridge has ONE event-based interface. The viewer's WebSocket
+// channel sends {type: 'newTab', url}, {type: 'closeTab', targetId},
+// etc. — and so does the MCP layer (in-process). Both go through the
+// SAME dispatcher so behavior is uniform: one place to handle errors,
+// one place to broadcast side effects, one place to evolve.
+//
+// Why message-passing instead of function-level primitives: the WS
+// protocol IS the API contract with viewers. MCP just rides that
+// protocol. Adding a new event type means one switch case here, and
+// both surfaces inherit it. No parallel call signatures to keep in sync.
+//
+// Returns a Promise<result> where result depends on event type — see
+// each case. Throws on error; callers decide how to surface.
+async function dispatchBridgeEvent(msg) {
+  switch (msg.type) {
+    case 'newTab': {
+      // background:true so creating a tab does NOT shift Chrome's
+      // internal focus; prevents BrowsingInstanceNotSwapped on
+      // subsequent switches back. Whether to switch the screencast is
+      // up to the caller — viewers do (UX), MCP does not.
+      const create = await browserCommand('Target.createTarget', {
+        url: normalizeUrl(msg.url || ''),
+        background: true,
+      });
+      if (create.error) throw new Error(create.error.message);
+      return { targetId: create.result.targetId };
+    }
+
+    case 'navigate': {
+      // Viewer's navigate operates on the active tab implicitly;
+      // MCP passes msg.targetId explicitly. Same primitive either way.
+      const targetId = msg.targetId || activeTargetId;
+      if (!targetId) throw new Error('navigate: no targetId and no active tab');
+      await poolAttach(targetId);
+      const entry = sessionPool.get(targetId);
+      if (!entry) throw new Error('navigate: no session for ' + targetId);
+      const r = await sessionCommand(entry.sessionId, 'Page.navigate', {
+        url: normalizeUrl(msg.url || ''),
+      });
+      if (r.error) throw new Error(r.error.message);
+      return {};
+    }
+
+    case 'reload': {
+      const targetId = msg.targetId || activeTargetId;
+      if (!targetId) throw new Error('reload: no targetId and no active tab');
+      await poolAttach(targetId);
+      const entry = sessionPool.get(targetId);
+      if (!entry) throw new Error('reload: no session for ' + targetId);
+      const r = await sessionCommand(entry.sessionId, 'Page.reload', {});
+      if (r.error) throw new Error(r.error.message);
+      return {};
+    }
+
+    case 'closeTab': {
+      const targetId = msg.targetId;
+      if (!targetId) throw new Error('closeTab: missing targetId');
+      if (!knownTabs.has(targetId)) {
+        log.debug('closeTab:', targetId, 'not in knownTabs, ignoring');
+        return {};
+      }
+      // tabClosing/tabCloseComplete events drive the viewer's per-tab
+      // spinner-then-removed transition. Going through dispatchBridgeEvent
+      // means MCP-driven closes (incl. FIFO evictions) get the same UX
+      // as user-clicked closes.
+      broadcastToViewers({ type: 'tabClosing', targetId });
+      try {
+        // Target.closeTarget over /json/close — the HTTP endpoint
+        // returns plain text "Target is closing" (not JSON), and going
+        // through browser CDP keeps the bridge↔Chrome interface uniform
+        // (CDP for everything mutating; HTTP /json/* only for discovery).
+        const r = await browserCommand('Target.closeTarget', { targetId });
+        if (r.error) throw new Error(r.error.message);
+        await enqueueOp(() => reconcileTabsGlobal());
+      } finally {
+        broadcastToViewers({ type: 'tabCloseComplete', targetId });
+      }
+      return {};
+    }
+
+    default:
+      throw new Error('dispatchBridgeEvent: unknown type: ' + msg.type);
+  }
+}
+
 async function reconcileTabsGlobal() {
   try {
     const targets = await getCdpTargets();
@@ -987,7 +1091,7 @@ async function applyZoom() {
 
 // --- HTTP server ---
 
-const KNOWN_ENDPOINTS = new Set(['health', 'tabs', 'devtools-check']);
+const KNOWN_ENDPOINTS = new Set(['health', 'tabs', 'devtools-check', 'mcp']);
 function routePath(url) {
   const clean = url.split('?')[0];
   const segments = clean.split('/').filter(Boolean);
@@ -1001,6 +1105,30 @@ function jsonResponse(res, data, status = 200) {
   res.writeHead(status, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(data));
 }
+
+// MCP endpoint — kept in its own module (mcp.mjs) so the bridge code
+// stays focused on screencast/viewer. Tools are dispatched here through
+// dependency injection so mcp.mjs has no direct knowledge of bridge
+// internals beyond the documented surface.
+const mcpHandler = createMcpHandler({
+  // Single shared dispatcher — MCP and viewer mutate state through the
+  // same event API so behavior is uniform (MCP closing a tab triggers
+  // the same tabClosing/Complete broadcast a viewer click does).
+  dispatchBridgeEvent,
+  // For tab listing MCP uses the same internal helper the viewer uses
+  // when assembling its broadcast (preserves knownTabs ordering bookkeeping).
+  getCdpTargets,
+  // Lower-level CDP helpers for MCP-only operations (Runtime.evaluate,
+  // Page.captureScreenshot — things the viewer protocol doesn't expose).
+  sessionCommand,
+  // Fire-and-forget CDP send for commands whose response never arrives in
+  // headless (Input.dispatchMouseEvent mouseWheel — used for browser_scroll).
+  sessionSend,
+  poolAttach,
+  sessionPool,
+  ensureBrowserConnection,
+  log,
+});
 
 const server = http.createServer(async (req, res) => {
   const p = routePath(req.url);
@@ -1032,6 +1160,8 @@ const server = http.createServer(async (req, res) => {
         browserWsConnected: !!(browserWs && browserWs.readyState === WebSocket.OPEN)
       }, 502);
     }
+  } else if (p === '/mcp') {
+    await mcpHandler(req, res);
   } else if (p === '/tabs') {
     try {
       const targets = await getCdpTargets();
@@ -1153,11 +1283,19 @@ viewerWss.on('connection', async (client, req) => {
         getProfileStatus().catch(() => null)
       ]);
       clientSend({ type: 'targetChanged', targetId: activeTargetId, url: target.url, title: target.title });
+      // Include MCP per-tab metadata in the connect snapshot so the
+      // floating attention box renders immediately on viewer reconnect.
+      // Without this, refreshing the page (or opening a new viewer)
+      // would wipe attention from the client view until something else
+      // triggered scheduleTabBroadcast.
+      const mcpState = getMcpState();
       const tabPages = tabTargets.filter(t => t.type === 'page').map(t => ({
         id: t.id, url: t.url, title: t.title,
-        active: t.id === activeTargetId
+        active: t.id === activeTargetId,
+        mcpOwned: !!mcpState.owned[t.id],
+        attention: mcpState.attention[t.id] || null,
       }));
-      clientSend({ type: 'tabs', tabs: tabPages });
+      clientSend({ type: 'tabs', tabs: tabPages, mcpLimits: mcpState.limits });
       clientSend({ type: 'extensions', extensions: exts });
       if (profile) clientSend({ type: 'profileStatus', ...profile });
       // Replay last frame so canvas isn't blank while waiting for the
@@ -1241,13 +1379,15 @@ viewerWss.on('connection', async (client, req) => {
           break;
 
         case 'navigate':
-          if (entry) {
-            await sessionCommand(entry.sessionId, 'Page.navigate', { url: normalizeUrl(msg.url) }).catch(() => {});
+          if (activeTargetId) {
+            await dispatchBridgeEvent({ type: 'navigate', url: msg.url, targetId: activeTargetId }).catch(() => {});
           }
           break;
 
         case 'reload':
-          if (entry) sessionSend(entry.sessionId, 'Page.reload');
+          if (activeTargetId) {
+            await dispatchBridgeEvent({ type: 'reload', targetId: activeTargetId }).catch(() => {});
+          }
           break;
 
         case 'stop':
@@ -1274,16 +1414,11 @@ viewerWss.on('connection', async (client, req) => {
 
         case 'newTab':
           try {
-            const newUrl = normalizeUrl(msg.url || '');
-            // Use Target.createTarget instead of /json/new to avoid Chrome
-            // shifting internal focus to the new tab, which deactivates the
-            // current tab and triggers BrowsingInstanceNotSwapped on switch back.
-            const createResp = await browserCommand('Target.createTarget', {
-              url: newUrl,
-              background: true
-            });
-            if (createResp.error) throw new Error(createResp.error.message);
-            await enqueueOp(() => switchToTarget(createResp.result.targetId));
+            const { targetId: newId } = await dispatchBridgeEvent({ type: 'newTab', url: msg.url });
+            // Viewer-initiated tab creation switches focus — user pressed
+            // "+" or entered a URL; they expect the new tab on screen.
+            // MCP doesn't switch (it would steal focus from the user).
+            await enqueueOp(() => switchToTarget(newId));
           } catch (err) {
             clientSend({ type: 'error', message: 'Failed to create tab: ' + err.message });
           }
@@ -1306,36 +1441,37 @@ viewerWss.on('connection', async (client, req) => {
 
         case 'closeTab':
           if (msg.targetId) {
-            if (!knownTabs.has(msg.targetId)) {
-              log.debug('closeTab:', msg.targetId, 'not in knownTabs, ignoring');
-              break;
-            }
             const t0 = Date.now();
-            broadcastToViewers({ type: 'tabClosing', targetId: msg.targetId });
             try {
-              await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/close/${msg.targetId}`);
-              await enqueueOp(() => reconcileTabsGlobal());
+              await dispatchBridgeEvent({ type: 'closeTab', targetId: msg.targetId });
             } catch (err) {
               log.error('closeTab error:', err.message);
               broadcastToViewers({ type: 'error', message: 'Failed to close tab: ' + err.message });
-            } finally {
-              broadcastToViewers({ type: 'tabCloseComplete', targetId: msg.targetId });
             }
             log.debug('closeTab: e2e', Date.now() - t0 + 'ms');
           }
           break;
 
+        case 'dismissAttention':
+          // User clicked ✕ on the attention floating box. Server-side
+          // state matches what browser_dismiss_attention does.
+          if (msg.targetId) clearAttention(msg.targetId);
+          break;
+
         case 'getTabs': {
           // Read-only tab listing — does NOT go through the operation queue.
-          // The old approach (enqueueOp → reconcileTabsGlobal) serialized
-          // read-only queries behind write operations, causing the queue to
-          // back up when the viewer polls frequently.
+          // Includes mcpOwned + attention so client renders the
+          // floating box / blinking dots without waiting for the next
+          // scheduled broadcast.
           const tabTargets = await getCdpTargets();
+          const mcpState = getMcpState();
           const tabPages = tabTargets.filter(t => t.type === 'page').map(t => ({
             id: t.id, url: t.url, title: t.title,
-            active: t.id === activeTargetId
+            active: t.id === activeTargetId,
+            mcpOwned: !!mcpState.owned[t.id],
+            attention: mcpState.attention[t.id] || null,
           }));
-          broadcastToViewers({ type: 'tabs', tabs: tabPages });
+          broadcastToViewers({ type: 'tabs', tabs: tabPages, mcpLimits: mcpState.limits });
           break;
         }
 
@@ -1359,17 +1495,26 @@ viewerWss.on('connection', async (client, req) => {
         case 'copyInternalState':
           try {
             const jsonList = await cdpFetch('/json/list');
+            const mcp = getMcpState();
             clientSend({ type: 'internalState', data: {
-              jsonList,
-              knownTabs: Object.fromEntries(knownTabs),
               activeTargetId,
+              browserConnected: !!(browserWs && browserWs.readyState === WebSocket.OPEN),
+              screencastActive,
+              zoomLevel,
+              tabCounter,
+              knownTabs: Object.fromEntries(knownTabs),
               sessionPool: Object.fromEntries(
                 [...sessionPool].map(([tid, e]) => [tid, { sessionId: e.sessionId, mainFrameId: e.mainFrameId }])
               ),
-              tabCounter,
-              screencastActive,
-              zoomLevel,
-              browserConnected: !!(browserWs && browserWs.readyState === WebSocket.OPEN)
+              // MCP-layer state — agents, FIFO ownership, attention requests.
+              mcp: {
+                limits: mcp.limits,
+                ownedTabs: mcp.owned,        // { tabId: { openedAt } }
+                attentionRequests: mcp.attention, // { tabId: { message, since } }
+                ownedCount: Object.keys(mcp.owned).length,
+                attentionCount: Object.keys(mcp.attention).length,
+              },
+              jsonList,
             }});
           } catch (err) {
             clientSend({ type: 'error', message: 'Failed to get internal state: ' + err.message });

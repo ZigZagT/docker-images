@@ -51,6 +51,6 @@ COPY --chmod=755 chrome /usr/local/bin/chrome
 
 COPY browser-bridge/package.json browser-bridge/package-lock.json /opt/browser-bridge/
 RUN cd /opt/browser-bridge && npm install --omit=dev && npm cache clean --force
-COPY browser-bridge/server.mjs browser-bridge/index.html /opt/browser-bridge/
+COPY browser-bridge/server.mjs browser-bridge/mcp.mjs browser-bridge/index.html /opt/browser-bridge/
 
 CMD ["chrome"]

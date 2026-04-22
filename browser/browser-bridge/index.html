@@ -53,6 +53,137 @@
   .tab-close:hover { color: #f66; }
   .tab.closing { opacity: 0.4; pointer-events: none; }
   .tab.closing .tab-close { display: none; }
+  /* MCP-owned tabs: full background fill so the human can identify
+     agent-controlled tabs at a glance from across the room. The active
+     state still wins on border-bottom (orange) so the user can tell
+     active vs inactive within the MCP set. */
+  .tab.mcp-owned        { background: #1e3a5f; color: #cfd8e8; }
+  .tab.mcp-owned:hover  { background: #2a4f7d; color: #fff; }
+  .tab.mcp-owned.active { background: #2c4d7a; color: #fff; }
+  /* Synchronized blink for ALL attention indicators.
+     One animation runs on :root, driving a custom property all dots
+     read. Without this, each dot's animation timeline starts when its
+     element is inserted into the DOM — so a dot added later blinks out
+     of phase with existing ones. The @property declaration makes the
+     custom property animatable (without it, the value would interpolate
+     as a CSS string, which doesn't tick). */
+  @property --attention-blink {
+    syntax: '<number>';
+    initial-value: 1;
+    inherits: true;
+  }
+  @keyframes attention-blink-tick {
+    0%, 49.99% { --attention-blink: 1; }
+    50%, 100%  { --attention-blink: 0.2; }
+  }
+  :root {
+    animation: attention-blink-tick 1s step-end infinite;
+  }
+  /* Attention dot: a small blinking circle inserted into the tab title
+     row. Discrete signal — the row itself doesn't pulse (annoying) but
+     the dot does, drawing the eye to the specific tab. The actual
+     instruction goes into the floating box (see #attention-floating). */
+  .tab-attention-dot {
+    display: inline-block;
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: #f59e0b;
+    margin-right: 2px;
+    flex-shrink: 0;
+    opacity: var(--attention-blink);
+  }
+  /* Floating attention box: appears overlaid on the viewer canvas ONLY
+     when the currently-active tab has an attention request. Carries the
+     agent's full instruction (multi-line). Positioned top-right so it
+     doesn't cover the typical center-of-page content the user needs to
+     interact with. Collapsible — user clicks the chevron to hide the
+     message body when it gets in the way; the title bar stays visible
+     so they remember the attention is still pending. Re-expands
+     automatically if the agent updates the message. */
+  #attention-floating {
+    display: none;
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    max-width: 360px;
+    background: rgba(36, 28, 12, 0.96);
+    border: 1px solid #f59e0b;
+    border-left-width: 4px;
+    border-radius: 4px;
+    color: #fde68a;
+    font-size: 12px;
+    line-height: 1.45;
+    padding: 10px 12px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+    z-index: 10;
+    user-select: text;
+  }
+  #attention-floating.visible { display: block; }
+  #attention-floating.collapsed {
+    /* Shrink to a small pill in the corner — title only, no body. */
+    padding: 4px 8px;
+    max-width: none;
+  }
+  #attention-floating.collapsed .af-message,
+  #attention-floating.collapsed .af-actions { display: none; }
+  /* Title row IS the collapse hit target — entire row clickable, full
+     height. Reusing .btn-like sizing so it matches toolbar buttons. */
+  #attention-floating .af-title {
+    font-weight: bold;
+    color: #f59e0b;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    min-height: 28px;
+    padding: 4px 6px;
+    margin: -4px -6px 6px;
+    border-radius: 3px;
+    user-select: none;
+  }
+  #attention-floating .af-title:hover { background: rgba(245, 158, 11, 0.15); }
+  #attention-floating.collapsed .af-title { margin-bottom: -4px; }
+  #attention-floating .af-title-dot {
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    background: #f59e0b;
+    opacity: var(--attention-blink);
+    flex-shrink: 0;
+  }
+  /* Chevron — just a glyph, large enough to read (the title row carries
+     the click). Not a .btn — that frame is overkill for a status icon. */
+  #attention-floating .af-toggle {
+    color: #f59e0b;
+    font-size: 20px;
+    line-height: 1;
+    flex-shrink: 0;
+    width: 20px;
+    text-align: center;
+  }
+  #attention-floating .af-title-text { flex: 1; }
+  #attention-floating .af-message {
+    white-space: pre-wrap;
+    word-wrap: break-word;
+  }
+  /* Action row below the message. Dismiss reuses .btn shape but is
+     amber-tinted to match the attention box theme — toolbar gray would
+     clash visually with the warm amber surround. */
+  #attention-floating .af-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 6px;
+    margin-top: 8px;
+  }
+  #attention-floating .af-actions .btn {
+    background: #4a3010;
+    border-color: #f59e0b;
+    color: #fde68a;
+  }
+  #attention-floating .af-actions .btn:hover {
+    background: #f59e0b;
+    color: #241c0c;
+    border-color: #f59e0b;
+  }
   @keyframes spin { to { transform: rotate(360deg); } }
   .tab-spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid #555; border-top-color: #ccc; border-radius: 50%; animation: spin 0.6s linear infinite; flex-shrink: 0; }
   .tab-new {
@@ -330,6 +461,17 @@
   <span id="status" class="disconnected">disconnected</span>
 </div>
 <div id="viewer">
+  <div id="attention-floating">
+    <div class="af-title" id="attention-title" title="Click to collapse / expand">
+      <span class="af-title-dot"></span>
+      <span class="af-title-text">Agent needs your attention</span>
+      <span class="af-toggle" id="attention-toggle">&#9662;</span>
+    </div>
+    <div class="af-message"></div>
+    <div class="af-actions">
+      <button class="btn" id="attention-dismiss" title="Tell the agent the user has dismissed this attention request">Dismiss</button>
+    </div>
+  </div>
   <div id="find-bar">
     <input id="find-input" type="text" placeholder="Find..." spellcheck="false" />
     <span id="find-count"></span>
@@ -603,9 +745,33 @@ function updateTabEl(el, tab) {
   const isClosing = closingTabs.has(tab.id);
   const isActive = tab.id === currentTargetId;
 
-  const wantClass = 'tab' + (isActive ? ' active' : '') + (isClosing ? ' closing' : '');
+  // mcp-owned drives the row background; the attention dot below is what
+  // signals attention. The previous row-pulse animation was annoying.
+  const wantClass = 'tab' +
+    (isActive ? ' active' : '') +
+    (isClosing ? ' closing' : '') +
+    (tab.mcpOwned ? ' mcp-owned' : '');
   if (el.className !== wantClass) el.className = wantClass;
-  if (el.title !== tab.url) el.title = tab.url;
+  // Title attribute drops the URL when there's an attention message —
+  // the message is more useful in a hover than the URL is.
+  const wantTitle = tab.attention?.message
+    ? `Agent needs attention: ${tab.attention.message}\n\n${tab.url || ''}`
+    : (tab.url || '');
+  if (el.title !== wantTitle) el.title = wantTitle;
+
+  // Blinking dot before the title when attention is set. The full
+  // instruction text lives in the floating box (#attention-floating)
+  // which only appears when this tab is the active one.
+  let dotEl = el.querySelector('.tab-attention-dot');
+  if (tab.attention) {
+    if (!dotEl) {
+      dotEl = document.createElement('span');
+      dotEl.className = 'tab-attention-dot';
+      el.insertBefore(dotEl, el.firstChild);
+    }
+  } else if (dotEl) {
+    dotEl.remove();
+  }
 
   const titleEl = el.querySelector('.tab-title');
   const decoded = decodeEntities(tab.title || tab.url || '(empty)');
@@ -627,11 +793,84 @@ function updateTabEl(el, tab) {
   }
 }
 
+// Per-tab collapse state. Key = tabId; value = the message string the
+// user collapsed against. If the agent updates the message (different
+// string), we re-expand so the user sees the new content. If they
+// collapse and the agent later re-sends the SAME message, stay collapsed.
+const collapsedAttentions = new Map();
+
+// The floating attention box is shown ONLY for the currently-active
+// tab — the instruction is context-relevant when the user is looking
+// at the page, and useless clutter otherwise. The blinking dot in the
+// tab title still tells the user that other tabs need attention too.
+function renderAttentionFloating() {
+  const box = document.getElementById('attention-floating');
+  if (!box) return;
+  const activeTab = currentTabs.find(t => t.id === currentTargetId);
+  if (activeTab && activeTab.attention) {
+    const msg = activeTab.attention.message;
+    const msgEl = box.querySelector('.af-message');
+    if (msgEl && msgEl.textContent !== msg) msgEl.textContent = msg;
+    // Stay collapsed only if the user collapsed against THIS message.
+    // A new/changed message re-expands the box so the user sees it.
+    const collapsedFor = collapsedAttentions.get(activeTab.id);
+    if (collapsedFor === msg) {
+      box.classList.add('collapsed');
+    } else {
+      box.classList.remove('collapsed');
+      collapsedAttentions.delete(activeTab.id);
+    }
+    box.classList.add('visible');
+    const toggle = document.getElementById('attention-toggle');
+    if (toggle) toggle.innerHTML = box.classList.contains('collapsed') ? '&#9656;' : '&#9662;';
+  } else {
+    box.classList.remove('visible');
+  }
+}
+
+// Title row + dismiss handlers — wired once at load.
+// - Title row (entire row) toggles collapse. Persists per-tab against
+//   the current message string, so a fresh message re-expands automatically.
+// - Dismiss sends a WS event to the bridge to clear server-side attention
+//   state (same effect as agent calling browser_dismiss_attention).
+function toggleAttentionCollapse() {
+  const box = document.getElementById('attention-floating');
+  const toggle = document.getElementById('attention-toggle');
+  const activeTab = currentTabs.find(t => t.id === currentTargetId);
+  if (!activeTab?.attention) return;
+  const collapsing = !box.classList.contains('collapsed');
+  box.classList.toggle('collapsed');
+  if (toggle) toggle.innerHTML = collapsing ? '&#9656;' : '&#9662;'; // ▸ collapsed / ▾ expanded
+  if (collapsing) collapsedAttentions.set(activeTab.id, activeTab.attention.message);
+  else collapsedAttentions.delete(activeTab.id);
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  const titleRow = document.getElementById('attention-title');
+  if (titleRow) titleRow.addEventListener('click', toggleAttentionCollapse);
+  const dismiss = document.getElementById('attention-dismiss');
+  if (dismiss) {
+    dismiss.addEventListener('click', (e) => {
+      e.stopPropagation(); // don't let the title-row click handler fire too
+      const activeTab = currentTabs.find(t => t.id === currentTargetId);
+      if (!activeTab?.attention) return;
+      send({ type: 'dismissAttention', targetId: activeTab.id });
+      // Optimistic: clear locally so the box hides immediately. The
+      // bridge's next tabs broadcast will confirm (or correct).
+      collapsedAttentions.delete(activeTab.id);
+      activeTab.attention = null;
+      renderAttentionFloating();
+      renderTabs();
+    });
+  }
+});
+
 function renderTabs() {
   const tabIds = new Set(currentTabs.map(t => t.id));
   for (const id of closingTabs) {
     if (!tabIds.has(id)) closingTabs.delete(id);
   }
+  renderAttentionFloating();
 
   const existing = new Map();
   for (const el of tabsEl.querySelectorAll('.tab[data-tab-id]')) {
