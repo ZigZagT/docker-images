@@ -54,8 +54,15 @@ services:
     shm_size: 1g
     ports:
       - "6080:6080"
+    environment:
+      CHROME_USER_DATA_DIR: /data  # persist profile (cookies, sessions, extensions); omit for ephemeral
+    volumes:
+      - browser-data:/data
     devices:
       - /dev/dri:/dev/dri  # GPU acceleration on Linux hosts (Intel/AMD)
+
+volumes:
+  browser-data:
 ```
 
 Drop the `devices` line if your host has no `/dev/dri` (macOS, Windows). The container falls back to bundled SwiftShader (CPU rendering) automatically.
@@ -223,5 +230,6 @@ Access at `https://my-nginx.com/my-browser`
 | `SCREENCAST_QUALITY` | `80` | JPEG quality (1-100) |
 | `VIEWPORT_WIDTH` | `1920` | Viewport width |
 | `VIEWPORT_HEIGHT` | `1080` | Viewport height |
+| `CHROME_USER_DATA_DIR` | _(unset)_ | When set, Chrome persists its profile here. Mount a volume at this path to keep cookies/sessions/extensions across restarts. Unset = ephemeral `/tmp/...` profile. |
 | `MCP_MAX_OPEN_TABS` | `3` | Max simultaneous MCP-owned tabs (FIFO cap). |
 | `MCP_MAX_ATTENTION` | `3` | Max simultaneous attention requests. |

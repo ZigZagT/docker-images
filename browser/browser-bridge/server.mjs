@@ -1494,7 +1494,7 @@ viewerWss.on('connection', async (client, req) => {
 
         case 'copyInternalState':
           try {
-            const jsonList = await cdpFetch('/json/list');
+            const cdpTargets = await cdpFetch('/json/list');
             const mcp = getMcpState();
             clientSend({ type: 'internalState', data: {
               activeTargetId,
@@ -1514,7 +1514,9 @@ viewerWss.on('connection', async (client, req) => {
                 ownedCount: Object.keys(mcp.owned).length,
                 attentionCount: Object.keys(mcp.attention).length,
               },
-              jsonList,
+              // Raw CDP target list from /json/list — tabs, service workers,
+              // devtools targets. Same data getCdpTargets() returns to internals.
+              cdpTargets,
             }});
           } catch (err) {
             clientSend({ type: 'error', message: 'Failed to get internal state: ' + err.message });

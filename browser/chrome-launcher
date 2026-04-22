@@ -7,6 +7,18 @@ VIEWPORT_WIDTH="${VIEWPORT_WIDTH:-1920}"
 VIEWPORT_HEIGHT="${VIEWPORT_HEIGHT:-1080}"
 CDP_PORT="${CDP_PORT:-18800}"
 
+# Profile persistence: when CHROME_USER_DATA_DIR is set, Chrome stores its
+# profile (cookies, history, logins, extensions, sessionStorage) at that
+# path. Mount a host volume to persist across container restarts. When
+# unset, Chrome uses an ephemeral /tmp/org.chromium.Chromium.scoped_dir.*
+# that gets wiped on restart.
+profile_flag=()
+if [ -n "$CHROME_USER_DATA_DIR" ]; then
+    mkdir -p "$CHROME_USER_DATA_DIR"
+    profile_flag+=(--user-data-dir="$CHROME_USER_DATA_DIR")
+    echo "chrome-launcher: persisting profile at $CHROME_USER_DATA_DIR" >&2
+fi
+
 UA_FILE="/usr/local/etc/chrome-ua"
 UA=""
 if [ -f "$UA_FILE" ]; then
@@ -54,6 +66,7 @@ fi
 exec chrome-raw \
     --headless \
     --no-sandbox \
+    "${profile_flag[@]}" \
     --remote-debugging-port="$CDP_PORT" \
     --window-size="${VIEWPORT_WIDTH},${VIEWPORT_HEIGHT}" \
     --screen-info="{0,0 ${VIEWPORT_WIDTH}x${VIEWPORT_HEIGHT}}" \

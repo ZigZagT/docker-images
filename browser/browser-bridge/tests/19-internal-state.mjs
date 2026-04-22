@@ -17,7 +17,7 @@ if (!d) fail('internal-state', 'no data in internalState');
 if (!d.browserConnected) fail('internal-state', 'browserConnected is false');
 if (!d.activeTargetId) fail('internal-state', 'no activeTargetId');
 if (!d.sessionPool[d.activeTargetId]) fail('internal-state', 'active target not in session pool');
-if (!Array.isArray(d.jsonList)) fail('internal-state', 'jsonList not an array');
+if (!Array.isArray(d.cdpTargets)) fail('internal-state', 'cdpTargets not an array');
 
 // knownTabs should have entries
 const knownCount = Object.keys(d.knownTabs).length;
