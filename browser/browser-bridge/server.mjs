@@ -85,6 +85,17 @@ let profileCache = null;
 let profileCacheTime = 0;
 const PROFILE_CACHE_TTL = 60000;
 
+// UA Client Hints override. The chrome-launcher passes --user-agent="..." to
+// freeze the UA string to a stable value; that flag also wipes Chrome's
+// UA-CH high-entropy metadata (architecture/bitness/uaFullVersion become
+// empty), which modern bot detectors flag as "Cannot detect Chrome version".
+// We restore those values per page session via Network.setUserAgentOverride
+// using the same UA string + metadata derived from the actual binary +
+// host arch. Computed once at startup since none of the inputs change.
+const UA_FILE = '/usr/local/etc/chrome-ua';
+let uaOverrideString = null;
+let uaOverrideMetadata = null;
+
 // Tab broadcast debounce
 let tabBroadcastTimer = null;
 
@@ -185,6 +196,100 @@ function normalizeUrl(input) {
   if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(input)) return input;
   if (/^[^\s/]+\.[^\s/]+/.test(input)) return 'https://' + input;
   return 'https://www.google.com/search?q=' + encodeURIComponent(input);
+}
+
+// --- UA Client Hints override init ---
+//
+// chrome-launcher hard-pins the UA via --user-agent="..." (so Chromium's
+// reduced UA can't drift between versions and so the "Headless" tag is
+// stripped). Side effect: --user-agent flattens UA-CH metadata to empty
+// strings because the flag carries no version/arch info. Detectors like
+// rebrowser-bot-detector then report "Cannot detect Chrome version".
+//
+// The fix is per-page-session Network.setUserAgentOverride with both the
+// userAgent string AND a userAgentMetadata object. When metadata is
+// supplied, Chrome surfaces it through navigator.userAgentData.* without
+// falling back to the empty-flag state. Inputs (chrome-ua file, binary
+// version, dpkg arch) are immutable for the container's lifetime, so we
+// compute once at startup.
+
+async function initUserAgentOverride() {
+  let ua;
+  try {
+    ua = fs.readFileSync(UA_FILE, 'utf-8').trim();
+  } catch (err) {
+    log.error('UA-CH override init: cannot read', UA_FILE + ':', err.message);
+    return;
+  }
+  if (!ua) {
+    log.error('UA-CH override init: empty', UA_FILE);
+    return;
+  }
+
+  let fullVersion, major;
+  try {
+    const { stdout } = await execFileAsync('chrome-raw', ['--version']);
+    const m = stdout.trim().match(/(\d+)\.(\d+)\.(\d+)\.(\d+)/);
+    if (!m) throw new Error('unparseable: ' + stdout.trim());
+    fullVersion = m[0];
+    major = m[1];
+  } catch (err) {
+    log.error('UA-CH override init: chrome-raw --version failed:', err.message);
+    return;
+  }
+
+  // Map dpkg arch to UA-CH architecture/bitness pair. amd64→x86/64,
+  // arm64→arm/64. Other arches are uncommon for headless browsers so
+  // leave the values blank rather than guess; Chrome treats blank
+  // strings as "unknown" rather than rejecting the override.
+  let architecture = '', bitness = '';
+  try {
+    const { stdout } = await execFileAsync('dpkg', ['--print-architecture']);
+    const arch = stdout.trim();
+    if (arch === 'amd64')      { architecture = 'x86'; bitness = '64'; }
+    else if (arch === 'arm64') { architecture = 'arm'; bitness = '64'; }
+    else if (arch === 'i386')  { architecture = 'x86'; bitness = '32'; }
+    else if (arch === 'armhf') { architecture = 'arm'; bitness = '32'; }
+  } catch (err) {
+    log.error('UA-CH override init: dpkg --print-architecture failed:', err.message);
+  }
+
+  // Brands list must include "Google Chrome" whenever the UA string claims
+  // Chrome/X — bot detectors cross-check brands against the UA token and
+  // flag pure-Chromium brands as "Google Chrome for Testing" (a known
+  // automation signal). The chrome-launcher pins UA to the upstream
+  // Chrome reduced-UA format (Chrome/X.0.0.0), so we commit to that
+  // identity here too. GREASE entry rotates in real Chrome; we use a
+  // stable variant — detectors only check that *some* GREASE exists, not
+  // its exact spelling.
+  uaOverrideString = ua;
+  const claimsChrome = /\bChrome\/\d/.test(ua);
+  const brandsList = [
+    { brand: 'Chromium', version: major },
+  ];
+  const fullList = [
+    { brand: 'Chromium', version: fullVersion },
+  ];
+  if (claimsChrome) {
+    brandsList.push({ brand: 'Google Chrome', version: major });
+    fullList.push({ brand: 'Google Chrome', version: fullVersion });
+  }
+  brandsList.push({ brand: 'Not.A/Brand', version: '8' });
+  fullList.push({ brand: 'Not.A/Brand', version: '8.0.0.0' });
+
+  uaOverrideMetadata = {
+    brands: brandsList,
+    fullVersionList: fullList,
+    fullVersion,
+    platform: 'Linux',
+    platformVersion: '',
+    architecture,
+    model: '',
+    mobile: false,
+    bitness,
+    wow64: false,
+  };
+  log.info('UA-CH override ready: arch=' + architecture + '/' + bitness + ' chromium=' + fullVersion);
 }
 
 // --- Extension discovery ---
@@ -582,6 +687,12 @@ async function poolAttach(targetId) {
   sessionPool.set(targetId, entry);
 
   await sessionCommand(sessionId, 'Page.enable').catch(() => {});
+  if (uaOverrideString && uaOverrideMetadata) {
+    await sessionCommand(sessionId, 'Network.setUserAgentOverride', {
+      userAgent: uaOverrideString,
+      userAgentMetadata: uaOverrideMetadata,
+    }).catch(err => log.error('setUserAgentOverride failed for', targetId.slice(0, 8) + ':', err.message));
+  }
   const frameTree = await sessionCommand(sessionId, 'Page.getFrameTree').catch(() => null);
   entry.mainFrameId = frameTree?.result?.frameTree?.frame?.id || null;
 
@@ -1489,3 +1600,9 @@ viewerWss.on('connection', async (client, req) => {
 server.listen(PORT, '0.0.0.0', () => {
   log.info(`Browser bridge listening on http://0.0.0.0:${PORT}`);
 });
+
+// Compute UA-CH override once at startup. It's safe to run alongside the
+// listen call: poolAttach is only invoked after a CDP target is observed,
+// which requires the browser to be up and a viewer or HTTP request to
+// have arrived — both happen well after this completes.
+initUserAgentOverride();
