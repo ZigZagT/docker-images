@@ -6,6 +6,11 @@ FROM ${BASE_IMAGE}
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         fonts-liberation fonts-noto-core fontconfig \
+    && if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
+        apt-get install -y --no-install-recommends \
+            mesa-vulkan-drivers libgl1-mesa-dri libegl-mesa0 \
+            intel-media-va-driver i965-va-driver; \
+    fi \
     && fc-cache -fv \
     && npm install -g playwright-core \
     && PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \

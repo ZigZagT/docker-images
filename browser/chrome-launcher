@@ -21,12 +21,43 @@ for arg in "$@"; do
     esac
 done
 
+# GPU detection — Chrome's --headless mode auto-injects
+# --use-angle=swiftshader-webgl which forces software WebGL even when a
+# real GPU is present. We override with --use-angle=vulkan only when both:
+#   (1) a render node (/dev/dri/renderD*) is accessible, AND
+#   (2) at least one non-SwiftShader Vulkan ICD is installed.
+# When both are true, Mesa+ICD can drive the GPU. Otherwise we leave the
+# default flag in place — adding --use-angle=vulkan without a real adapter
+# breaks WebGL on macOS (verified).
+gpu_flags=()
+if ls /dev/dri/renderD* > /dev/null 2>&1; then
+    has_render_node=1
+else
+    has_render_node=0
+fi
+has_real_vulkan_icd=0
+if [ -d /usr/share/vulkan/icd.d ]; then
+    for icd in /usr/share/vulkan/icd.d/*.json; do
+        case "$(basename "$icd")" in
+            *swiftshader*|*lvp_icd*) ;;  # software-only ICDs, skip
+            *) has_real_vulkan_icd=1 ;;
+        esac
+    done
+fi
+if [ "$has_render_node" = "1" ] && [ "$has_real_vulkan_icd" = "1" ]; then
+    gpu_flags+=(--use-angle=vulkan)
+    echo "chrome-launcher: GPU detected (render node + Vulkan ICD), enabling --use-angle=vulkan" >&2
+else
+    echo "chrome-launcher: no GPU detected (render_node=$has_render_node, vulkan_icd=$has_real_vulkan_icd), using default software rendering" >&2
+fi
+
 exec chrome-raw \
     --headless \
     --no-sandbox \
     --remote-debugging-port="$CDP_PORT" \
     --window-size="${VIEWPORT_WIDTH},${VIEWPORT_HEIGHT}" \
     --screen-info="{0,0 ${VIEWPORT_WIDTH}x${VIEWPORT_HEIGHT}}" \
+    "${gpu_flags[@]}" \
     --disable-renderer-backgrounding \
     --disable-background-timer-throttling \
     --disable-backgrounding-occluded-windows \

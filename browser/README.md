@@ -44,6 +44,33 @@ docker run -d --init --name browser --shm-size=1g \
 
 Open `http://<host>:6080` to access the browser.
 
+### docker compose
+
+```yaml
+services:
+  browser:
+    init: true
+    image: deaddev/browser
+    shm_size: 1g
+    ports:
+      - "6080:6080"
+    devices:
+      - /dev/dri:/dev/dri  # GPU acceleration on Linux hosts (Intel/AMD)
+```
+
+Drop the `devices` line if your host has no `/dev/dri` (macOS, Windows). The container falls back to bundled SwiftShader (CPU rendering) automatically.
+
+### GPU acceleration
+
+The image ships with software rendering (SwiftShader) by default. To enable hardware acceleration on Linux hosts:
+
+| Host | Steps |
+| --- | --- |
+| **Linux + Intel iGPU** | Mount `/dev/dri`. Mesa drivers and Intel VA-API drivers are pre-installed in the `amd64` image. Verify with `chrome://gpu` in the viewer — `WebGL Renderer` should report your iGPU instead of `SwiftShader`. |
+| **Linux + AMD GPU** | Mount `/dev/dri`. Mesa Vulkan/GL drivers handle AMD. |
+| **Linux + NVIDIA GPU** | Mount `/dev/dri` is not enough. Install [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/) on the host and add `--gpus all` to `docker run`. |
+| **macOS / Windows / arm64 hosts** | Falls back to SwiftShader (CPU). No way to pass GPU into Linux containers via Docker Desktop. The arm64 image omits Mesa packages to stay small. |
+
 ### Use as base image
 
 Set `executablePath` to `chrome` in puppeteer/playwright.
