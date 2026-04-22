@@ -5,12 +5,12 @@ import { connectViewer, delay, httpGet, pass, fail } from './helpers.mjs';
 const TEST_URL = 'https://www.browserscan.net/bot-detection';
 const v = await connectViewer();
 await v.waitFor('targetChanged');
-v.send({ type: 'getTabs' }); await v.waitFor('tabs');
 v.clearEvents();
 
-// Create blank tab
+// Create blank tab — track by targetId, not URL (avoids ambiguity with accumulated tabs)
 v.send({ type: 'newTab' });
-await v.waitFor('targetChanged');
+const blankTc = await v.waitFor('targetChanged');
+const blankId = blankTc.targetId;
 v.clearEvents();
 
 // Create second tab for switching
@@ -18,13 +18,8 @@ v.send({ type: 'newTab', url: 'https://example.com' });
 const otherTc = await v.waitFor('targetChanged');
 const otherId = otherTc.targetId;
 
-// Switch back to blank tab
-v.send({ type: 'getTabs' });
-const tabs0 = await v.waitFor('tabs');
-const blankTab = tabs0.tabs.find(t => t.url === 'about:blank' || t.url === 'chrome://newtab/');
-if (!blankTab) fail('navigate-blank-tab', 'no blank tab found');
-
-v.send({ type: 'switchTab', targetId: blankTab.id });
+// Switch back to the blank tab we created
+v.send({ type: 'switchTab', targetId: blankId });
 await v.waitFor('targetChanged');
 v.clearEvents();
 
@@ -33,11 +28,10 @@ for (let round = 1; round <= 3; round++) {
   await v.waitFor('navigated');
   await delay(3000); v.clearEvents();
 
-  // Find the browserscan tab
-  v.send({ type: 'getTabs' });
-  const tabs = await v.waitFor('tabs');
-  const navTab = tabs.tabs.find(t => t.url?.includes('browserscan'));
-  if (!navTab) fail('navigate-blank-tab', `round ${round}: no browserscan tab in ${tabs.tabs.map(t=>t.url)}`);
+  // Verify the tab we created has the navigated URL
+  const list = await httpGet('http://127.0.0.1:18800/json/list');
+  const navUrl = list.find(t => t.id === blankId)?.url;
+  if (!navUrl?.includes('browserscan')) fail('navigate-blank-tab', `round ${round}: tab URL is ${navUrl}`);
 
   // Switch away
   v.send({ type: 'switchTab', targetId: otherId });
@@ -45,12 +39,12 @@ for (let round = 1; round <= 3; round++) {
   await delay(2000); v.clearEvents();
 
   // Switch back
-  v.send({ type: 'switchTab', targetId: navTab.id });
+  v.send({ type: 'switchTab', targetId: blankId });
   await v.waitFor('targetChanged');
   await delay(3000);
 
-  const list = await httpGet('http://127.0.0.1:18800/json/list');
-  const actualUrl = list.find(t => t.id === navTab.id)?.url;
+  const list2 = await httpGet('http://127.0.0.1:18800/json/list');
+  const actualUrl = list2.find(t => t.id === blankId)?.url;
   const after = v.events.splice(0);
   const revert = after.find(m => m.type === 'navigated' && (m.url === 'about:blank' || m.url === 'chrome://newtab/'));
 

@@ -358,7 +358,6 @@ let currentTabs = [];
 let currentTargetId = null;
 let pendingNewTabFocus = false;
 const closingTabs = new Set();
-let tabRefreshInterval;
 let profileInterval;
 
 const extBar = document.getElementById('ext-bar');
@@ -384,29 +383,38 @@ function connect() {
     requestTabs();
     send({ type: 'getExtensions' });
     send({ type: 'getProfileStatus' });
-    tabRefreshInterval = setInterval(() => { requestTabs(); send({ type: 'getExtensions' }); }, 3000);
+    // Resume screencast on (re)connect — if the viewer was hidden
+    // when the WS closed, visibilitychange won't fire to restart it.
+    send({ type: 'resumeScreencast' });
+    clearInterval(profileInterval);
     profileInterval = setInterval(() => send({ type: 'getProfileStatus' }), 60000);
   };
   ws.onclose = () => {
     setStatus('disconnected', 'disconnected');
-    clearInterval(tabRefreshInterval);
     clearInterval(profileInterval);
     setTimeout(connect, 2000);
   };
-  ws.onerror = () => {};
+  ws.onerror = (e) => { console.error('WebSocket error:', e); };
+
+  // Assign onload once — replacing it per-frame creates closure churn
+  // and races. The handler reads current img state, which is correct
+  // because img.src assignment is the latest.
+  img.onload = () => {
+    if (img.naturalWidth !== frameWidth || img.naturalHeight !== frameHeight) {
+      frameWidth = img.naturalWidth;
+      frameHeight = img.naturalHeight;
+      resize();
+    }
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  };
+  img.onerror = () => {};
 
   ws.onmessage = (e) => {
-    const msg = JSON.parse(e.data);
+    let msg;
+    try { msg = JSON.parse(e.data); }
+    catch (err) { console.warn('bad message:', err.message); return; }
 
     if (msg.type === 'frame') {
-      img.onload = () => {
-        if (img.naturalWidth !== frameWidth || img.naturalHeight !== frameHeight) {
-          frameWidth = img.naturalWidth;
-          frameHeight = img.naturalHeight;
-          resize();
-        }
-        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-      };
       img.src = 'data:image/jpeg;base64,' + msg.data;
     }
 
@@ -417,14 +425,15 @@ function connect() {
     if (msg.type === 'targetChanged') {
       urlBar.value = msg.url || '';
       currentTargetId = msg.targetId;
-      location.hash = msg.targetId;
+      // replaceState instead of location.hash — hash assignment pushes
+      // history entries that break the popstate back/forward trap.
+      history.replaceState(history.state, '', '#' + msg.targetId);
       setStatus('connected', 'connected');
       // Reset loading indicator — new tab's state will arrive via CDP events
       const reloadBtn = document.getElementById('btn-reload');
       reloadBtn.textContent = '↻';
       reloadBtn.title = 'Reload';
       reloadBtn.dataset.loading = '';
-      requestTabs();
       if (pendingNewTabFocus) {
         pendingNewTabFocus = false;
         urlBar.focus();
@@ -453,11 +462,6 @@ function connect() {
     if (msg.type === 'tabCloseComplete') {
       closingTabs.delete(msg.targetId);
       renderTabs();
-    }
-
-    if (msg.type === 'tabsChanged') {
-      requestTabs();
-      send({ type: 'getExtensions' });
     }
 
     if (msg.type === 'tabClosing') {
@@ -574,6 +578,11 @@ function createTabEl(tab) {
   el.addEventListener('click', (e) => {
     if (el.classList.contains('closing')) return;
     if (e.target.closest('.tab-close')) return;
+    // Optimistic: highlight immediately. The bridge's targetChanged
+    // will confirm (or correct) this state once the switch completes.
+    currentTargetId = tab.id;
+    urlBar.value = tab.url || '';
+    renderTabs();
     send({ type: 'switchTab', targetId: tab.id });
   });
 
@@ -971,12 +980,14 @@ document.getElementById('find-close').addEventListener('click', closeFindBar);
 
 canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 
-// Intercept browser back/forward and forward to remote Chrome.
-// Push a history entry so back/forward don't leave the page.
-// On popstate, detect direction, send command, and restore the entry.
-let histIdx = 1;
+// Forward browser back/forward to the screencasted Chrome tab.
+// Two history entries trap the user on this page. Popstate detects
+// direction (back vs forward) and sends the command to the bridge.
+// targetChanged uses replaceState (not location.hash) to avoid
+// pushing extra entries that would corrupt the idx tracking.
 history.replaceState({ idx: 0 }, '');
 history.pushState({ idx: 1 }, '');
+let histIdx = 1;
 window.addEventListener('popstate', (e) => {
   const newIdx = e.state?.idx ?? 0;
   if (newIdx < histIdx) {
@@ -985,18 +996,18 @@ window.addEventListener('popstate', (e) => {
     send({ type: 'forward' });
   }
   histIdx = newIdx;
-  // Re-push so back/forward keep working
   if (newIdx === 0) {
     history.pushState({ idx: 1 }, '');
     histIdx = 1;
   }
 });
 
-// Background tabs get throttled — screencast frames stop arriving.
-// Re-switch to current tab on foreground to restart screencast.
+// Resume screencast frames after the viewer tab regains focus.
+// Only restarts frame capture — does NOT trigger a full switchToTarget
+// which would race with in-flight navigations.
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden && currentTargetId) {
-    send({ type: 'switchTab', targetId: currentTargetId });
+  if (!document.hidden) {
+    send({ type: 'resumeScreencast' });
   }
 });
 

@@ -5,9 +5,12 @@
 // Each gets an independent sessionId so they don't evict each other.
 // (Page-level webSocketDebuggerUrl is exclusive — a second client kills the first.)
 //
-// Session pool: CDP sessions stay attached to all known page targets permanently,
-// preventing Chrome from discarding background tabs. Tab switching only
-// stops/starts screencast (~3 round trips) instead of detach/reattach (~7).
+// Session pool: CDP sessions stay attached to all known page targets permanently.
+// Tab switching only stops/starts screencast (~3 round trips) instead of
+// detach/reattach (~7). Sessions do NOT prevent Chrome from discarding
+// background renderers — the NavigationController in the browser process
+// preserves history entries across renderer death and reloads from the
+// last committed NavigationEntry on reactivation.
 // All viewers share one active target and receive broadcast frames.
 // DevTools connections are independent — each gets its own session outside the pool.
 
@@ -38,6 +41,56 @@ const log = {
   debug: (...args) => { if (LOG_LEVEL >= 2) console.log('[bridge]', ...args); },
 };
 
+// --- Mutable state ---
+
+// Tab tracking
+let tabCounter = 0;
+const knownTabs = new Map();   // targetId → creation order integer
+let lastKnownOrder = [];       // targetId[] sorted by knownTabs order
+
+// Browser CDP connection
+let browserWs = null;
+let browserCmdId = 1;
+const pendingBrowserCmds = new Map(); // id → { resolve, reject, sessionId }
+const sessionHandlers = new Map();    // sessionId → fn(msg)
+let browserConnecting = null;
+let browserExplicitlyStopped = false;
+let reconnecting = false;
+
+// Session pool
+const sessionPool = new Map(); // targetId → { sessionId, mainFrameId }
+let activeTargetId = null;
+let screencastActive = false;
+// Last frame broadcast to viewers — replayed to new connections so the
+// user sees content immediately instead of a blank canvas while waiting
+// for Chrome to produce the next frame (which only happens on visual change).
+let lastFrame = null;
+
+// Operation queue — all state-mutating async operations (switchToTarget,
+// reconcileTabsGlobal) run through this queue sequentially.
+const opQueue = [];
+let opRunning = false;
+
+// Zoom
+let zoomLevel = 1.0;
+let zoomScriptId = null;
+
+// Extension cache
+let extensionCache = null;
+let extensionPrefsMtimeMs = 0;
+
+// Profile cache
+let profileDir = null;
+let profileCache = null;
+let profileCacheTime = 0;
+const PROFILE_CACHE_TTL = 60000;
+
+// Tab broadcast debounce
+let tabBroadcastTimer = null;
+
+// Dedup: only one ensureAtLeastOnePage() runs at a time
+let ensurePagePromise = null;
+
 // --- CDP HTTP helpers ---
 
 async function cdpFetch(p, method = 'GET') {
@@ -50,12 +103,8 @@ async function cdpFetch(p, method = 'GET') {
   }
 }
 
-let tabCounter = 0;
-const knownTabs = new Map(); // targetId -> creation integer
-const helperTargets = new Set(); // temp targets (sync-internals etc.) hidden from tab list
-
 async function getCdpTargets() {
-  const targets = (await cdpFetch('/json/list')).filter(t => !helperTargets.has(t.id));
+  const targets = await cdpFetch('/json/list');
 
   const currentIds = new Set();
   for (const t of targets) {
@@ -75,29 +124,50 @@ async function getCdpTargets() {
 }
 
 // Debounced broadcast: notify all viewers to refresh tabs when targets change.
-let tabBroadcastTimer = null;
+// Push the actual tab list (not a content-free notification) so viewers
+// don't need to round-trip a getTabs request. 50ms debounce coalesces
+// bursts (e.g. several Target.targetCreated events firing in sequence)
+// without adding user-perceptible delay.
 function scheduleTabBroadcast() {
   if (tabBroadcastTimer) return;
-  tabBroadcastTimer = setTimeout(() => {
+  tabBroadcastTimer = setTimeout(async () => {
     tabBroadcastTimer = null;
-    broadcastToViewers({ type: 'tabsChanged' });
-  }, 500);
+    try {
+      const targets = await getCdpTargets();
+      const tabPages = targets.filter(t => t.type === 'page').map(t => ({
+        id: t.id, url: t.url, title: t.title,
+        active: t.id === activeTargetId
+      }));
+      broadcastToViewers({ type: 'tabs', tabs: tabPages });
+    } catch (err) {
+      log.error('scheduleTabBroadcast error:', err.message);
+    }
+  }, 50);
 }
 
-// Global dedup: when multiple viewers see 0 pages simultaneously,
-// only one blank tab is created. Second caller gets the same promise.
-let ensurePageLock = null;
+let extBroadcastTimer = null;
+function scheduleExtBroadcast() {
+  if (extBroadcastTimer) return;
+  extBroadcastTimer = setTimeout(async () => {
+    extBroadcastTimer = null;
+    try {
+      const exts = await getExtensionInfo();
+      broadcastToViewers({ type: 'extensions', extensions: exts });
+    } catch {}
+  }, 50);
+}
+
 function ensureAtLeastOnePage() {
-  if (ensurePageLock) return ensurePageLock;
-  ensurePageLock = (async () => {
+  if (ensurePagePromise) return ensurePagePromise;
+  ensurePagePromise = (async () => {
     const targets = await getCdpTargets();
     const pages = targets.filter(t => t.type === 'page');
     if (pages.length > 0) return pages[0];
     const resp = await browserCommand('Target.createTarget', { url: 'about:blank', background: true });
     if (resp.error) throw new Error(resp.error.message);
     return { id: resp.result.targetId, url: 'about:blank', type: 'page' };
-  })().finally(() => { ensurePageLock = null; });
-  return ensurePageLock;
+  })().finally(() => { ensurePagePromise = null; });
+  return ensurePagePromise;
 }
 
 async function findPageTarget(targetId) {
@@ -121,9 +191,6 @@ function normalizeUrl(input) {
 // Reads extension info from Chrome's Preferences file on disk.
 // Icon files are read directly from extension directories and converted to data URLs.
 // Falls back to attaching to service workers via CDP for i18n-resolved names.
-
-let extensionCache = null;
-let extensionPrefsMtimeMs = 0;
 
 async function readExtensionIcon(extPath, manifest) {
   const ai = manifest.action?.default_icon || manifest.browser_action?.default_icon;
@@ -149,22 +216,36 @@ async function readExtensionIcon(extPath, manifest) {
 
 async function ensureProfileDir() {
   if (profileDir) return;
-  await ensureBrowserConnection();
-  let helperId = null;
-  let helperSid = null;
+  // Discover profile dir from Chrome's /json/version endpoint instead of
+  // creating a helper tab. The userDataDir field in /json/version gives
+  // the base path; the profile is typically "Default" under it.
   try {
-    const target = await cdpFetch('/json/new?chrome://version/', 'PUT');
-    helperId = target.id;
-    helperTargets.add(helperId);
-    helperSid = await attachToTarget(helperId);
-    await sessionCommand(helperSid, 'Page.enable');
-    await discoverProfileDir(helperSid);
+    const version = await cdpFetch('/json/version');
+    // Chrome exposes userDataDir in the version endpoint on some builds.
+    // Fall back to scanning common paths.
+    if (version.userDataDir) {
+      const defaultProfile = path.join(version.userDataDir, 'Default');
+      try {
+        await fs.promises.access(path.join(defaultProfile, 'Preferences'));
+        profileDir = defaultProfile;
+        log.debug('discovered profile dir from /json/version:', profileDir);
+        return;
+      } catch {}
+    }
+    // Fall back: scan for scoped_dir pattern used by headless Chrome
+    const tmpDirs = await fs.promises.readdir('/tmp').catch(() => []);
+    for (const d of tmpDirs) {
+      if (d.startsWith('org.chromium.Chromium')) {
+        const candidate = path.join('/tmp', d, 'Default');
+        try {
+          await fs.promises.access(path.join(candidate, 'Preferences'));
+          profileDir = candidate;
+          log.debug('discovered profile dir from /tmp scan:', profileDir);
+          return;
+        } catch {}
+      }
+    }
   } catch {}
-  if (helperSid) detachSession(helperSid);
-  if (helperId) {
-    helperTargets.delete(helperId);
-    fetch(`http://${CDP_HOST}:${CDP_PORT}/json/close/${helperId}`).catch(() => {});
-  }
 }
 
 async function getExtensionInfo() {
@@ -222,140 +303,57 @@ async function getExtensionInfo() {
 }
 
 // --- Profile / sync status ---
-// Avatar + email from Chrome's Preferences file (profile path discovered via chrome://version/).
-// Sync status from chrome://sync-internals/ helper tab (hidden from tab list via helperTargets).
-
-let profileCache = null;
-let profileCacheTime = 0;
-let profileDir = null; // cached after first discovery from chrome://version/
-const PROFILE_CACHE_TTL = 60000;
-
-async function discoverProfileDir(helperSid) {
-  if (profileDir) return;
-  await sessionCommand(helperSid, 'Page.navigate', { url: 'chrome://version/' });
-  for (let i = 0; i < 10; i++) {
-    await new Promise(r => setTimeout(r, 500));
-    const resp = await sessionCommand(helperSid, 'Runtime.evaluate', {
-      expression: `document.getElementById('profile_path')?.textContent?.trim()`
-    });
-    const val = resp?.result?.result?.value;
-    if (val) {
-      profileDir = val;
-      log.debug('discovered profile dir:', profileDir);
-      return;
-    }
-  }
-}
+// Avatar + email read from Chrome's Preferences file on disk.
+// Profile dir discovered from /json/version or /tmp scan — no helper tabs.
 
 async function getProfileStatus() {
   if (profileCache && Date.now() - profileCacheTime < PROFILE_CACHE_TTL) {
     return profileCache;
   }
 
-  await ensureBrowserConnection();
-  let helperId = null;
-  let helperSid = null;
+  // Read profile data from Preferences file on disk instead of creating
+  // helper tabs via /json/new. Helper tab creation causes Chrome to shift
+  // internal focus, deactivating the user's current tab — which leads to
+  // page revert/refresh when switching back.
+  await ensureProfileDir();
 
-  try {
-    const target = await cdpFetch('/json/new?chrome://sync-internals/', 'PUT');
-    helperId = target.id;
-    helperTargets.add(helperId);
-    helperSid = await attachToTarget(helperId);
-    await sessionCommand(helperSid, 'Page.enable');
+  let avatar = null;
+  let email = null;
+  let fullName = null;
+  let transport = '';
+  let summary = '';
 
-    // Poll for sync-internals data
-    let syncData = {};
-    for (let i = 0; i < 10; i++) {
-      await new Promise(r => setTimeout(r, 500));
-      const evalResp = await sessionCommand(helperSid, 'Runtime.evaluate', {
-        expression: `(() => {
-          const result = {};
-          document.querySelectorAll('#about-info tr').forEach(r => {
-            const cells = r.querySelectorAll('td');
-            if (cells.length >= 2)
-              result[cells[0].textContent.trim()] = cells[1].textContent.trim();
-          });
-          return JSON.stringify(result);
-        })()`
-      });
-      if (evalResp?.result?.result?.value) {
-        const data = JSON.parse(evalResp.result.result.value);
-        if (Object.keys(data).length > 0) {
-          syncData = data;
-          break;
-        }
+  if (profileDir) {
+    try {
+      const prefs = JSON.parse(await fs.promises.readFile(
+        path.join(profileDir, 'Preferences'), 'utf8'));
+      const account = prefs.account_info?.[0];
+      if (account) {
+        avatar = account.picture_url || null;
+        email = account.email || null;
+        fullName = account.full_name || null;
       }
-    }
-
-    // Discover profile dir once via chrome://version/
-    if (!profileDir) {
-      try { await discoverProfileDir(helperSid); } catch {}
-    }
-
-    // Read avatar + account info from Preferences file
-    let avatar = null;
-    let email = syncData['Username'] || syncData['Authenticated Account ID'] || null;
-    let fullName = null;
-    if (profileDir) {
-      try {
-        const prefs = JSON.parse(await fs.promises.readFile(
-          path.join(profileDir, 'Preferences'), 'utf8'));
-        const account = prefs.account_info?.[0];
-        if (account) {
-          avatar = account.picture_url || null;
-          if (!email) email = account.email || null;
-          fullName = account.full_name || null;
-        }
-      } catch {}
-    }
-
-    const transport = syncData['Transport State'] || '';
-    const summary = syncData['Summary'] || transport;
-
-    // Transport State "Active" = ok, anything else = problem.
-    // Don't interpret non-Active states — surface the exact value.
-    let status = 'signed_out';
-    if (email) {
-      status = (transport === 'Active' || !transport) ? 'ok' : 'error';
-    }
-
-    profileCache = { email, fullName, status, summary, avatar, transport };
-    profileCacheTime = Date.now();
-    return profileCache;
-  } catch {
-    return { email: null, fullName: null, status: 'unknown', summary: '', avatar: null };
-  } finally {
-    if (helperSid) detachSession(helperSid);
-    if (helperId) {
-      helperTargets.delete(helperId);
-      fetch(`http://${CDP_HOST}:${CDP_PORT}/json/close/${helperId}`).catch(() => {});
-    }
+      // Read sync transport state from Preferences if available
+      const syncPrefs = prefs.sync;
+      if (syncPrefs) {
+        transport = syncPrefs.transport_state || '';
+      }
+    } catch {}
   }
+
+  let status = 'signed_out';
+  if (email) {
+    status = (transport === 'Active' || !transport) ? 'ok' : 'error';
+  }
+
+  profileCache = { email, fullName, status, summary, avatar, transport };
+  profileCacheTime = Date.now();
+  return profileCache;
 }
 
 // --- Shared browser-level CDP connection ---
 // All clients (viewer, devtools) multiplex through one browser WebSocket.
 // Each gets an independent session via Target.attachToTarget(flatten:true).
-
-let browserWs = null;
-let browserCmdId = 1;
-let pendingBrowserCmds = new Map(); // id → { resolve, reject, sessionId }
-let sessionHandlers = new Map();    // sessionId → fn(msg)
-let browserConnecting = null;       // dedup concurrent connect attempts
-let browserExplicitlyStopped = false; // suppress auto-reconnect after explicit stop
-
-// --- Global session pool ---
-// Sessions attached to ALL known page targets. Prevents Chrome from discarding
-// background tabs and eliminates detach/attach overhead on tab switch.
-const sessionPool = new Map(); // targetId -> { sessionId, mainFrameId }
-let activeTargetId = null;
-let screencastActive = false;
-let globalSwitching = false;
-let globalZoomLevel = 1.0;
-let globalZoomScriptId = null;
-let lastKnownOrder = [];
-let globalReconciling = false;
-let globalReconnecting = false;
 
 async function getBrowserWsUrl() {
   const version = await cdpFetch('/json/version');
@@ -419,14 +417,13 @@ function ensureBrowserConnection() {
             const ti = msg.params?.targetInfo;
             if (ti?.type === 'page') {
               scheduleTabBroadcast();
-              poolAttach(ti.targetId).catch(err =>
-                log.error('poolAttach failed for', ti.targetId, err.message));
+              // Sessions attach lazily in switchToTarget, not here.
             }
             // Extension installed/enabled — invalidate cache so next
             // getExtensions fetches fresh data
             if (ti?.type === 'service_worker' || ti?.type === 'background_page') {
               extensionCache = null;
-              scheduleTabBroadcast();
+              scheduleExtBroadcast();
             }
           }
           if (msg.method === 'Target.targetDestroyed') {
@@ -434,14 +431,15 @@ function ensureBrowserConnection() {
             if (destroyedId) {
               if (knownTabs.has(destroyedId)) scheduleTabBroadcast();
               poolDetach(destroyedId);
+              // Don't null activeTargetId here — let reconcileTabsGlobal
+              // detect the missing tab and pick an adjacent one.
               if (destroyedId === activeTargetId) {
-                activeTargetId = null;
                 screencastActive = false;
-                globalZoomScriptId = null;
-                reconcileTabsGlobal();
+                enqueueOp(() => reconcileTabsGlobal()).catch(err => log.error('reconcile error:', err.message));
               }
             }
             extensionCache = null;
+            scheduleExtBroadcast();
           }
           if (msg.method === 'Target.targetInfoChanged') {
             const ti = msg.params?.targetInfo;
@@ -461,7 +459,7 @@ function ensureBrowserConnection() {
         sessionPool.clear();
         activeTargetId = null;
         screencastActive = false;
-        globalZoomScriptId = null;
+        zoomScriptId = null;
         // Invalidate caches
         extensionCache = null;
         profileCache = null;
@@ -469,7 +467,7 @@ function ensureBrowserConnection() {
         profileDir = null;
         extensionPrefsMtimeMs = 0;
         if (!browserExplicitlyStopped) {
-          globalReconnect();
+          reconnectToBrowser();
         }
       });
 
@@ -602,15 +600,23 @@ function poolDetach(targetId) {
 }
 
 function poolSessionHandler(targetId, entry, msg) {
+  // bfcache rejection — log the exact reason Chrome refused to cache this page
+  if (msg.method === 'Page.backForwardCacheNotUsed') {
+    const reasons = (msg.params?.notRestoredExplanations || []).map(e => e.reason);
+    log.info('bfcache rejected for', targetId.slice(0, 8) + ':', reasons.join(', ') || 'unknown');
+  }
+
   // Screencast frames — only from active target, broadcast to all viewers
   if (msg.method === 'Page.screencastFrame') {
     if (targetId === activeTargetId) {
-      broadcastToViewers({
+      const frame = {
         type: 'frame',
         data: msg.params.data,
         metadata: msg.params.metadata,
         sessionId: msg.params.sessionId
-      });
+      };
+      lastFrame = frame;
+      broadcastToViewers(frame);
       sessionSend(entry.sessionId, 'Page.screencastFrameAck', {
         sessionId: msg.params.sessionId
       });
@@ -649,25 +655,42 @@ function poolSessionHandler(targetId, entry, msg) {
     sessionHandlers.delete(entry.sessionId);
     if (targetId === activeTargetId) {
       screencastActive = false;
-      globalZoomScriptId = null;
-      reconcileTabsGlobal();
+      zoomScriptId = null;
+      enqueueOp(() => reconcileTabsGlobal()).catch(err => log.error('reconcile error:', err.message));
     }
   }
 }
 
+// Serial operation queue — prevents concurrent switchToTarget/reconcile
+// from fighting over shared state. Like Redux: operations dispatch to a
+// queue and execute one at a time. No locks between them.
+function enqueueOp(fn) {
+  return new Promise((resolve, reject) => {
+    opQueue.push({ fn, resolve, reject });
+    if (!opRunning) drainOps();
+  });
+}
+async function drainOps() {
+  opRunning = true;
+  while (opQueue.length > 0) {
+    const { fn, resolve, reject } = opQueue.shift();
+    try { resolve(await fn()); } catch (e) { reject(e); }
+  }
+  opRunning = false;
+}
+
 async function switchToTarget(targetId) {
   if (targetId === activeTargetId && screencastActive) return;
-  if (globalSwitching) return;
-  globalSwitching = true;
   const t0 = Date.now();
   try {
-    // Stop screencast on old active session
-    if (activeTargetId && screencastActive) {
+    // Stop screencast on old active session — always send stop even
+    // if screencastActive is false (async startScreencast may be pending)
+    if (activeTargetId) {
       const oldEntry = sessionPool.get(activeTargetId);
       if (oldEntry) sessionSend(oldEntry.sessionId, 'Page.stopScreencast');
       screencastActive = false;
     }
-    globalZoomScriptId = null;
+    zoomScriptId = null;
 
     // Ensure target is in the pool
     if (!sessionPool.has(targetId)) {
@@ -677,8 +700,10 @@ async function switchToTarget(targetId) {
     if (!entry) throw new Error('Failed to attach to target ' + targetId);
 
     activeTargetId = targetId;
+    // Drop cached frame from old target — replaying it on a new viewer
+    // connect would briefly show the wrong tab's content.
+    lastFrame = null;
 
-    // Activate so Chrome treats it as foreground (required for screencast)
     let t1 = Date.now();
     const activateResp = await browserCommand('Target.activateTarget', { targetId });
     if (activateResp.error) log.error('activateTarget failed:', activateResp.error.message);
@@ -688,16 +713,7 @@ async function switchToTarget(targetId) {
     await sessionCommand(entry.sessionId, 'Page.bringToFront');
     log.debug('switchToTarget: bringToFront', Date.now() - t1 + 'ms');
 
-    t1 = Date.now();
-    const scResp = await sessionCommand(entry.sessionId, 'Page.startScreencast', {
-      format: 'jpeg', quality: SCREENCAST_QUALITY,
-      maxWidth: VIEWPORT_WIDTH, maxHeight: VIEWPORT_HEIGHT
-    });
-    if (scResp.error) log.error('startScreencast failed:', scResp.error.message);
-    screencastActive = true;
-    log.debug('switchToTarget: startScreencast', Date.now() - t1 + 'ms');
-
-    if (globalZoomLevel !== 1.0) await applyZoomGlobal();
+    if (zoomLevel !== 1.0) await applyZoom();
 
     lastKnownOrder = [...knownTabs.entries()]
       .sort((a, b) => a[1] - b[1])
@@ -711,15 +727,34 @@ async function switchToTarget(targetId) {
       title: target.title
     });
 
+    // startScreencast — fire and forget, not awaited.
+    // Awaiting would block the operation queue if Chrome is slow to
+    // start frame capture (observed under tab accumulation / resource
+    // pressure in test suites). The targetChanged broadcast above
+    // already gave viewers the correct URL; frames resume when
+    // startScreencast completes asynchronously.
+    const scTargetId = targetId;
+    sessionCommand(entry.sessionId, 'Page.startScreencast', {
+      format: 'jpeg', quality: SCREENCAST_QUALITY,
+      maxWidth: VIEWPORT_WIDTH, maxHeight: VIEWPORT_HEIGHT
+    }).then(scResp => {
+      if (scResp.error) {
+        log.error('startScreencast failed:', scResp.error.message);
+        return;
+      }
+      if (activeTargetId === scTargetId) screencastActive = true;
+      log.debug('startScreencast completed for', scTargetId.slice(0, 8));
+    }).catch(err => {
+      log.error('startScreencast error:', err.message);
+    });
+
     log.debug('switchToTarget: total', Date.now() - t0 + 'ms');
-  } finally {
-    globalSwitching = false;
+  } catch (err) {
+    throw err;
   }
 }
 
 async function reconcileTabsGlobal() {
-  if (globalReconciling || globalSwitching) return;
-  globalReconciling = true;
   try {
     const targets = await getCdpTargets();
     const pages = targets.filter(t => t.type === 'page');
@@ -738,7 +773,7 @@ async function reconcileTabsGlobal() {
       }
     }
 
-    if (activeTargetId && !currentIds.has(activeTargetId)) {
+    if (!activeTargetId || (activeTargetId && !currentIds.has(activeTargetId))) {
       // Active tab gone — find adjacent from old order
       const oldSet = new Set(lastKnownOrder);
       const searchOrder = [...lastKnownOrder];
@@ -763,7 +798,7 @@ async function reconcileTabsGlobal() {
 
       activeTargetId = null;
       screencastActive = false;
-      globalZoomScriptId = null;
+      zoomScriptId = null;
 
       if (pages.length === 0) {
         const page = await ensureAtLeastOnePage();
@@ -782,14 +817,12 @@ async function reconcileTabsGlobal() {
     broadcastToViewers({ type: 'tabs', tabs: freshPages });
   } catch (err) {
     log.error('reconcileTabsGlobal error:', err.message);
-  } finally {
-    globalReconciling = false;
   }
 }
 
-function globalReconnect() {
-  if (globalReconnecting || browserExplicitlyStopped) return;
-  globalReconnecting = true;
+function reconnectToBrowser() {
+  if (reconnecting || browserExplicitlyStopped) return;
+  reconnecting = true;
 
   (async () => {
     while (true) {
@@ -801,43 +834,43 @@ function globalReconnect() {
         const pages = targets.filter(t => t.type === 'page');
         for (const page of pages) {
           await poolAttach(page.id).catch(err =>
-            log.error('globalReconnect poolAttach failed:', err.message));
+            log.error('reconnectToBrowser poolAttach failed:', err.message));
         }
         if (pages.length === 0) {
           const page = await ensureAtLeastOnePage();
-          await switchToTarget(page.id);
+          await enqueueOp(() => switchToTarget(page.id));
         } else {
           const resume = pages.find(t => t.id === activeTargetId) || pages[0];
-          await switchToTarget(resume.id);
+          await enqueueOp(() => switchToTarget(resume.id));
         }
-        globalReconnecting = false;
+        reconnecting = false;
         break;
       } catch (err) {
-        log.error('globalReconnect attempt failed:', err.message);
+        log.error('reconnectToBrowser attempt failed:', err.message);
       }
     }
   })();
 }
 
-async function applyZoomGlobal() {
+async function applyZoom() {
   const entry = activeSession();
   if (!entry) return;
   const sid = entry.sessionId;
-  if (globalZoomScriptId) {
+  if (zoomScriptId) {
     await sessionCommand(sid, 'Page.removeScriptToEvaluateOnNewDocument', {
-      identifier: globalZoomScriptId
+      identifier: zoomScriptId
     }).catch(() => {});
-    globalZoomScriptId = null;
+    zoomScriptId = null;
   }
-  const zoomValue = globalZoomLevel === 1.0 ? '' : String(globalZoomLevel);
+  const zoomValue = zoomLevel === 1.0 ? '' : String(zoomLevel);
   await sessionCommand(sid, 'Runtime.evaluate', {
     expression: `document.documentElement.style.zoom='${zoomValue}'`
   }).catch(() => {});
-  if (globalZoomLevel !== 1.0) {
+  if (zoomLevel !== 1.0) {
     const resp = await sessionCommand(sid, 'Page.addScriptToEvaluateOnNewDocument', {
-      source: `document.documentElement.style.zoom='${globalZoomLevel}'`
+      source: `document.documentElement.style.zoom='${zoomLevel}'`
     }).catch(() => null);
-    if (resp?.result?.identifier) globalZoomScriptId = resp.result.identifier;
+    if (resp?.result?.identifier) zoomScriptId = resp.result.identifier;
   }
 }
 
@@ -861,7 +894,7 @@ function jsonResponse(res, data, status = 200) {
 const server = http.createServer(async (req, res) => {
   const p = routePath(req.url);
   if (p === '/' || p === '/index.html') {
-    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.writeHead(200, { 'Content-Type': 'text/html', 'Cache-Control': 'no-cache, no-store, must-revalidate' });
     fs.createReadStream(HTML_PATH).pipe(res);
   } else if (p === '/health') {
     jsonResponse(res, { ok: true });
@@ -997,24 +1030,41 @@ viewerWss.on('connection', async (client, req) => {
     if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify(obj));
   }
 
-  // Send current state snapshot so the viewer catches up immediately
+  // Send complete state snapshot so the viewer renders fully on first
+  // paint instead of showing a half-populated UI (URL bar set but no
+  // tabs, no extensions, no canvas content).
   if (activeTargetId) {
     try {
-      const target = await findPageTarget(activeTargetId);
+      const [target, tabTargets, exts, profile] = await Promise.all([
+        findPageTarget(activeTargetId),
+        getCdpTargets(),
+        getExtensionInfo().catch(() => []),
+        getProfileStatus().catch(() => null)
+      ]);
       clientSend({ type: 'targetChanged', targetId: activeTargetId, url: target.url, title: target.title });
+      const tabPages = tabTargets.filter(t => t.type === 'page').map(t => ({
+        id: t.id, url: t.url, title: t.title,
+        active: t.id === activeTargetId
+      }));
+      clientSend({ type: 'tabs', tabs: tabPages });
+      clientSend({ type: 'extensions', extensions: exts });
+      if (profile) clientSend({ type: 'profileStatus', ...profile });
+      // Replay last frame so canvas isn't blank while waiting for the
+      // next screencast frame (which only fires on visual change).
+      if (lastFrame) clientSend(lastFrame);
     } catch {}
   }
 
   // Bootstrap: first viewer when no active target
-  if (!activeTargetId && !globalSwitching && !globalReconnecting) {
+  if (!activeTargetId && !reconnecting) {
     try {
       await ensureBrowserConnection();
       const target = await findPageTarget(preferredTarget || null);
-      await switchToTarget(target.targetId);
+      await enqueueOp(() => switchToTarget(target.targetId));
     } catch (err) {
       log.error('viewer bootstrap failed:', err.message);
       clientSend({ type: 'status', message: 'Waiting for browser to start...' });
-      globalReconnect();
+      reconnectToBrowser();
     }
   }
 
@@ -1074,13 +1124,15 @@ viewerWss.on('connection', async (client, req) => {
 
         case 'zoom':
           if (typeof msg.level === 'number') {
-            globalZoomLevel = Math.max(0.25, Math.min(5, msg.level));
-            await applyZoomGlobal();
+            zoomLevel = Math.max(0.25, Math.min(5, msg.level));
+            await applyZoom();
           }
           break;
 
         case 'navigate':
-          if (entry) sessionSend(entry.sessionId, 'Page.navigate', { url: normalizeUrl(msg.url) });
+          if (entry) {
+            await sessionCommand(entry.sessionId, 'Page.navigate', { url: normalizeUrl(msg.url) }).catch(() => {});
+          }
           break;
 
         case 'reload':
@@ -1102,7 +1154,7 @@ viewerWss.on('connection', async (client, req) => {
         case 'switchTab':
           if (msg.targetId) {
             try {
-              await switchToTarget(msg.targetId);
+              await enqueueOp(() => switchToTarget(msg.targetId));
             } catch (err) {
               clientSend({ type: 'error', message: 'Failed to switch tab: ' + err.message });
             }
@@ -1112,8 +1164,15 @@ viewerWss.on('connection', async (client, req) => {
         case 'newTab':
           try {
             const newUrl = normalizeUrl(msg.url || '');
-            const target = await cdpFetch('/json/new?' + newUrl, 'PUT');
-            await switchToTarget(target.id);
+            // Use Target.createTarget instead of /json/new to avoid Chrome
+            // shifting internal focus to the new tab, which deactivates the
+            // current tab and triggers BrowsingInstanceNotSwapped on switch back.
+            const createResp = await browserCommand('Target.createTarget', {
+              url: newUrl,
+              background: true
+            });
+            if (createResp.error) throw new Error(createResp.error.message);
+            await enqueueOp(() => switchToTarget(createResp.result.targetId));
           } catch (err) {
             clientSend({ type: 'error', message: 'Failed to create tab: ' + err.message });
           }
@@ -1123,8 +1182,12 @@ viewerWss.on('connection', async (client, req) => {
           try {
             if (!activeTargetId) throw new Error('No active tab');
             const curTarget = await findPageTarget(activeTargetId);
-            const dup = await cdpFetch('/json/new?' + encodeURI(curTarget.url), 'PUT');
-            await switchToTarget(dup.id);
+            const dupResp = await browserCommand('Target.createTarget', {
+              url: curTarget.url,
+              background: true
+            });
+            if (dupResp.error) throw new Error(dupResp.error.message);
+            await enqueueOp(() => switchToTarget(dupResp.result.targetId));
           } catch (err) {
             clientSend({ type: 'error', message: 'Failed to duplicate tab: ' + err.message });
           }
@@ -1140,7 +1203,7 @@ viewerWss.on('connection', async (client, req) => {
             broadcastToViewers({ type: 'tabClosing', targetId: msg.targetId });
             try {
               await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/close/${msg.targetId}`);
-              await reconcileTabsGlobal();
+              await enqueueOp(() => reconcileTabsGlobal());
             } catch (err) {
               log.error('closeTab error:', err.message);
               broadcastToViewers({ type: 'error', message: 'Failed to close tab: ' + err.message });
@@ -1151,9 +1214,36 @@ viewerWss.on('connection', async (client, req) => {
           }
           break;
 
-        case 'getTabs':
-          await reconcileTabsGlobal();
+        case 'getTabs': {
+          // Read-only tab listing — does NOT go through the operation queue.
+          // The old approach (enqueueOp → reconcileTabsGlobal) serialized
+          // read-only queries behind write operations, causing the queue to
+          // back up when the viewer polls frequently.
+          const tabTargets = await getCdpTargets();
+          const tabPages = tabTargets.filter(t => t.type === 'page').map(t => ({
+            id: t.id, url: t.url, title: t.title,
+            active: t.id === activeTargetId
+          }));
+          broadcastToViewers({ type: 'tabs', tabs: tabPages });
           break;
+        }
+
+        case 'resumeScreencast': {
+          // Lightweight restart — just re-starts frame capture on the
+          // current active target without running the full switchToTarget
+          // flow. Used by the viewer's visibilitychange handler so that
+          // regaining focus doesn't trigger tab switching side effects.
+          const resumeEntry = activeSession();
+          if (resumeEntry) {
+            sessionCommand(resumeEntry.sessionId, 'Page.startScreencast', {
+              format: 'jpeg', quality: SCREENCAST_QUALITY,
+              maxWidth: VIEWPORT_WIDTH, maxHeight: VIEWPORT_HEIGHT
+            }).then(r => {
+              if (!r.error) screencastActive = true;
+            }).catch(() => {});
+          }
+          break;
+        }
 
         case 'copyInternalState':
           try {
@@ -1161,15 +1251,13 @@ viewerWss.on('connection', async (client, req) => {
             clientSend({ type: 'internalState', data: {
               jsonList,
               knownTabs: Object.fromEntries(knownTabs),
-              helperTargets: [...helperTargets],
               activeTargetId,
               sessionPool: Object.fromEntries(
                 [...sessionPool].map(([tid, e]) => [tid, { sessionId: e.sessionId, mainFrameId: e.mainFrameId }])
               ),
               tabCounter,
               screencastActive,
-              globalSwitching,
-              globalZoomLevel,
+              zoomLevel,
               browserConnected: !!(browserWs && browserWs.readyState === WebSocket.OPEN)
             }});
           } catch (err) {
@@ -1241,7 +1329,7 @@ viewerWss.on('connection', async (client, req) => {
                     t.url?.startsWith('chrome-extension://' + extId + '/') &&
                     !prevIds.has(t.id || t.targetId));
                   if (popup) {
-                    await switchToTarget(popup.id);
+                    await enqueueOp(() => switchToTarget(popup.id));
                     opened = true;
                   }
                 }
@@ -1277,7 +1365,7 @@ viewerWss.on('connection', async (client, req) => {
                 const url = 'chrome-extension://' + extId + '/' + popupPath;
                 const createResp = await browserCommand('Target.createTarget', { url, background: true });
                 if (createResp.error) throw new Error(createResp.error.message);
-                await switchToTarget(createResp.result.targetId);
+                await enqueueOp(() => switchToTarget(createResp.result.targetId));
               } catch (err) {
                 clientSend({ type: 'error', message: 'Popup failed: ' + err.message });
               }
@@ -1293,14 +1381,14 @@ viewerWss.on('connection', async (client, req) => {
           sessionPool.clear();
           activeTargetId = null;
           screencastActive = false;
-          globalZoomScriptId = null;
+          zoomScriptId = null;
           browserExplicitlyStopped = true;
           if (browserWs) { browserWs.close(); browserWs = null; }
           try {
             await execFileAsync(CHROME_CMD, ['stop'], { timeout: 15000 }).catch(() => {});
             await execFileAsync(CHROME_CMD, ['start-detached'], { timeout: 15000 });
             browserExplicitlyStopped = false;
-            globalReconnect();
+            reconnectToBrowser();
           } catch (err) {
             browserExplicitlyStopped = false;
             broadcastToViewers({ type: 'error', message: 'Browser restart failed: ' + err.message });
@@ -1312,7 +1400,7 @@ viewerWss.on('connection', async (client, req) => {
           sessionPool.clear();
           activeTargetId = null;
           screencastActive = false;
-          globalZoomScriptId = null;
+          zoomScriptId = null;
           browserExplicitlyStopped = true;
           if (browserWs) { browserWs.close(); browserWs = null; }
           try {
@@ -1328,7 +1416,7 @@ viewerWss.on('connection', async (client, req) => {
           browserExplicitlyStopped = false;
           try {
             await execFileAsync(CHROME_CMD, ['start-detached'], { timeout: 15000 });
-            globalReconnect();
+            reconnectToBrowser();
           } catch (err) {
             broadcastToViewers({ type: 'error', message: 'Browser start failed: ' + err.message });
           }
