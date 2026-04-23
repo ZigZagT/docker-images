@@ -1,25 +1,40 @@
 #!/bin/bash
 # chrome — Chrome + browser bridge process manager
 #
-# Foreground:   chrome [...chrome-args]
-# Detached:     chrome start-detached [...chrome-args]
-# Restart:      chrome restart
-# Stop:         chrome stop
+# Foreground:    chrome [...chrome-args]              (block, supervisor)
+# Background:    chrome start [...chrome-args]        (detach, supervisor)
+# Restart all:   chrome restart
+# Stop all:      chrome stop
+# Per-component: chrome {start|stop|restart}-{browser|bridge}
 #
-# When called with --* flags, execs into chrome-launcher directly
-# (puppeteer/playwright executablePath compatibility).
+# When called with --* flags as the first arg, execs into chrome-launcher
+# directly (puppeteer/playwright executablePath compatibility).
+#
+# Universal interface: external processes (e.g. server.mjs) should invoke
+# per-component subcommands without caring whether a foreground supervisor
+# is present. The script transparently dispatches:
+#   - if a foreground supervisor is running, write the command to a
+#     drop file and signal the supervisor (SIGUSR1 trap reads + executes)
+#   - otherwise, execute the action in this process directly
+# Either way, the public surface is `chrome <command>`.
 
 CHROME_ARGS_FILE="/tmp/chrome.args"
 CHROME_PID_FILE="/tmp/chrome.pid"
 BRIDGE_PID_FILE="/tmp/browser-bridge.pid"
 BRIDGE_DIR="/opt/browser-bridge"
 FOREGROUND_PID_FILE="/tmp/chrome-foreground.pid"
+SUPERVISOR_CMD_FILE="/tmp/chrome.cmd"
 
 save_args() {
+    # Always create the args file — even when no args are given. The
+    # file's existence is the marker that someone ran `chrome` or
+    # `chrome start` to set up the launch context. start_browser uses
+    # this distinction to refuse standalone start-browser invocations
+    # against a never-bootstrapped container.
     if [ $# -gt 0 ]; then
         printf '%s\0' "$@" > "$CHROME_ARGS_FILE"
     else
-        rm -f "$CHROME_ARGS_FILE"
+        : > "$CHROME_ARGS_FILE"
     fi
 }
 
@@ -34,14 +49,34 @@ load_args() {
 
 is_running() { [ -f "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null; }
 
-start_chrome() {
+has_supervisor() {
+    [ -f "$FOREGROUND_PID_FILE" ] && kill -0 "$(cat "$FOREGROUND_PID_FILE")" 2>/dev/null
+}
+
+start_browser() {
+    if is_running "$CHROME_PID_FILE"; then
+        echo "browser already running (pid $(cat "$CHROME_PID_FILE"))"
+        return 0
+    fi
+    if [ ! -e "$CHROME_ARGS_FILE" ]; then
+        # No args file at all means nobody ran `chrome [args]` or
+        # `chrome start [args]` to set up the launch context. An empty
+        # file is fine (just means no chrome flags were given).
+        echo "error: no saved args; run 'chrome [...args]' or 'chrome start [...args]' first" >&2
+        return 1
+    fi
+    load_args
     ulimit -c 0
-    chrome-launcher "$@" &
+    chrome-launcher "${LOADED_ARGS[@]}" &
     echo $! > "$CHROME_PID_FILE"
-    echo "chrome started (pid $!)"
+    echo "browser started (pid $!)"
 }
 
 start_bridge() {
+    if is_running "$BRIDGE_PID_FILE"; then
+        echo "bridge already running (pid $(cat "$BRIDGE_PID_FILE"))"
+        return 0
+    fi
     cd "$BRIDGE_DIR"
     ulimit -c 0
     node server.mjs &
@@ -49,34 +84,119 @@ start_bridge() {
     echo "bridge started (pid $!)"
 }
 
-stop_all() {
-    if [ -f "$BRIDGE_PID_FILE" ]; then
-        kill "$(cat "$BRIDGE_PID_FILE")" 2>/dev/null
-        rm -f "$BRIDGE_PID_FILE"
-    else
-        pkill -f "browser-bridge/server.mjs" 2>/dev/null
-    fi
+stop_browser() {
     if [ -f "$CHROME_PID_FILE" ]; then
         kill "$(cat "$CHROME_PID_FILE")" 2>/dev/null
         rm -f "$CHROME_PID_FILE"
     else
         pkill -f "chrome-raw" 2>/dev/null
     fi
+}
+
+stop_bridge() {
+    if [ -f "$BRIDGE_PID_FILE" ]; then
+        kill "$(cat "$BRIDGE_PID_FILE")" 2>/dev/null
+        rm -f "$BRIDGE_PID_FILE"
+    else
+        pkill -f "browser-bridge/server.mjs" 2>/dev/null
+    fi
+}
+
+stop_all() {
+    stop_bridge
+    stop_browser
     echo "stopped"
 }
 
+restart_browser() {
+    stop_browser
+    sleep 0.5
+    start_browser
+}
+
+restart_bridge() {
+    stop_bridge
+    sleep 0.5
+    start_bridge
+}
+
+# Supervisor signal handler: dispatched on SIGUSR1.
+# Reads SUPERVISOR_CMD_FILE to determine which action to take; the file
+# is consumed (deleted) so a missing/stale signal is a no-op.
+handle_supervisor_cmd() {
+    [ -f "$SUPERVISOR_CMD_FILE" ] || return
+    local cmd
+    cmd=$(cat "$SUPERVISOR_CMD_FILE")
+    rm -f "$SUPERVISOR_CMD_FILE"
+    case "$cmd" in
+        start-browser)   start_browser ;;
+        stop-browser)    stop_browser ;;
+        restart-browser) restart_browser ;;
+        start-bridge)    start_bridge ;;
+        stop-bridge)     stop_bridge ;;
+        restart-bridge)  restart_bridge ;;
+        *) echo "supervisor: unknown command '$cmd'" >&2 ;;
+    esac
+}
+
+# Universal per-component dispatcher. If a foreground supervisor is
+# running, hand the action off to it via signal so child PIDs are owned
+# by the supervisor and survive long-lived backgrounding. Otherwise run
+# the action in this process directly. Callers (CLI users, server.mjs)
+# don't need to know which mode the container started in.
+dispatch() {
+    local cmd="$1"
+    if has_supervisor; then
+        echo "$cmd" > "$SUPERVISOR_CMD_FILE"
+        kill -USR1 "$(cat "$FOREGROUND_PID_FILE")"
+    else
+        case "$cmd" in
+            start-browser)   start_browser ;;
+            stop-browser)    stop_browser ;;
+            restart-browser) restart_browser ;;
+            start-bridge)    start_bridge ;;
+            stop-bridge)     stop_bridge ;;
+            restart-bridge)  restart_bridge ;;
+        esac
+    fi
+}
+
+run_foreground_supervisor() {
+    echo $$ > "$FOREGROUND_PID_FILE"
+    save_args "$@"
+    start_browser
+    start_bridge
+    trap 'stop_all; rm -f "$FOREGROUND_PID_FILE" "$SUPERVISOR_CMD_FILE"; exit 0' TERM INT
+    trap 'handle_supervisor_cmd' USR1
+    # `sleep & wait` is the canonical pattern for sleeping while
+    # remaining responsive to traps — bash interrupts `wait` on
+    # signal delivery and re-enters the loop.
+    while true; do sleep 86400 & wait; done
+}
+
 case "$1" in
-    start-detached)
+    start)
+        # Background supervisor: detach a new instance of this script with
+        # the same args. The detached subshell re-enters via the catch-all
+        # branch below, becomes the foreground supervisor in its own
+        # process group, and runs forever until killed.
         shift
         save_args "$@"
-        start_chrome "$@"
-        start_bridge
+        nohup setsid "$0" "$@" >/dev/null 2>&1 < /dev/null &
+        disown
+        # Give the detached supervisor a moment to write FOREGROUND_PID_FILE
+        # so subsequent commands can find it.
+        sleep 0.3
+        if has_supervisor; then
+            echo "started in background (supervisor pid $(cat "$FOREGROUND_PID_FILE"))"
+        else
+            echo "warning: supervisor did not register a PID file in time" >&2
+        fi
         ;;
     restart)
         stop_all
         sleep 1
-        load_args
-        start_chrome "${LOADED_ARGS[@]}"
+        start_browser
         start_bridge
         ;;
     stop)
@@ -85,26 +205,26 @@ case "$1" in
             kill -TERM "$(cat "$FOREGROUND_PID_FILE")" 2>/dev/null
         fi
         ;;
+    start-browser|stop-browser|restart-browser|start-bridge|stop-bridge|restart-bridge)
+        dispatch "$1"
+        ;;
     -h|--help|help)
-        echo "Usage: chrome [...chrome-args]"
-        echo "       chrome start-detached [...chrome-args]"
-        echo "       chrome restart"
-        echo "       chrome stop"
+        echo "Usage: chrome [...chrome-args]                  (foreground supervisor)"
+        echo "       chrome start [...chrome-args]            (background supervisor)"
+        echo "       chrome restart                           (restart both)"
+        echo "       chrome stop                              (stop both + exit supervisor)"
+        echo "       chrome {start|stop|restart}-browser      (chrome only; auto-detects FG/BG)"
+        echo "       chrome {start|stop|restart}-bridge       (bridge only; auto-detects FG/BG)"
         ;;
     *)
-        # --* flags: start bridge, then exec into chrome-launcher (puppeteer/playwright executablePath)
+        # Puppeteer/playwright executablePath compat: --* flags as first
+        # arg → start the bridge in the background, then exec into the
+        # chrome binary directly so callers' PID accounting works.
         if [ $# -gt 0 ] && [[ "$1" == --* ]]; then
             save_args "$@"
             start_bridge
             exec chrome-launcher "$@"
         fi
-
-        # Foreground mode: start both, block until signal
-        echo $$ > "$FOREGROUND_PID_FILE"
-        save_args "$@"
-        start_chrome "$@"
-        start_bridge
-        trap 'stop_all; rm -f "$FOREGROUND_PID_FILE"; exit 0' TERM INT
-        while true; do sleep 86400 & wait; done
+        run_foreground_supervisor "$@"
         ;;
 esac

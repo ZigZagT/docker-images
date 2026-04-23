@@ -20,7 +20,7 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { WebSocketServer, WebSocket } from 'ws';
-import { createMcpHandler, getMcpState, noteTabClosed, onMcpStateChange, clearAttention } from './mcp.mjs';
+import { createMcpHandler, getMcpState, noteTabClosed, onMcpStateChange, clearAttention, pruneStaleTabs } from './mcp.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -33,6 +33,18 @@ const VIEWPORT_HEIGHT = parseInt(process.env.VIEWPORT_HEIGHT || '1080', 10);
 
 const HTML_PATH = path.join(path.dirname(new URL(import.meta.url).pathname), 'index.html');
 const CHROME_CMD = '/usr/local/bin/chrome';
+
+// All process control goes through `chrome <subcommand>`. The chrome
+// script is the universal interface and handles FG/BG dispatch itself
+// (signal to supervisor when one exists, direct exec otherwise) — the
+// bridge doesn't care which mode the container started in.
+function runChromeCommand(cmd, opts = {}) {
+  // Detached + unref so the child outlives the bridge process. This
+  // matters for restart-bridge: the supervisor will SIGTERM us, and the
+  // detached child needs to deliver the signal+cmd before we die.
+  const child = execFile(CHROME_CMD, [cmd], { detached: true, stdio: 'ignore', ...opts });
+  child.unref();
+}
 
 const LOG_LEVELS = { error: 0, info: 1, debug: 2 };
 const LOG_LEVEL = LOG_LEVELS[process.env.BRIDGE_LOG || 'info'] ?? LOG_LEVELS.info;
@@ -337,36 +349,45 @@ async function readExtensionIcon(extPath, manifest) {
 
 async function ensureProfileDir() {
   if (profileDir) return;
-  // Discover profile dir from Chrome's /json/version endpoint instead of
-  // creating a helper tab. The userDataDir field in /json/version gives
-  // the base path; the profile is typically "Default" under it.
+  // Ask Chrome itself. /json/version doesn't carry userDataDir (Chrome 147)
+  // and Browser.getBrowserCommandLine requires --enable-automation, which
+  // would set navigator.webdriver=true and defeat bot-detection stealth.
+  // chrome://version's #command_line element is the only stealth-safe path.
+  // Open it as a background CDP target (no focus shift, no page revert),
+  // parse the path, close. Cached for the session lifetime.
+  let targetId = null;
+  let sessionId = null;
   try {
-    const version = await cdpFetch('/json/version');
-    // Chrome exposes userDataDir in the version endpoint on some builds.
-    // Fall back to scanning common paths.
-    if (version.userDataDir) {
-      const defaultProfile = path.join(version.userDataDir, 'Default');
-      try {
-        await fs.promises.access(path.join(defaultProfile, 'Preferences'));
-        profileDir = defaultProfile;
-        log.debug('discovered profile dir from /json/version:', profileDir);
-        return;
-      } catch {}
+    const create = await browserCommand('Target.createTarget', {
+      url: 'chrome://version', background: true
+    });
+    if (create.error) throw new Error(create.error.message);
+    targetId = create.result.targetId;
+    sessionId = await attachToTarget(targetId);
+    // chrome://version is local — load is fast. Poll the DOM rather than
+    // wiring Page.loadEventFired so we don't need to enable Page domain.
+    let cmdline = null;
+    for (let i = 0; i < 20; i++) {
+      const r = await sessionCommand(sessionId, 'Runtime.evaluate', {
+        expression: '(document.getElementById("command_line")||{}).textContent || ""',
+        returnByValue: true
+      });
+      if (r.result?.result?.value) { cmdline = r.result.result.value; break; }
+      await new Promise(res => setTimeout(res, 50));
     }
-    // Fall back: scan for scoped_dir pattern used by headless Chrome
-    const tmpDirs = await fs.promises.readdir('/tmp').catch(() => []);
-    for (const d of tmpDirs) {
-      if (d.startsWith('org.chromium.Chromium')) {
-        const candidate = path.join('/tmp', d, 'Default');
-        try {
-          await fs.promises.access(path.join(candidate, 'Preferences'));
-          profileDir = candidate;
-          log.debug('discovered profile dir from /tmp scan:', profileDir);
-          return;
-        } catch {}
-      }
-    }
-  } catch {}
+    if (!cmdline) throw new Error('chrome://version #command_line empty');
+    const m = cmdline.match(/--user-data-dir=(\S+)/);
+    if (!m) throw new Error('--user-data-dir not in command line');
+    const candidate = path.join(m[1], 'Default');
+    await fs.promises.access(path.join(candidate, 'Preferences'));
+    profileDir = candidate;
+    log.debug('discovered profile dir from chrome://version:', profileDir);
+  } catch (err) {
+    log.error('ensureProfileDir failed:', err.message);
+  } finally {
+    if (sessionId) detachSession(sessionId);
+    if (targetId) browserCommand('Target.closeTarget', { targetId }).catch(() => {});
+  }
 }
 
 async function getExtensionInfo() {
@@ -1025,11 +1046,19 @@ async function reconcileTabsGlobal() {
       lastKnownOrder = newOrder;
     }
 
+    // Per-tab MCP metadata must be on every tabs payload — see the
+    // matching overlay in scheduleTabBroadcast. Forgetting it here was a
+    // real bug: a single tab destruction triggered a reconcile broadcast
+    // that wiped mcpOwned/attention from the viewer until the next
+    // unrelated event re-broadcast with the full payload.
+    const mcpState = getMcpState();
     const freshPages = pages.map(t => ({
       id: t.id, url: t.url, title: t.title,
-      active: t.id === activeTargetId
+      active: t.id === activeTargetId,
+      mcpOwned: !!mcpState.owned[t.id],
+      attention: mcpState.attention[t.id] || null,
     }));
-    broadcastToViewers({ type: 'tabs', tabs: freshPages });
+    broadcastToViewers({ type: 'tabs', tabs: freshPages, mcpLimits: mcpState.limits });
   } catch (err) {
     log.error('reconcileTabsGlobal error:', err.message);
   }
@@ -1047,6 +1076,21 @@ function reconnectToBrowser() {
         await ensureBrowserConnection();
         const targets = await getCdpTargets();
         const pages = targets.filter(t => t.type === 'page');
+        // After a chrome restart every targetId is brand-new — drop
+        // stale MCP-owned / attention tracking so counts stay consistent
+        // and the FIFO cap doesn't get pinned by entries no chrome
+        // process can match.
+        pruneStaleTabs(pages.map(p => p.id));
+        // Invalidate disk-backed caches. Between WS-close and this
+        // reconnect, getProfileStatus/getExtensions may have been called
+        // (e.g. on a viewer refresh during the gap) and cached an empty
+        // fallback against a dead chrome. Without this clear, that empty
+        // value would survive for the full TTL and the viewer would
+        // show "no avatar / no extensions" until it eventually expired.
+        profileCache = null;
+        profileCacheTime = 0;
+        extensionCache = null;
+        extensionPrefsMtimeMs = 0;
         for (const page of pages) {
           await poolAttach(page.id).catch(err =>
             log.error('reconnectToBrowser poolAttach failed:', err.message));
@@ -1642,15 +1686,11 @@ viewerWss.on('connection', async (client, req) => {
           zoomScriptId = null;
           browserExplicitlyStopped = true;
           if (browserWs) { browserWs.close(); browserWs = null; }
-          try {
-            await execFileAsync(CHROME_CMD, ['stop'], { timeout: 15000 }).catch(() => {});
-            await execFileAsync(CHROME_CMD, ['start-detached'], { timeout: 15000 });
-            browserExplicitlyStopped = false;
-            reconnectToBrowser();
-          } catch (err) {
-            browserExplicitlyStopped = false;
-            broadcastToViewers({ type: 'error', message: 'Browser restart failed: ' + err.message });
-          }
+          runChromeCommand('restart-browser');
+          browserExplicitlyStopped = false;
+          // chrome script needs a moment to kill + respawn chrome before
+          // the new CDP endpoint is reachable.
+          setTimeout(() => reconnectToBrowser(), 1500);
           break;
 
         case 'browserStop':
@@ -1661,33 +1701,23 @@ viewerWss.on('connection', async (client, req) => {
           zoomScriptId = null;
           browserExplicitlyStopped = true;
           if (browserWs) { browserWs.close(); browserWs = null; }
-          try {
-            await execFileAsync(CHROME_CMD, ['stop'], { timeout: 15000 });
-            broadcastToViewers({ type: 'browserStopped' });
-          } catch (err) {
-            broadcastToViewers({ type: 'error', message: 'Browser stop failed: ' + err.message });
-          }
+          runChromeCommand('stop-browser');
+          broadcastToViewers({ type: 'browserStopped' });
           break;
 
         case 'browserStart':
           broadcastToViewers({ type: 'status', message: 'Starting browser...' });
           browserExplicitlyStopped = false;
-          try {
-            await execFileAsync(CHROME_CMD, ['start-detached'], { timeout: 15000 });
-            reconnectToBrowser();
-          } catch (err) {
-            broadcastToViewers({ type: 'error', message: 'Browser start failed: ' + err.message });
-          }
+          runChromeCommand('start-browser');
+          setTimeout(() => reconnectToBrowser(), 1500);
           break;
 
         case 'bridgeRestart': {
+          // Bridge-only restart: chrome and all open tabs preserved.
+          // The chrome script will SIGTERM us shortly; the new bridge it
+          // spawns reconnects to the still-running chrome.
           broadcastToViewers({ type: 'error', message: 'Restarting bridge...' });
-          setTimeout(() => {
-            const child = execFile(CHROME_CMD, ['restart'], {
-              detached: true, stdio: 'ignore'
-            });
-            child.unref();
-          }, 500);
+          setTimeout(() => runChromeCommand('restart-bridge'), 500);
           break;
         }
 

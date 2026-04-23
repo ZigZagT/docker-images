@@ -17,6 +17,36 @@ if [ -n "$CHROME_USER_DATA_DIR" ]; then
     mkdir -p "$CHROME_USER_DATA_DIR"
     profile_flag+=(--user-data-dir="$CHROME_USER_DATA_DIR")
     echo "chrome-launcher: persisting profile at $CHROME_USER_DATA_DIR" >&2
+    # Clear stale Singleton{Lock,Socket,Cookie} symlinks. Chrome writes
+    # these as `<hostname>-<pid>` to refuse a second chromium against the
+    # same profile. Across container restarts the hostname changes
+    # (default docker behaviour) and on a fresh container an unrelated
+    # process may inherit the old PID, so chrome misreads the lock as
+    # "another computer is using this profile" or "PID still alive" and
+    # refuses to launch. We're the only chromium in this container by
+    # design, so clearing the lock is safe.
+    rm -f "$CHROME_USER_DATA_DIR/SingletonLock" \
+          "$CHROME_USER_DATA_DIR/SingletonSocket" \
+          "$CHROME_USER_DATA_DIR/SingletonCookie"
+    # Suppress the "Restore Pages?" crash bubble: when we kill chrome
+    # (SIGTERM during restart-browser, container shutdown, etc.) it marks
+    # exit_type=Crashed, and on next boot Chrome prompts instead of
+    # honouring the user's "Continue where you left off" setting. The
+    # prompt requires a real click — there's no human-in-the-loop in
+    # headless. Resetting exit_type to "Normal" makes Chrome auto-act on
+    # whatever startup behaviour the user configured (NTP, restore, list
+    # of pages — all respected). We DON'T touch session.restore_on_startup
+    # so the user's chrome://settings choice is the source of truth.
+    PREFS="$CHROME_USER_DATA_DIR/Default/Preferences"
+    if [ -f "$PREFS" ]; then
+        tmp=$(mktemp)
+        if jq '.profile.exit_type = "Normal"
+               | .profile.exited_cleanly = true' "$PREFS" > "$tmp" 2>/dev/null; then
+            mv "$tmp" "$PREFS"
+        else
+            rm -f "$tmp"
+        fi
+    fi
 fi
 
 UA_FILE="/usr/local/etc/chrome-ua"

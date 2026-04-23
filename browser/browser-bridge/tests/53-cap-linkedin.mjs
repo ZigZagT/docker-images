@@ -46,27 +46,36 @@ await call('browser_wait_for', {
   timeoutMs: 15000,
 });
 
-const probe = await call('browser_evaluate', {
+// `call` already auto-parses JSON returned by browser_evaluate, so the
+// returned value is the object — not a string to JSON.parse again.
+const p = await call('browser_evaluate', {
   tabId,
   expression: 'JSON.stringify({title: document.title, jobCount: document.querySelectorAll("a[href*=\'/jobs/view/\']").length, hasModal: !!document.querySelector("[role=dialog]")})',
 });
-const p = JSON.parse(probe);
 if (p.jobCount < 10) fail('cap-linkedin', 'expected ≥10 job links, got ' + p.jobCount);
 
-// If the join-now dialog popped, dismiss it before snapshotting.
-if (p.hasModal) {
-  const snap = await call('browser_get_snapshot', { tabId });
-  const dismissUid = findUid(snap, 'button', /^Dismiss$/);
-  if (dismissUid) {
-    await call('browser_click', { tabId, uid: dismissUid });
-    await delay(800);
-  }
+// LinkedIn's "Join now to view more jobs" modal can pop at any point —
+// before or after the initial probe. Always try to dismiss it right
+// before the final snapshot. The modal completely dominates the
+// accessibility tree (a [role=dialog] with [focused]) and hides the
+// job list, so a leftover modal causes spurious "no headings" fails.
+let finalSnap = await call('browser_get_snapshot', { tabId });
+let dismissUid = findUid(finalSnap, 'button', /^Dismiss$/);
+if (dismissUid) {
+  await call('browser_click', { tabId, uid: dismissUid });
+  await delay(800);
+  finalSnap = await call('browser_get_snapshot', { tabId });
 }
 
-const finalSnap = await call('browser_get_snapshot', { tabId });
-const headingCount = (String(finalSnap).match(/\] heading "Software Engineer/g) || []).length;
+// Job titles vary heavily ("Software Engineer III", "Sr. SWE", "Backend
+// Engineer", "Full Stack Developer", etc). Verify the snapshot has some
+// headings (job cards) and that engineer-adjacent terms are present.
+const headingCount = (String(finalSnap).match(/\] heading/g) || []).length;
 if (headingCount < 5) {
-  fail('cap-linkedin', 'snapshot has too few Software Engineer headings: ' + headingCount);
+  fail('cap-linkedin', 'snapshot has too few headings: ' + headingCount);
+}
+if (!/engineer|developer|swe|programmer/i.test(finalSnap)) {
+  fail('cap-linkedin', 'snapshot has no engineer/developer/swe terms — search context lost');
 }
 
 await call('browser_close_tab', { tabId });

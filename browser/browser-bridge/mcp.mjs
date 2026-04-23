@@ -60,6 +60,25 @@ export function noteTabClosed(targetId) {
   if (changed) notifyStateChanged();
 }
 
+// Drop tracking for any targetId no longer present in the live browser
+// (e.g. after a chrome restart, where every targetId is fresh and the
+// old in-memory MCP-owned/attention map would otherwise leak entries
+// forever, miscounting against the FIFO cap and breaking ownership UX).
+export function pruneStaleTabs(liveTargetIds) {
+  const live = new Set(liveTargetIds);
+  let changed = false;
+  for (const id of mcpOwnedTabs.keys()) {
+    if (!live.has(id)) { mcpOwnedTabs.delete(id); changed = true; }
+  }
+  for (const id of attentionRequests.keys()) {
+    if (!live.has(id)) { attentionRequests.delete(id); changed = true; }
+  }
+  for (const id of tabSnapshots.keys()) {
+    if (!live.has(id)) tabSnapshots.delete(id);
+  }
+  if (changed) notifyStateChanged();
+}
+
 // Used by the viewer's "dismiss" button on the attention floating box.
 // Equivalent to browser_dismiss_attention but originates from the human,
 // not the agent — server-side state is the same either way.
@@ -1003,26 +1022,20 @@ const TOOLS = [
         backendNodeId = snap.idToBackend.get(String(uid));
         if (backendNodeId === undefined) throw new Error('uid ' + uid + ' not in current snapshot');
       } else {
-        // Selector path — resolve to nodeId. Note: DOM.scrollIntoViewIfNeeded
-        // accepts either nodeId OR backendNodeId, so we convert via DOM.requestNode.
+        // Selector path — resolve to a Runtime objectId, then pass that
+        // straight to DOM.scrollIntoViewIfNeeded (it accepts nodeId,
+        // backendNodeId, OR objectId per CDP spec). The earlier
+        // DOM.requestNode bounce was both unnecessary and unreliable
+        // because requestNode requires DOM.getDocument to have populated
+        // the inspector tree first.
         const isXpath = selector.startsWith('/') || selector.startsWith('(/');
-        let objId;
-        if (isXpath) {
-          const ev = await d.sessionCommand(entry.sessionId, 'Runtime.evaluate', {
-            expression: `(() => { const r = document.evaluate(${JSON.stringify(selector)}, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null); return r.singleNodeValue; })()`,
-          });
-          objId = ev.result?.result?.objectId;
-          if (!objId) throw new Error('no element matches: ' + selector);
-        } else {
-          const ev = await d.sessionCommand(entry.sessionId, 'Runtime.evaluate', {
-            expression: `document.querySelector(${JSON.stringify(selector)})`,
-          });
-          objId = ev.result?.result?.objectId;
-          if (!objId) throw new Error('no element matches: ' + selector);
-        }
-        const reqNode = await d.sessionCommand(entry.sessionId, 'DOM.requestNode', { objectId: objId });
-        if (!reqNode.result?.nodeId) throw new Error('failed to resolve to nodeId: ' + selector);
-        const r = await d.sessionCommand(entry.sessionId, 'DOM.scrollIntoViewIfNeeded', { nodeId: reqNode.result.nodeId });
+        const expr = isXpath
+          ? `(() => { const r = document.evaluate(${JSON.stringify(selector)}, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null); return r.singleNodeValue; })()`
+          : `document.querySelector(${JSON.stringify(selector)})`;
+        const ev = await d.sessionCommand(entry.sessionId, 'Runtime.evaluate', { expression: expr });
+        const objId = ev.result?.result?.objectId;
+        if (!objId) throw new Error('no element matches: ' + selector);
+        const r = await d.sessionCommand(entry.sessionId, 'DOM.scrollIntoViewIfNeeded', { objectId: objId });
         if (r.error) throw new Error(r.error.message);
         const result = { tabId, selector, scrolled: true };
         if (includeSnapshot) result.snapshot = await buildAndStoreSnapshot(d, tabId);

@@ -33,11 +33,11 @@ await call('browser_wait_for', {
   timeoutMs: 20000,
 });
 
-const probe = await call('browser_evaluate', {
+// `call` already auto-parses JSON returned by browser_evaluate.
+const p = await call('browser_evaluate', {
   tabId,
   expression: 'JSON.stringify({title: document.title.slice(0,80), productCount: document.querySelectorAll("a[href*=\'/item/\']").length, captcha: !!document.querySelector("[id*=captcha], [class*=slidetounlock]"), firstHref: document.querySelector("a[href*=\'/item/\']")?.href})',
 });
-const p = JSON.parse(probe);
 if (p.captcha) fail('cap-aliexpress', 'AliExpress served captcha — stealth setup may have regressed');
 if (p.productCount < 5) fail('cap-aliexpress', 'expected ≥5 products, got ' + p.productCount);
 if (!p.firstHref) fail('cap-aliexpress', 'no product href');
@@ -46,17 +46,19 @@ if (!p.firstHref) fail('cap-aliexpress', 'no product href');
 const itemMatch = p.firstHref.match(/\/item\/(\d+)\.html/);
 if (!itemMatch) fail('cap-aliexpress', 'product href shape unexpected: ' + p.firstHref);
 await call('browser_navigate', { tabId, url: 'https://www.aliexpress.com/item/' + itemMatch[1] + '.html' });
+// Wait until the product page is more than just shell — body text and a
+// recognisable currency symbol both present. AliExpress lazy-loads the
+// price block, so just innerText.length isn't enough.
 await call('browser_wait_for', {
   tabId,
-  expression: 'document.body.innerText.length > 1000',
-  timeoutMs: 15000,
+  expression: 'document.body.innerText.length > 1000 && /(US\\s*\\$|CDN\\s*\\$|€|£|¥|\\$\\s?\\d)/.test(document.body.innerText)',
+  timeoutMs: 25000,
 });
 
-const detail = await call('browser_evaluate', {
+const d = await call('browser_evaluate', {
   tabId,
-  expression: 'JSON.stringify({url: location.href, hasPriceText: /\\$\\d|CDN|US\\s*\\$|€\\d/.test(document.body.innerText)})',
+  expression: 'JSON.stringify({url: location.href, hasPriceText: /(US\\s*\\$|CDN\\s*\\$|€\\s*\\d|£\\s*\\d|¥\\s*\\d|\\$\\s?\\d)/.test(document.body.innerText)})',
 });
-const d = JSON.parse(detail);
 if (!d.url.includes('/item/')) fail('cap-aliexpress', 'product url not /item/...');
 if (!d.hasPriceText) fail('cap-aliexpress', 'product page has no price text');
 
