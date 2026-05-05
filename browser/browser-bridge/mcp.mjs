@@ -1173,6 +1173,321 @@ const TOOLS = [
       return text(JSON.stringify({ tabId, cleared: had, attentionCount: attentionRequests.size }, null, 2));
     },
   },
+
+  // --- Dev mode tools ---
+
+  {
+    name: 'browser_set_dev_mode',
+    description:
+      'Toggle dev mode on a tab. When enabled, activates Runtime/Log/Network CDP domains on the ' +
+      'tab\'s session, unlocking browser_get_console_logs, browser_get_network_requests, ' +
+      'browser_get_network_response, browser_get_popup_log, browser_set_dialog_handler, ' +
+      'browser_get_pending_dialog, browser_handle_dialog, browser_list_frames, and browser_navigate_frame.\n\n' +
+      'Dev mode breaks stealth — the enabled CDP domains are detectable by pages. Only use on ' +
+      'tabs where observability matters more than stealth.\n\n' +
+      'Returns: { tabId, devMode: true/false }.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'string' },
+        enabled: { type: 'boolean', description: 'true to enable, false to disable.' },
+      },
+      required: ['tabId', 'enabled'],
+    },
+    async run({ tabId, enabled }, d) {
+      await d.poolAttach(tabId);
+      const entry = d.sessionPool.get(tabId);
+      if (!entry) throw new Error('tab not found: ' + tabId);
+
+      if (enabled && !devModeTabs.has(tabId)) {
+        await d.sessionCommand(entry.sessionId, 'Runtime.enable');
+        await d.sessionCommand(entry.sessionId, 'Log.enable');
+        await d.sessionCommand(entry.sessionId, 'Network.enable');
+        // Popup tracking: inject binding + window.open wrapper
+        await d.sessionCommand(entry.sessionId, 'Runtime.addBinding', { name: '__devPopup' });
+        const scriptResp = await d.sessionCommand(entry.sessionId, 'Page.addScriptToEvaluateOnNewDocument', {
+          source: `(function(){if(window.__devPopupPatched)return;window.__devPopupPatched=true;const o=window.open;window.open=function(u,t,f){const r=o.call(this,u,t,f);try{__devPopup(JSON.stringify({url:u||'',target:t||'',features:f||'',blocked:!r}))}catch(e){}return r}})()`,
+        });
+        const popupScriptId = scriptResp?.result?.identifier || null;
+        // Also run the patch on the current page immediately
+        await d.sessionCommand(entry.sessionId, 'Runtime.evaluate', {
+          expression: `(function(){if(window.__devPopupPatched)return;window.__devPopupPatched=true;const o=window.open;window.open=function(u,t,f){const r=o.call(this,u,t,f);try{__devPopup(JSON.stringify({url:u||'',target:t||'',features:f||'',blocked:!r}))}catch(e){}return r}})()`,
+        }).catch(() => {});
+
+        devModeTabs.set(tabId, {
+          consoleLogs: [],
+          networkRequests: new Map(),
+          networkBodies: new Map(),
+          popupLog: [],
+          dialogHandler: 'manual',
+          pendingDialog: null,
+          popupScriptId,
+        });
+        notifyStateChanged();
+      } else if (!enabled && devModeTabs.has(tabId)) {
+        const state = devModeTabs.get(tabId);
+        if (state.popupScriptId) {
+          await d.sessionCommand(entry.sessionId, 'Page.removeScriptToEvaluateOnNewDocument', {
+            identifier: state.popupScriptId,
+          }).catch(() => {});
+        }
+        await d.sessionCommand(entry.sessionId, 'Runtime.disable').catch(() => {});
+        await d.sessionCommand(entry.sessionId, 'Log.disable').catch(() => {});
+        await d.sessionCommand(entry.sessionId, 'Network.disable').catch(() => {});
+        devModeTabs.delete(tabId);
+        notifyStateChanged();
+      }
+
+      return text(JSON.stringify({ tabId, devMode: !!enabled }, null, 2));
+    },
+  },
+
+  {
+    name: 'browser_get_console_logs',
+    description:
+      'Retrieve captured console output and page errors for a dev-mode tab. Returns entries since ' +
+      '`since` timestamp (ms epoch, optional — omit for all buffered). Ring buffer holds up to ' +
+      DEV_LOG_CAP + ' entries.\n\n' +
+      'Each entry: { type, level, text, source?, line?, col?, ts }. Requires dev mode.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'string' },
+        since: { type: 'number', description: 'Only return entries after this timestamp (ms epoch). Optional.' },
+        clear: { type: 'boolean', description: 'Clear the buffer after reading. Default false.' },
+      },
+      required: ['tabId'],
+    },
+    async run({ tabId, since, clear }, _d) {
+      const state = requireDevMode(tabId);
+      let logs = state.consoleLogs;
+      if (since) logs = logs.filter(e => e.ts > since);
+      const result = { tabId, entries: logs, total: state.consoleLogs.length, returned: logs.length };
+      if (clear) state.consoleLogs = [];
+      return text(JSON.stringify(result, null, 2));
+    },
+  },
+
+  {
+    name: 'browser_set_dialog_handler',
+    description:
+      'Set how a dev-mode tab handles JavaScript dialogs (alert/confirm/prompt). Modes:\n' +
+      '- "manual" (default): dialog stays open until you call browser_handle_dialog.\n' +
+      '- "auto-accept": automatically accept (confirm→true, prompt→defaultValue).\n' +
+      '- "auto-dismiss": automatically dismiss (confirm→false, prompt→cancel).\n\n' +
+      'Requires dev mode.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'string' },
+        mode: { type: 'string', enum: ['manual', 'auto-accept', 'auto-dismiss'] },
+      },
+      required: ['tabId', 'mode'],
+    },
+    async run({ tabId, mode }, _d) {
+      const state = requireDevMode(tabId);
+      state.dialogHandler = mode;
+      return text(JSON.stringify({ tabId, dialogHandler: mode }, null, 2));
+    },
+  },
+
+  {
+    name: 'browser_get_pending_dialog',
+    description:
+      'Check if a dev-mode tab has a pending (unhandled) JavaScript dialog. Returns null if no dialog ' +
+      'is open, or { type, message, defaultPrompt, url, ts } if one is waiting.\n\n' +
+      'Requires dev mode with dialogHandler set to "manual".',
+    inputSchema: {
+      type: 'object',
+      properties: { tabId: { type: 'string' } },
+      required: ['tabId'],
+    },
+    async run({ tabId }, _d) {
+      const state = requireDevMode(tabId);
+      return text(JSON.stringify({ tabId, pendingDialog: state.pendingDialog }, null, 2));
+    },
+  },
+
+  {
+    name: 'browser_handle_dialog',
+    description:
+      'Accept or dismiss a pending JavaScript dialog on a dev-mode tab. Only works when ' +
+      'dialogHandler is "manual" and a dialog is pending.\n\n' +
+      'For prompt dialogs, pass promptText to fill the input before accepting.\n\n' +
+      'Requires dev mode.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'string' },
+        accept: { type: 'boolean', description: 'true to accept, false to dismiss.' },
+        promptText: { type: 'string', description: 'Text for prompt dialogs (ignored for alert/confirm).' },
+      },
+      required: ['tabId', 'accept'],
+    },
+    async run({ tabId, accept, promptText }, d) {
+      const state = requireDevMode(tabId);
+      if (!state.pendingDialog) throw new Error('no pending dialog on tab ' + tabId);
+      await d.poolAttach(tabId);
+      const entry = d.sessionPool.get(tabId);
+      if (!entry) throw new Error('tab not found: ' + tabId);
+      const params = { accept };
+      if (promptText !== undefined) params.promptText = promptText;
+      const r = await d.sessionCommand(entry.sessionId, 'Page.handleJavaScriptDialog', params);
+      if (r.error) throw new Error(r.error.message);
+      const handled = state.pendingDialog;
+      state.pendingDialog = null;
+      return text(JSON.stringify({ tabId, handled: handled.type, accept }, null, 2));
+    },
+  },
+
+  {
+    name: 'browser_get_popup_log',
+    description:
+      'Retrieve the log of window.open() attempts on a dev-mode tab. Each entry records the URL, ' +
+      'target, features, whether Chrome blocked it, and timestamp.\n\n' +
+      'Ring buffer holds up to ' + DEV_POPUP_CAP + ' entries. Requires dev mode.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'string' },
+        clear: { type: 'boolean', description: 'Clear the log after reading. Default false.' },
+      },
+      required: ['tabId'],
+    },
+    async run({ tabId, clear }, _d) {
+      const state = requireDevMode(tabId);
+      const entries = [...state.popupLog];
+      if (clear) state.popupLog = [];
+      return text(JSON.stringify({ tabId, entries, total: entries.length }, null, 2));
+    },
+  },
+
+  {
+    name: 'browser_get_network_requests',
+    description:
+      'List captured network requests for a dev-mode tab. Returns the most recent requests ' +
+      '(up to ' + DEV_NET_CAP + '). Optional filter narrows by URL substring, method, or status.\n\n' +
+      'Each entry: { requestId, url, method, type, status, mimeType, size, done, failed, errorText, ts }.\n\n' +
+      'Use requestId with browser_get_network_response to fetch the response body. Requires dev mode.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'string' },
+        filter: {
+          type: 'object',
+          properties: {
+            url: { type: 'string', description: 'URL substring match.' },
+            method: { type: 'string', description: 'HTTP method (GET, POST, etc.).' },
+            status: { type: 'integer', description: 'Exact status code match.' },
+          },
+        },
+      },
+      required: ['tabId'],
+    },
+    async run({ tabId, filter }, _d) {
+      const state = requireDevMode(tabId);
+      let entries = [...state.networkRequests.values()];
+      if (filter) {
+        if (filter.url) entries = entries.filter(e => e.url.includes(filter.url));
+        if (filter.method) entries = entries.filter(e => e.method === filter.method);
+        if (filter.status !== undefined) entries = entries.filter(e => e.status === filter.status);
+      }
+      return text(JSON.stringify({ tabId, requests: entries, total: entries.length }, null, 2));
+    },
+  },
+
+  {
+    name: 'browser_get_network_response',
+    description:
+      'Fetch the response body of a captured network request by requestId. Returns the body as text ' +
+      '(up to 1 MB; base64 for binary). The request must be complete (done:true).\n\n' +
+      'Requires dev mode.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'string' },
+        requestId: { type: 'string' },
+      },
+      required: ['tabId', 'requestId'],
+    },
+    async run({ tabId, requestId }, d) {
+      const state = requireDevMode(tabId);
+      const req = state.networkRequests.get(requestId);
+      if (!req) throw new Error('requestId not found: ' + requestId);
+      if (!req.done) throw new Error('request not complete yet — wait for it to finish');
+      await d.poolAttach(tabId);
+      const entry = d.sessionPool.get(tabId);
+      if (!entry) throw new Error('tab not found: ' + tabId);
+      const r = await d.sessionCommand(entry.sessionId, 'Network.getResponseBody', { requestId });
+      if (r.error) throw new Error(r.error.message);
+      const body = r.result?.body || '';
+      const base64 = r.result?.base64Encoded || false;
+      if (!base64 && body.length > 1_000_000) {
+        return text(JSON.stringify({ tabId, requestId, truncated: true, size: body.length, body: body.slice(0, 1_000_000) }, null, 2));
+      }
+      return text(JSON.stringify({ tabId, requestId, base64Encoded: base64, body }, null, 2));
+    },
+  },
+
+  {
+    name: 'browser_list_frames',
+    description:
+      'List all frames (main + iframes) in a dev-mode tab. Returns the frame tree with ' +
+      'frameId, url, name, and parentFrameId for each frame.\n\n' +
+      'Use frameId with browser_navigate_frame to navigate a specific iframe. Requires dev mode.',
+    inputSchema: {
+      type: 'object',
+      properties: { tabId: { type: 'string' } },
+      required: ['tabId'],
+    },
+    async run({ tabId }, d) {
+      requireDevMode(tabId);
+      await d.poolAttach(tabId);
+      const entry = d.sessionPool.get(tabId);
+      if (!entry) throw new Error('tab not found: ' + tabId);
+      const r = await d.sessionCommand(entry.sessionId, 'Page.getFrameTree');
+      if (r.error) throw new Error(r.error.message);
+      const frames = [];
+      function walk(node, parentId) {
+        const f = node.frame;
+        frames.push({
+          frameId: f.id,
+          url: f.url,
+          name: f.name || '',
+          parentFrameId: parentId,
+        });
+        for (const child of (node.childFrames || [])) walk(child, f.id);
+      }
+      walk(r.result.frameTree, null);
+      return text(JSON.stringify({ tabId, frames }, null, 2));
+    },
+  },
+
+  {
+    name: 'browser_navigate_frame',
+    description:
+      'Navigate a specific frame (iframe) within a dev-mode tab to a new URL. Identify the frame ' +
+      'by frameId from browser_list_frames.\n\n' +
+      'Requires dev mode.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'string' },
+        frameId: { type: 'string', description: 'Frame ID from browser_list_frames.' },
+        url: { type: 'string' },
+      },
+      required: ['tabId', 'frameId', 'url'],
+    },
+    async run({ tabId, frameId, url }, d) {
+      requireDevMode(tabId);
+      await d.poolAttach(tabId);
+      const entry = d.sessionPool.get(tabId);
+      if (!entry) throw new Error('tab not found: ' + tabId);
+      const r = await d.sessionCommand(entry.sessionId, 'Page.navigate', { url, frameId });
+      if (r.error) throw new Error(r.error.message);
+      return text(JSON.stringify({ tabId, frameId, url, navigated: true }, null, 2));
+    },
+  },
 ];
 
 // --- JSON-RPC dispatcher ---

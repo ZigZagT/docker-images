@@ -61,7 +61,12 @@ const expected = ['browser_list_tabs', 'browser_navigate', 'browser_open',
                   'browser_get_html', 'browser_click', 'browser_type',
                   'browser_press_key', 'browser_scroll', 'browser_scroll_into_view',
                   'browser_screenshot', 'browser_wait_for',
-                  'browser_set_attention', 'browser_dismiss_attention'];
+                  'browser_set_attention', 'browser_dismiss_attention',
+                  'browser_set_dev_mode', 'browser_get_console_logs',
+                  'browser_set_dialog_handler', 'browser_get_pending_dialog',
+                  'browser_handle_dialog', 'browser_get_popup_log',
+                  'browser_get_network_requests', 'browser_get_network_response',
+                  'browser_list_frames', 'browser_navigate_frame'];
 const got = (list.json?.result?.tools || []).map(t => t.name);
 for (const name of expected) {
   if (!got.includes(name)) fail('mcp-endpoint', 'missing tool: ' + name + '; have ' + got.join(','));

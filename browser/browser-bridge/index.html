@@ -92,6 +92,12 @@
     flex-shrink: 0;
     opacity: var(--attention-blink);
   }
+  .tab-devmode-icon {
+    font-size: 11px;
+    margin-right: 2px;
+    flex-shrink: 0;
+    opacity: 0.7;
+  }
   /* Floating attention box: appears overlaid on the viewer canvas ONLY
      when the currently-active tab has an attention request. Carries the
      agent's full instruction (multi-line). Positioned top-right so it
@@ -759,6 +765,19 @@ function updateTabEl(el, tab) {
     : (tab.url || '');
   if (el.title !== wantTitle) el.title = wantTitle;
 
+  // Wrench icon for dev-mode tabs
+  let wrenchEl = el.querySelector('.tab-devmode-icon');
+  if (tab.devMode) {
+    if (!wrenchEl) {
+      wrenchEl = document.createElement('span');
+      wrenchEl.className = 'tab-devmode-icon';
+      wrenchEl.textContent = '🔧';
+      el.insertBefore(wrenchEl, el.firstChild);
+    }
+  } else if (wrenchEl) {
+    wrenchEl.remove();
+  }
+
   // Blinking dot before the title when attention is set. The full
   // instruction text lives in the floating box (#attention-floating)
   // which only appears when this tab is the active one.
@@ -767,7 +786,9 @@ function updateTabEl(el, tab) {
     if (!dotEl) {
       dotEl = document.createElement('span');
       dotEl.className = 'tab-attention-dot';
-      el.insertBefore(dotEl, el.firstChild);
+      // Insert after wrench if present, otherwise at start
+      const ref = el.querySelector('.tab-devmode-icon');
+      el.insertBefore(dotEl, ref ? ref.nextSibling : el.firstChild);
     }
   } else if (dotEl) {
     dotEl.remove();

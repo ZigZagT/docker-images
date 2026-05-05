@@ -20,7 +20,7 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { WebSocketServer, WebSocket } from 'ws';
-import { createMcpHandler, getMcpState, noteTabClosed, onMcpStateChange, clearAttention, pruneStaleTabs } from './mcp.mjs';
+import { createMcpHandler, getMcpState, noteTabClosed, onMcpStateChange, clearAttention, pruneStaleTabs, isDevMode, devModeSessionHandler } from './mcp.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -167,6 +167,7 @@ function scheduleTabBroadcast() {
         id: t.id, url: t.url, title: t.title,
         active: t.id === activeTargetId,
         mcpOwned: !!mcpState.owned[t.id],
+        devMode: !!mcpState.devMode[t.id],
         attention: mcpState.attention[t.id] || null,
       }));
       broadcastToViewers({
@@ -725,6 +726,12 @@ async function poolAttach(targetId) {
   sessionPool.set(targetId, entry);
 
   await sessionCommand(sessionId, 'Page.enable').catch(() => {});
+  // Native <select> dropdowns are OS-level popup windows outside the compositor
+  // surface — invisible to Page.startScreencast. base-select renders them as
+  // DOM popovers in the top layer, making them part of the page surface.
+  await sessionCommand(sessionId, 'Page.addScriptToEvaluateOnNewDocument', {
+    source: '(()=>{const s=document.createElement("style");s.textContent="select,select::picker(select){appearance:base-select!important}";(document.head||document.documentElement).appendChild(s)})()',
+  }).catch(() => {});
   if (uaOverrideString && uaOverrideMetadata) {
     await sessionCommand(sessionId, 'Network.setUserAgentOverride', {
       userAgent: uaOverrideString,
@@ -795,6 +802,12 @@ function poolSessionHandler(targetId, entry, msg) {
         broadcastToViewers({ type: 'loading', loading: false });
       }
     }
+  }
+
+  // Dev mode event forwarding — routes Runtime/Log/Network/Page dialog events
+  // to mcp.mjs's per-tab ring buffers when this tab has dev mode active.
+  if (isDevMode(targetId)) {
+    devModeSessionHandler(targetId, msg, { sessionPool, sessionCommand });
   }
 
   // Session killed by Chrome (target crashed, etc.)
@@ -1056,6 +1069,7 @@ async function reconcileTabsGlobal() {
       id: t.id, url: t.url, title: t.title,
       active: t.id === activeTargetId,
       mcpOwned: !!mcpState.owned[t.id],
+      devMode: !!mcpState.devMode[t.id],
       attention: mcpState.attention[t.id] || null,
     }));
     broadcastToViewers({ type: 'tabs', tabs: freshPages, mcpLimits: mcpState.limits });
@@ -1337,6 +1351,7 @@ viewerWss.on('connection', async (client, req) => {
         id: t.id, url: t.url, title: t.title,
         active: t.id === activeTargetId,
         mcpOwned: !!mcpState.owned[t.id],
+        devMode: !!mcpState.devMode[t.id],
         attention: mcpState.attention[t.id] || null,
       }));
       clientSend({ type: 'tabs', tabs: tabPages, mcpLimits: mcpState.limits });
@@ -1504,7 +1519,7 @@ viewerWss.on('connection', async (client, req) => {
 
         case 'getTabs': {
           // Read-only tab listing — does NOT go through the operation queue.
-          // Includes mcpOwned + attention so client renders the
+          // Includes mcpOwned + devMode + attention so client renders the
           // floating box / blinking dots without waiting for the next
           // scheduled broadcast.
           const tabTargets = await getCdpTargets();
@@ -1513,6 +1528,7 @@ viewerWss.on('connection', async (client, req) => {
             id: t.id, url: t.url, title: t.title,
             active: t.id === activeTargetId,
             mcpOwned: !!mcpState.owned[t.id],
+            devMode: !!mcpState.devMode[t.id],
             attention: mcpState.attention[t.id] || null,
           }));
           broadcastToViewers({ type: 'tabs', tabs: tabPages, mcpLimits: mcpState.limits });
