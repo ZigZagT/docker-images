@@ -19,7 +19,8 @@ async function call(name, args) {
   const r = await rpc('tools/call', { name, arguments: args });
   const t = r.result?.content?.[0]?.text;
   if (r.result?.isError) throw new Error(t);
-  return t ? JSON.parse(t) : null;
+  if (!t) return null;
+  try { return JSON.parse(t); } catch { return t; }
 }
 
 async function callRaw(name, args) {

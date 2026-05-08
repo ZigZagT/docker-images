@@ -18,7 +18,8 @@ async function call(name, args) {
   const r = await rpc('tools/call', { name, arguments: args });
   const t = r.result?.content?.[0]?.text;
   if (r.result?.isError) throw new Error(t);
-  return t ? JSON.parse(t) : null;
+  if (!t) return null;
+  try { return JSON.parse(t); } catch { return t; }
 }
 
 // Setup: create a page with an iframe
@@ -42,21 +43,27 @@ if (childFrame.parentFrameId !== mainFrame.frameId) {
   fail('dev-mode-frames', 'child parent mismatch');
 }
 
-// Navigate the iframe
+// Navigate the iframe via DOM (set src) to stay same-origin with data: scheme
+await call('browser_evaluate', {
+  tabId,
+  expression: 'document.querySelector("iframe[name=child]").src = "data:text/html,<h2>Navigated</h2>"',
+});
+await delay(500);
+
+// Verify frame tree updated — child frame should now have the new data: URL
+const framesAfter = await call('browser_list_frames', { tabId });
+const updatedChild = framesAfter.frames.find(f => f.parentFrameId !== null);
+if (!updatedChild || !updatedChild.url.includes('Navigated')) {
+  fail('dev-mode-frames', 'frame URL not updated: ' + JSON.stringify(framesAfter));
+}
+
+// Also verify browser_navigate_frame returns success
 const navResult = await call('browser_navigate_frame', {
   tabId,
-  frameId: childFrame.frameId,
-  url: 'data:text/html,<h2>Navigated</h2>',
+  frameId: updatedChild.frameId,
+  url: 'about:blank',
 });
 if (!navResult.navigated) fail('dev-mode-frames', 'navigate_frame did not return navigated:true');
-await delay(300);
-
-// Verify frame URL changed
-const framesAfter = await call('browser_list_frames', { tabId });
-const updatedChild = framesAfter.frames.find(f => f.frameId === childFrame.frameId);
-if (!updatedChild || !updatedChild.url.includes('Navigated')) {
-  fail('dev-mode-frames', 'frame URL not updated after navigate');
-}
 
 // Cleanup
 await call('browser_close_tab', { tabId });

@@ -20,7 +20,7 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { WebSocketServer, WebSocket } from 'ws';
-import { createMcpHandler, getMcpState, noteTabClosed, onMcpStateChange, clearAttention, pruneStaleTabs, isDevMode, devModeSessionHandler } from './mcp.mjs';
+import { createMcpHandler, getMcpState, noteTabClosed, onMcpStateChange, clearAttention, pruneStaleTabs, isDevMode, devModeSessionHandler, inheritMcpOwnership } from './mcp.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -184,6 +184,10 @@ function scheduleTabBroadcast() {
 // Repaint when MCP-side state changes (new owned tab, attention add/clear)
 // without waiting for an unrelated tab event.
 onMcpStateChange(scheduleTabBroadcast);
+
+// Target.targetInfoChanged does not fire for JS-driven title changes
+// (e.g. SPA routers setting document.title). Poll /json/list to catch them.
+setInterval(scheduleTabBroadcast, 2000);
 
 let extBroadcastTimer = null;
 function scheduleExtBroadcast() {
@@ -559,8 +563,13 @@ function ensureBrowserConnection() {
           if (msg.method === 'Target.targetCreated') {
             const ti = msg.params?.targetInfo;
             if (ti?.type === 'page') {
+              if (ti.openerId) {
+                const r = inheritMcpOwnership(ti.targetId, ti.openerId);
+                for (const id of r.evicted) {
+                  browserCommand('Target.closeTarget', { targetId: id }).catch(() => {});
+                }
+              }
               scheduleTabBroadcast();
-              // Sessions attach lazily in switchToTarget, not here.
             }
             // Extension installed/enabled — invalidate cache so next
             // getExtensions fetches fresh data
@@ -587,7 +596,9 @@ function ensureBrowserConnection() {
           }
           if (msg.method === 'Target.targetInfoChanged') {
             const ti = msg.params?.targetInfo;
-            if (ti?.type === 'page') scheduleTabBroadcast();
+            if (ti?.type === 'page') {
+              scheduleTabBroadcast();
+            }
           }
         } catch { /* ignore parse errors */ }
       });
@@ -726,18 +737,38 @@ async function poolAttach(targetId) {
   sessionPool.set(targetId, entry);
 
   await sessionCommand(sessionId, 'Page.enable').catch(() => {});
-  // Native <select> dropdowns are OS-level popup windows outside the compositor
-  // surface — invisible to Page.startScreencast. base-select renders them as
-  // DOM popovers in the top layer, making them part of the page surface.
-  await sessionCommand(sessionId, 'Page.addScriptToEvaluateOnNewDocument', {
-    source: '(()=>{const s=document.createElement("style");s.textContent="select,select::picker(select){appearance:base-select!important}";(document.head||document.documentElement).appendChild(s)})()',
-  }).catch(() => {});
   if (uaOverrideString && uaOverrideMetadata) {
     await sessionCommand(sessionId, 'Network.setUserAgentOverride', {
       userAgent: uaOverrideString,
       userAgentMetadata: uaOverrideMetadata,
     }).catch(err => log.error('setUserAgentOverride failed for', targetId.slice(0, 8) + ':', err.message));
   }
+
+  // Render <select> as in-page DOM popovers (appearance: base-select) so
+  // dropdowns are visible in screencast instead of being invisible
+  // OS-level popup windows. Viewer mouse clicks can't select options
+  // (Chrome gives <option> elements zero hit-test geometry in the
+  // base-select picker), but keyboard navigation works (arrow keys +
+  // Enter). MCP browser_click handles options via JS in resolveTarget().
+  const baseSelectScript = `(() => {
+    const inject = () => {
+      if (document.getElementById("__bb_base_select")) return;
+      const s = document.createElement("style");
+      s.id = "__bb_base_select";
+      s.textContent = "select { appearance: base-select !important; }";
+      (document.head || document.documentElement).appendChild(s);
+    };
+    if (document.head) inject();
+    else document.addEventListener("DOMContentLoaded", inject);
+  })()`;
+  sessionCommand(sessionId, 'Page.addScriptToEvaluateOnNewDocument', {
+    source: baseSelectScript,
+  }).catch(() => {});
+  sessionCommand(sessionId, 'Runtime.evaluate', {
+    expression: baseSelectScript,
+    returnByValue: true,
+  }).catch(() => {});
+
   const frameTree = await sessionCommand(sessionId, 'Page.getFrameTree').catch(() => null);
   entry.mainFrameId = frameTree?.result?.frameTree?.frame?.id || null;
 
@@ -764,6 +795,9 @@ function poolSessionHandler(targetId, entry, msg) {
 
   // Screencast frames — only from active target, broadcast to all viewers
   if (msg.method === 'Page.screencastFrame') {
+    sessionSend(entry.sessionId, 'Page.screencastFrameAck', {
+      sessionId: msg.params.sessionId
+    });
     if (targetId === activeTargetId) {
       const frame = {
         type: 'frame',
@@ -773,23 +807,26 @@ function poolSessionHandler(targetId, entry, msg) {
       };
       lastFrame = frame;
       broadcastToViewers(frame);
-      sessionSend(entry.sessionId, 'Page.screencastFrameAck', {
-        sessionId: msg.params.sessionId
-      });
     }
     return;
+  }
+
+  // Track main frame ID for all targets
+  if (msg.method === 'Page.frameNavigated' && !msg.params.frame?.parentId) {
+    entry.mainFrameId = msg.params.frame?.id;
   }
 
   // Page events — only forward from active target
   if (targetId === activeTargetId) {
     if (msg.method === 'Page.frameNavigated' && !msg.params.frame?.parentId) {
-      entry.mainFrameId = msg.params.frame?.id;
       broadcastToViewers({ type: 'navigated', url: msg.params.frame?.url });
+      scheduleTabBroadcast();
     }
     // JS-driven URL changes (history.pushState / replaceState)
     if (msg.method === 'Page.navigatedWithinDocument') {
       if (!entry.mainFrameId || msg.params.frameId === entry.mainFrameId) {
         broadcastToViewers({ type: 'navigated', url: msg.params.url });
+        scheduleTabBroadcast();
       }
     }
     if (msg.method === 'Page.frameStartedLoading') {
@@ -845,8 +882,7 @@ async function switchToTarget(targetId) {
   if (targetId === activeTargetId && screencastActive) return;
   const t0 = Date.now();
   try {
-    // Stop screencast on old active session — always send stop even
-    // if screencastActive is false (async startScreencast may be pending)
+    // Stop screencast on old active session
     if (activeTargetId) {
       const oldEntry = sessionPool.get(activeTargetId);
       if (oldEntry) sessionSend(oldEntry.sessionId, 'Page.stopScreencast');
@@ -890,11 +926,6 @@ async function switchToTarget(targetId) {
     });
 
     // startScreencast — fire and forget, not awaited.
-    // Awaiting would block the operation queue if Chrome is slow to
-    // start frame capture (observed under tab accumulation / resource
-    // pressure in test suites). The targetChanged broadcast above
-    // already gave viewers the correct URL; frames resume when
-    // startScreencast completes asynchronously.
     const scTargetId = targetId;
     sessionCommand(entry.sessionId, 'Page.startScreencast', {
       format: 'jpeg', quality: SCREENCAST_QUALITY,
@@ -1083,6 +1114,7 @@ function reconnectToBrowser() {
   reconnecting = true;
 
   (async () => {
+    let attempts = 0;
     while (true) {
       broadcastToViewers({ type: 'status', message: 'Reconnecting to browser...' });
       await new Promise(r => setTimeout(r, 2000));
@@ -1119,7 +1151,12 @@ function reconnectToBrowser() {
         reconnecting = false;
         break;
       } catch (err) {
+        attempts++;
         log.error('reconnectToBrowser attempt failed:', err.message);
+        if (attempts === 5) {
+          log.info('browser unreachable after 5 attempts, requesting Chrome restart');
+          runChromeCommand('restart-browser');
+        }
       }
     }
   })();
@@ -1329,9 +1366,10 @@ viewerWss.on('connection', async (client, req) => {
     if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify(obj));
   }
 
-  // Send complete state snapshot so the viewer renders fully on first
-  // paint instead of showing a half-populated UI (URL bar set but no
-  // tabs, no extensions, no canvas content).
+  // Drain pending ops (e.g. reconciliation after tab closure by test
+  // runner's cleanTabs) so the snapshot reflects settled state.
+  await enqueueOp(() => {});
+
   if (activeTargetId) {
     try {
       const [target, tabTargets, exts, profile] = await Promise.all([
@@ -1340,12 +1378,14 @@ viewerWss.on('connection', async (client, req) => {
         getExtensionInfo().catch(() => []),
         getProfileStatus().catch(() => null)
       ]);
-      clientSend({ type: 'targetChanged', targetId: activeTargetId, url: target.url, title: target.title });
-      // Include MCP per-tab metadata in the connect snapshot so the
-      // floating attention box renders immediately on viewer reconnect.
-      // Without this, refreshing the page (or opening a new viewer)
-      // would wipe attention from the client view until something else
-      // triggered scheduleTabBroadcast.
+      // findPageTarget falls back to any page when activeTargetId is
+      // gone (destroyed between cleanTabs and this connect). Align
+      // state before sending the snapshot so navigates hit a live tab.
+      if (target.targetId !== activeTargetId) {
+        await enqueueOp(() => switchToTarget(target.targetId));
+      } else {
+        clientSend({ type: 'targetChanged', targetId: activeTargetId, url: target.url, title: target.title });
+      }
       const mcpState = getMcpState();
       const tabPages = tabTargets.filter(t => t.type === 'page').map(t => ({
         id: t.id, url: t.url, title: t.title,
@@ -1536,10 +1576,10 @@ viewerWss.on('connection', async (client, req) => {
         }
 
         case 'resumeScreencast': {
-          // Lightweight restart — just re-starts frame capture on the
-          // current active target without running the full switchToTarget
-          // flow. Used by the viewer's visibilitychange handler so that
-          // regaining focus doesn't trigger tab switching side effects.
+          // Lightweight restart — re-starts frame capture on the current
+          // active target without the full switchToTarget flow. Used by the
+          // viewer's visibilitychange handler so regaining focus doesn't
+          // trigger tab switching side effects.
           const resumeEntry = activeSession();
           if (resumeEntry) {
             sessionCommand(resumeEntry.sessionId, 'Page.startScreencast', {
@@ -1732,8 +1772,21 @@ viewerWss.on('connection', async (client, req) => {
           // Bridge-only restart: chrome and all open tabs preserved.
           // The chrome script will SIGTERM us shortly; the new bridge it
           // spawns reconnects to the still-running chrome.
+          //
+          // Must stop screencast BEFORE dying. The GPU process captures
+          // frames via CopyOutputResultSender Mojo pipes — if those
+          // break mid-frame (bridge death kills the CDP socket while a
+          // capture is in-flight), the GPU process crashes. After 3 GPU
+          // crashes Chrome ABORTs entirely. Stopping the screencast
+          // drains the pipeline; the 800ms delay lets Chrome finish any
+          // in-flight frame before the bridge process dies.
           broadcastToViewers({ type: 'error', message: 'Restarting bridge...' });
-          setTimeout(() => runChromeCommand('restart-bridge'), 500);
+          if (screencastActive && activeTargetId) {
+            const ae = sessionPool.get(activeTargetId);
+            if (ae) sessionSend(ae.sessionId, 'Page.stopScreencast', {});
+            screencastActive = false;
+          }
+          setTimeout(() => runChromeCommand('restart-bridge'), 800);
           break;
         }
 

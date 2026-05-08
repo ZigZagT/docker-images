@@ -18,7 +18,8 @@ async function call(name, args) {
   const r = await rpc('tools/call', { name, arguments: args });
   const t = r.result?.content?.[0]?.text;
   if (r.result?.isError) throw new Error(t);
-  return t ? JSON.parse(t) : null;
+  if (!t) return null;
+  try { return JSON.parse(t); } catch { return t; }
 }
 
 // Setup
@@ -29,7 +30,7 @@ await call('browser_set_dev_mode', { tabId, enabled: true });
 // Trigger a window.open call (will likely be blocked without user gesture)
 await call('browser_evaluate', {
   tabId,
-  expression: 'window.open("https://example.com", "_blank", "width=400,height=300")',
+  expression: '(()=>{ window.open("https://example.com", "_blank", "width=400,height=300"); return "triggered"; })()',
 });
 await delay(300);
 

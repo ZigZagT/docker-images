@@ -568,11 +568,19 @@ function connect() {
 
     if (msg.type === 'navigated' && msg.url) {
       urlBar.value = msg.url;
+      const navTab = currentTabs.find(t => t.id === currentTargetId);
+      if (navTab) navTab.url = msg.url;
     }
 
     if (msg.type === 'targetChanged') {
       urlBar.value = msg.url || '';
       currentTargetId = msg.targetId;
+      const tcTab = currentTabs.find(t => t.id === msg.targetId);
+      if (tcTab) {
+        if (msg.url) tcTab.url = msg.url;
+        if (msg.title) tcTab.title = msg.title;
+        renderTabs();
+      }
       // replaceState instead of location.hash — hash assignment pushes
       // history entries that break the popstate back/forward trap.
       history.replaceState(history.state, '', '#' + msg.targetId);
@@ -728,8 +736,11 @@ function createTabEl(tab) {
     if (e.target.closest('.tab-close')) return;
     // Optimistic: highlight immediately. The bridge's targetChanged
     // will confirm (or correct) this state once the switch completes.
+    // Look up from currentTabs (not the closure's tab) — the original
+    // object goes stale when the tabs array is replaced by broadcasts.
+    const fresh = currentTabs.find(t => t.id === tab.id);
     currentTargetId = tab.id;
-    urlBar.value = tab.url || '';
+    urlBar.value = (fresh || tab).url || '';
     renderTabs();
     send({ type: 'switchTab', targetId: tab.id });
   });
@@ -762,7 +773,7 @@ function updateTabEl(el, tab) {
   // the message is more useful in a hover than the URL is.
   const wantTitle = tab.attention?.message
     ? `Agent needs attention: ${tab.attention.message}\n\n${tab.url || ''}`
-    : (tab.url || '');
+    : (tab.title ? tab.title + '\n' + (tab.url || '') : (tab.url || ''));
   if (el.title !== wantTitle) el.title = wantTitle;
 
   // Wrench icon for dev-mode tabs

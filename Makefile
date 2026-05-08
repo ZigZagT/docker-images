@@ -27,7 +27,7 @@ ifeq ($(PUSH),true)
 	BUILDX_CMD += --push
 endif
 
-.PHONY: all ubuntu ubuntu-nodejs ubuntu-rust ubuntu-bun ubuntu-geoip ubuntu-geoip-download ubuntu-geoip-build dnsmasq-exporter shadowsocks dnsmasq qemu cloud-hypervisor browser sqitch-pg wait-for-pg clean
+.PHONY: all ubuntu ubuntu-nodejs ubuntu-rust ubuntu-bun ubuntu-geoip ubuntu-geoip-download ubuntu-geoip-build dnsmasq-exporter shadowsocks dnsmasq qemu cloud-hypervisor browser sqitch-pg wait-for-pg clean remove-test-browser start-test-browser run-browser-test
 .PHONY: merge-ubuntu merge-ubuntu-nodejs merge-ubuntu-rust merge-ubuntu-bun merge-ubuntu-geoip merge-shadowsocks merge-dnsmasq merge-browser merge-qemu merge-cloud-hypervisor merge-dnsmasq-exporter merge-sqitch-pg merge-wait-for-pg
 
 # Default target
@@ -52,6 +52,38 @@ ubuntu:
 			--cache-from $(CACHE_REGISTRY)/ubuntu:$$tag$(TAG_SUFFIX) \
 			ubuntu; \
 	done
+
+BROWSER_TEST_IMAGE ?= $(CACHE_REGISTRY)/browser:latest
+BROWSER_TEST_CONTAINER ?= browser-test
+
+TESTS ?=
+BRIDGE_LOG ?= info
+
+remove-test-browser:
+	@docker rm -f $(BROWSER_TEST_CONTAINER) 2>/dev/null || true
+
+start-test-browser:
+	@docker rm -f $(BROWSER_TEST_CONTAINER) 2>/dev/null || true
+	@echo "Starting $(BROWSER_TEST_CONTAINER)..."
+	@docker run -d --name $(BROWSER_TEST_CONTAINER) --shm-size=2g \
+		-p 6080:6080 -p 18800:18800 \
+		-e BRIDGE_LOG=$(BRIDGE_LOG) \
+		-v $(CURDIR)/browser/browser-bridge/server.mjs:/opt/browser-bridge/server.mjs:ro \
+		-v $(CURDIR)/browser/browser-bridge/mcp.mjs:/opt/browser-bridge/mcp.mjs:ro \
+		-v $(CURDIR)/browser/browser-bridge/index.html:/opt/browser-bridge/index.html:ro \
+		-v $(CURDIR)/browser/browser-bridge/tests:/opt/browser-bridge/tests:ro \
+		$(BROWSER_TEST_IMAGE)
+	@printf 'Waiting for bridge'
+	@for i in $$(seq 1 30); do \
+		docker exec $(BROWSER_TEST_CONTAINER) \
+			node -e "require('http').get('http://127.0.0.1:6080/',r=>{r.resume();r.on('end',()=>process.exit(0))}).on('error',()=>process.exit(1))" \
+			2>/dev/null && break; \
+		printf '.'; sleep 1; \
+	done
+	@echo ' ready'
+
+run-browser-test: remove-test-browser start-test-browser
+	docker exec -w /opt/browser-bridge $(BROWSER_TEST_CONTAINER) node tests/run-all.mjs $(TESTS)
 
 test-ubuntu-setup-tz:
 	docker build ubuntu \

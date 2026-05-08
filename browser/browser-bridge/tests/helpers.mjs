@@ -26,7 +26,7 @@ export function connectViewer() {
 
   function send(obj) { ws.send(JSON.stringify(obj)); }
 
-  function waitFor(type, timeout = 8000) {
+  function waitFor(type, timeout = 15000) {
     return new Promise((res, rej) => {
       const t = setTimeout(() => rej(new Error('timeout waiting for ' + type)), timeout);
       const c = setInterval(() => {

@@ -2,7 +2,8 @@
 import { connectViewer, delay, httpGet, pass, fail } from './helpers.mjs';
 
 const v = await connectViewer();
-await v.waitFor('targetChanged'); v.clearEvents();
+const tc = await v.waitFor('targetChanged'); v.clearEvents();
+const activeId = tc.targetId;
 
 // Navigate to two different pages to build history
 v.send({ type: 'navigate', url: 'https://example.com' });
@@ -14,7 +15,6 @@ await v.waitFor('navigated');
 await delay(2000);
 
 const list1 = await httpGet('http://127.0.0.1:18800/json/list');
-const activeId = list1.find(t => t.type === 'page')?.id;
 const url1 = list1.find(t => t.id === activeId)?.url;
 if (!url1?.includes('iana.org')) fail('back-forward', 'expected iana.org, got: ' + url1);
 v.clearEvents();

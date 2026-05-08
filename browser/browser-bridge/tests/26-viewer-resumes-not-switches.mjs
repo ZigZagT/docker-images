@@ -55,15 +55,21 @@ await scmd(sid, 'Page.enable', {});
 await scmd(sid, 'Runtime.enable', {});
 await delay(4000);
 
-// Intercept the viewer's WebSocket send() to capture what it sends
+// Intercept at the WebSocket.send level — the viewer's `send` function
+// is a script-scope declaration that V8 resolves through the script
+// context slot, not window.send. Overriding window.send doesn't affect
+// the handler's closure reference. Patching ws.send captures all
+// outgoing messages regardless of call path.
 await scmd(sid, 'Runtime.evaluate', {
   expression: `
     window._sentMessages = [];
-    const _origSend = send;
-    window.send = function(obj) {
-      window._sentMessages.push(JSON.parse(JSON.stringify(obj)));
-      _origSend(obj);
-    };
+    if (ws && ws.send) {
+      const _origWsSend = ws.send.bind(ws);
+      ws.send = function(data) {
+        try { window._sentMessages.push(JSON.parse(data)); } catch {}
+        return _origWsSend(data);
+      };
+    }
   `
 });
 

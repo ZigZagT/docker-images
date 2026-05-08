@@ -90,7 +90,8 @@ if [ "$has_render_node" = "1" ] && [ "$has_real_vulkan_icd" = "1" ]; then
     gpu_flags+=(--use-angle=vulkan)
     echo "chrome-launcher: GPU detected (render node + Vulkan ICD), enabling --use-angle=vulkan" >&2
 else
-    echo "chrome-launcher: no GPU detected (render_node=$has_render_node, vulkan_icd=$has_real_vulkan_icd), using default software rendering" >&2
+    gpu_flags+=(--disable-gpu)
+    echo "chrome-launcher: no GPU detected (render_node=$has_render_node, vulkan_icd=$has_real_vulkan_icd), using --disable-gpu software rendering" >&2
 fi
 
 exec chrome-raw \

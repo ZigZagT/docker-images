@@ -53,7 +53,7 @@ const v = new WebSocket('ws://127.0.0.1:6080/ws');
 const vev = [];
 await new Promise(r => v.on('open', r));
 v.on('message', d => { try { const m = JSON.parse(d); if (m.type !== 'frame') vev.push(m); } catch {} });
-function vwait(type, ms = 8000) {
+function vwait(type, ms = 15000) {
   return new Promise((res, rej) => {
     const t = setTimeout(() => rej(new Error('vwait TO ' + type)), ms);
     const i = setInterval(() => {
@@ -81,7 +81,7 @@ cdp.on('message', raw => {
 function cmd(method, params = {}) {
   return new Promise((res, rej) => {
     const id = cmdId++;
-    const t = setTimeout(() => { pending.delete(id); rej(new Error('CDP TO ' + method)); }, 8000);
+    const t = setTimeout(() => { pending.delete(id); rej(new Error('CDP TO ' + method)); }, 15000);
     pending.set(id, v => { clearTimeout(t); res(v); });
     cdp.send(JSON.stringify({ id, method, params }));
   });

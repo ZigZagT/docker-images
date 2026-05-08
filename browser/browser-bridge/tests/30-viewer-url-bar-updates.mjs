@@ -40,10 +40,18 @@ const bridgeWs = new WebSocket('ws://127.0.0.1:6080/ws');
 await new Promise(r => bridgeWs.on('open', r));
 const bev = [];
 bridgeWs.on('message', d => { const m = JSON.parse(d); if (m.type === 'frame') return; bev.push(m); });
-await delay(1000);
+function bwait(type, ms = 15000) {
+  return new Promise((r, j) => {
+    const t = setTimeout(() => j(new Error('bwait TO: ' + type)), ms);
+    const c = setInterval(() => { const i = bev.findIndex(m => m.type === type); if (i >= 0) { clearTimeout(t); clearInterval(c); r(bev.splice(i, 1)[0]); } }, 50);
+  });
+}
+await bwait('targetChanged');
+bev.length = 0;
 
 bridgeWs.send(JSON.stringify({ type: 'navigate', url: 'https://example.com' }));
-await delay(3000);
+await bwait('navigated');
+await delay(2000);
 
 // Read the viewer's URL bar
 const resp = await scmd(sid, 'Runtime.evaluate', {

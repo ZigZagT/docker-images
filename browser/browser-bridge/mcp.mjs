@@ -37,6 +37,173 @@ const attentionRequests = new Map();
 // throw a clear error so the agent re-snapshots before retrying.
 const tabSnapshots = new Map();
 
+// --- Dev mode per-tab state ---
+// Opt-in dev mode enables CDP domains (Runtime, Log, Network) on a tab's
+// session, unlocking console/network/dialog/popup tools. Default tabs stay
+// clean (no Runtime.enable etc.) preserving stealth posture.
+const DEV_LOG_CAP = 1000;
+const DEV_NET_CAP = 1000;
+const DEV_POPUP_CAP = 200;
+
+// targetId → { consoleLogs[], networkRequests: Map, networkBodies: Map,
+//   popupLog[], dialogHandler, pendingDialog, popupScriptId }
+const devModeTabs = new Map();
+
+export function isDevMode(targetId) {
+  return devModeTabs.has(targetId);
+}
+
+function requireDevMode(tabId) {
+  if (!devModeTabs.has(tabId)) {
+    throw new Error('tab ' + tabId + ' is not in dev mode — call browser_set_dev_mode(tabId, true) first');
+  }
+  return devModeTabs.get(tabId);
+}
+
+// Called by server.mjs's poolSessionHandler for every CDP event on dev-mode tabs.
+export function devModeSessionHandler(targetId, msg, deps) {
+  const state = devModeTabs.get(targetId);
+  if (!state) return;
+
+  if (msg.method === 'Runtime.consoleAPICalled') {
+    const p = msg.params;
+    const entry = {
+      type: 'console',
+      level: p.type,
+      text: (p.args || []).map(a => a.value !== undefined ? String(a.value) : (a.description || a.type)).join(' '),
+      ts: Date.now(),
+    };
+    state.consoleLogs.push(entry);
+    if (state.consoleLogs.length > DEV_LOG_CAP) state.consoleLogs.shift();
+  }
+
+  if (msg.method === 'Runtime.exceptionThrown') {
+    const ex = msg.params?.exceptionDetails;
+    if (ex) {
+      const entry = {
+        type: 'exception',
+        level: 'error',
+        text: ex.text + (ex.exception?.description ? ' ' + ex.exception.description : ''),
+        source: ex.url || '',
+        line: ex.lineNumber,
+        col: ex.columnNumber,
+        ts: Date.now(),
+      };
+      state.consoleLogs.push(entry);
+      if (state.consoleLogs.length > DEV_LOG_CAP) state.consoleLogs.shift();
+    }
+  }
+
+  if (msg.method === 'Log.entryAdded') {
+    const e = msg.params?.entry;
+    if (e) {
+      const entry = {
+        type: 'log',
+        level: e.level,
+        text: e.text || '',
+        source: e.source || '',
+        url: e.url || '',
+        line: e.lineNumber,
+        ts: Date.now(),
+      };
+      state.consoleLogs.push(entry);
+      if (state.consoleLogs.length > DEV_LOG_CAP) state.consoleLogs.shift();
+    }
+  }
+
+  if (msg.method === 'Network.requestWillBeSent') {
+    const p = msg.params;
+    if (state.networkRequests.size >= DEV_NET_CAP) {
+      const oldest = state.networkRequests.keys().next().value;
+      state.networkRequests.delete(oldest);
+      state.networkBodies.delete(oldest);
+    }
+    state.networkRequests.set(p.requestId, {
+      requestId: p.requestId,
+      url: p.request.url,
+      method: p.request.method,
+      type: p.type || '',
+      ts: Date.now(),
+      status: null,
+      mimeType: null,
+      size: 0,
+      done: false,
+      failed: false,
+      errorText: null,
+    });
+  }
+
+  if (msg.method === 'Network.responseReceived') {
+    const p = msg.params;
+    const req = state.networkRequests.get(p.requestId);
+    if (req) {
+      req.status = p.response.status;
+      req.mimeType = p.response.mimeType;
+    }
+  }
+
+  if (msg.method === 'Network.dataReceived') {
+    const p = msg.params;
+    const req = state.networkRequests.get(p.requestId);
+    if (req) req.size += p.dataLength || 0;
+  }
+
+  if (msg.method === 'Network.loadingFinished') {
+    const req = state.networkRequests.get(msg.params.requestId);
+    if (req) req.done = true;
+  }
+
+  if (msg.method === 'Network.loadingFailed') {
+    const p = msg.params;
+    const req = state.networkRequests.get(p.requestId);
+    if (req) {
+      req.done = true;
+      req.failed = true;
+      req.errorText = p.errorText || null;
+    }
+  }
+
+  if (msg.method === 'Runtime.bindingCalled' && msg.params?.name === '__devPopup') {
+    try {
+      const data = JSON.parse(msg.params.payload);
+      state.popupLog.push({
+        url: data.url || '',
+        target: data.target || '',
+        features: data.features || '',
+        blocked: !!data.blocked,
+        ts: Date.now(),
+        resultingTabId: null,
+      });
+      if (state.popupLog.length > DEV_POPUP_CAP) state.popupLog.shift();
+    } catch {}
+  }
+
+  if (msg.method === 'Page.javascriptDialogOpening') {
+    const p = msg.params;
+    const dialog = {
+      type: p.type,
+      message: p.message || '',
+      defaultPrompt: p.defaultPrompt || '',
+      url: p.url || '',
+      ts: Date.now(),
+    };
+
+    if (state.dialogHandler === 'auto-accept') {
+      const entry = deps.sessionPool.get(targetId);
+      if (entry) deps.sessionCommand(entry.sessionId, 'Page.handleJavaScriptDialog', { accept: true }).catch(() => {});
+    } else if (state.dialogHandler === 'auto-dismiss') {
+      const entry = deps.sessionPool.get(targetId);
+      if (entry) deps.sessionCommand(entry.sessionId, 'Page.handleJavaScriptDialog', { accept: false }).catch(() => {});
+    } else {
+      state.pendingDialog = dialog;
+    }
+  }
+
+  if (msg.method === 'Page.javascriptDialogClosed') {
+    state.pendingDialog = null;
+  }
+}
+
 const stateListeners = new Set();
 function notifyStateChanged() {
   for (const fn of stateListeners) {
@@ -49,7 +216,9 @@ export function getMcpState() {
   for (const [id, meta] of mcpOwnedTabs) owned[id] = { openedAt: meta.openedAt };
   const attention = {};
   for (const [id, meta] of attentionRequests) attention[id] = { message: meta.message, since: meta.since };
-  return { owned, attention, limits: { maxTabs: MCP_MAX_OPEN_TABS, maxAttention: MCP_MAX_ATTENTION } };
+  const devMode = {};
+  for (const id of devModeTabs.keys()) devMode[id] = true;
+  return { owned, attention, devMode, limits: { maxTabs: MCP_MAX_OPEN_TABS, maxAttention: MCP_MAX_ATTENTION } };
 }
 
 export function noteTabClosed(targetId) {
@@ -57,7 +226,27 @@ export function noteTabClosed(targetId) {
   if (mcpOwnedTabs.delete(targetId)) changed = true;
   if (attentionRequests.delete(targetId)) changed = true;
   tabSnapshots.delete(targetId);
+  if (devModeTabs.delete(targetId)) changed = true;
   if (changed) notifyStateChanged();
+}
+
+// When a page opens a child (window.open, target=_blank, Ctrl+click), the
+// child inherits MCP ownership from its opener so the FIFO cap applies
+// transitively.  Returns { inherited, evicted: [targetId...] }.  Callers
+// must close evicted tabs themselves (async) — this function only removes
+// them from the ownership map synchronously.
+export function inheritMcpOwnership(childTargetId, openerTargetId) {
+  if (!openerTargetId || !mcpOwnedTabs.has(openerTargetId)) return { inherited: false, evicted: [] };
+  const evicted = [];
+  while (mcpOwnedTabs.size >= MCP_MAX_OPEN_TABS) {
+    const oldest = mcpOwnedTabs.keys().next().value;
+    if (attentionRequests.has(oldest)) break;
+    mcpOwnedTabs.delete(oldest);
+    evicted.push(oldest);
+  }
+  mcpOwnedTabs.set(childTargetId, { openedAt: Date.now() });
+  notifyStateChanged();
+  return { inherited: true, evicted };
 }
 
 // Drop tracking for any targetId no longer present in the live browser
@@ -75,6 +264,9 @@ export function pruneStaleTabs(liveTargetIds) {
   }
   for (const id of tabSnapshots.keys()) {
     if (!live.has(id)) tabSnapshots.delete(id);
+  }
+  for (const id of devModeTabs.keys()) {
+    if (!live.has(id)) { devModeTabs.delete(id); changed = true; }
   }
   if (changed) notifyStateChanged();
 }
@@ -203,6 +395,29 @@ Attention is capped at ${MCP_MAX_ATTENTION} concurrent requests across all agent
   blocked by attention). Read the message — it tells you what to do.
 - browser_open returns a \`notice\` field when an FIFO eviction occurred. When
   present, READ IT — it explains the auto-close and how to avoid it next time.
+
+# Dev mode
+
+By default, tabs run in stealth posture — no extra CDP domains enabled, minimal
+fingerprint surface. For debugging and inspection tasks, enable dev mode per tab:
+
+1. browser_set_dev_mode(tabId, enabled: true) — activates Runtime, Log, and
+   Network CDP domains on that tab. The viewer shows a wrench icon on dev-mode tabs.
+2. Dev-mode-only tools (all require dev mode ON, error otherwise):
+   - browser_get_console_logs — ring buffer of console.* calls + exceptions
+   - browser_set_dialog_handler / browser_get_pending_dialog / browser_handle_dialog
+     — intercept alert/confirm/prompt dialogs
+   - browser_get_popup_log — captures window.open attempts (blocked or not)
+   - browser_get_network_requests / browser_get_network_response — HTTP traffic log
+   - browser_list_frames / browser_navigate_frame — iframe tree inspection
+3. browser_evaluate gains a \`mode\` param in dev mode: 'serialize-deep' returns
+   CDP deep serialization (preserves Map, Set, Date, RegExp structure).
+4. Disable with browser_set_dev_mode(tabId, enabled: false) — cleans up all
+   captured state for that tab.
+
+Dev mode does NOT affect FIFO, attention, or tab ownership. It only adds
+observability. Turn it on when you need to debug network, console, or dialogs;
+leave it off for normal browsing to minimize detection surface.
 `.trim();
 
 // --- Helpers ---
@@ -383,6 +598,19 @@ function renderSnapshot(nodes) {
   return { text: lines.join('\n'), idToBackend };
 }
 
+// Shared JS body for selecting an <option> element and returning the
+// parent <select>'s center. Used by both UID and selector resolve paths.
+const OPTION_SELECT_JS = `
+  if (this.tagName !== 'OPTION') return null;
+  this.selected = true;
+  const sel = this.closest('select');
+  if (!sel) return null;
+  sel.dispatchEvent(new Event('input', {bubbles: true}));
+  sel.dispatchEvent(new Event('change', {bubbles: true}));
+  const r = sel.getBoundingClientRect();
+  return { x: r.left + r.width/2, y: r.top + r.height/2 };
+`;
+
 // Resolve a uid (or selector) to bounding-box center coords. Used by
 // click and type for trusted CDP input dispatch.
 async function resolveTarget(d, tabId, { uid, selector }) {
@@ -401,12 +629,42 @@ async function resolveTarget(d, tabId, { uid, selector }) {
       throw new Error('uid ' + uid + ' not in current snapshot — re-snapshot the page (the DOM may have changed)');
     }
     const box = await d.sessionCommand(entry.sessionId, 'DOM.getBoxModel', { backendNodeId: backend });
-    if (box.error) throw new Error('uid ' + uid + ' has no box (offscreen or zero-size): ' + box.error.message);
-    // content quad is 8 numbers: [x1,y1, x2,y2, x3,y3, x4,y4] (TL, TR, BR, BL).
-    const c = box.result.model.content;
-    const cx = (c[0] + c[4]) / 2;
-    const cy = (c[1] + c[5]) / 2;
-    return { entry, x: cx, y: cy };
+    if (!box.error) {
+      // content quad is 8 numbers: [x1,y1, x2,y2, x3,y3, x4,y4] (TL, TR, BR, BL).
+      const c = box.result.model.content;
+      const cx = (c[0] + c[4]) / 2;
+      const cy = (c[1] + c[5]) / 2;
+      return { entry, x: cx, y: cy };
+    }
+    // getBoxModel fails for elements in CSS top layer (e.g. base-select
+    // popover options). Resolve via JS instead.
+    const resolved = await d.sessionCommand(entry.sessionId, 'DOM.resolveNode', { backendNodeId: backend });
+    if (resolved.error) throw new Error('uid ' + uid + ' has no box and cannot be resolved: ' + resolved.error.message);
+    const objId = resolved.result.object.objectId;
+    // <option> elements have zero geometry even in base-select pickers.
+    // Select via JS and return the parent <select>'s center so the
+    // subsequent cdpClickAt closes the picker.
+    const optResult = await d.sessionCommand(entry.sessionId, 'Runtime.callFunctionOn', {
+      objectId: objId,
+      functionDeclaration: `function() {${OPTION_SELECT_JS}}`,
+      returnByValue: true,
+    });
+    if (!optResult.error && optResult.result?.result?.value) {
+      const coords = optResult.result.result.value;
+      return { entry, x: coords.x, y: coords.y };
+    }
+    // General fallback: getBoundingClientRect for non-option top-layer elements.
+    const rectResult = await d.sessionCommand(entry.sessionId, 'Runtime.callFunctionOn', {
+      objectId: objId,
+      functionDeclaration: 'function() { const r = this.getBoundingClientRect(); return { x: r.left + r.width/2, y: r.top + r.height/2, w: r.width, h: r.height }; }',
+      returnByValue: true,
+    });
+    if (rectResult.error) throw new Error('uid ' + uid + ' has no box (offscreen or zero-size): ' + box.error.message);
+    const rect = rectResult.result?.result?.value;
+    if (!rect || (rect.w === 0 && rect.h === 0)) {
+      throw new Error('uid ' + uid + ' has no box (offscreen or zero-size): ' + box.error.message);
+    }
+    return { entry, x: rect.x, y: rect.y };
   }
 
   // Selector path — CSS or XPath.
@@ -426,6 +684,8 @@ async function resolveTarget(d, tabId, { uid, selector }) {
     if (!el) return JSON.stringify({ error: 'no element matches: ' + path });
     const r = el.getBoundingClientRect();
     if (r.width === 0 && r.height === 0) {
+      const optCoords = (function() {${OPTION_SELECT_JS}}).call(el);
+      if (optCoords) return JSON.stringify(optCoords);
       return JSON.stringify({ error: 'element has zero size — call browser_scroll_into_view first' });
     }
     return JSON.stringify({ x: r.left + r.width/2, y: r.top + r.height/2 });
@@ -454,8 +714,10 @@ async function buildAndStoreSnapshot(d, tabId) {
 
 // CDP dispatched mouse click — produces isTrusted=true events that bot-
 // detection scripts can't distinguish from real human input.
-async function cdpClickAt(d, sessionId, x, y) {
-  const common = { x, y, button: 'left', clickCount: 1, modifiers: 0 };
+const MODIFIER_BITS = { alt: 1, ctrl: 2, meta: 4, shift: 8 };
+
+async function cdpClickAt(d, sessionId, x, y, modifiers = 0) {
+  const common = { x, y, button: 'left', clickCount: 1, modifiers };
   await d.sessionCommand(sessionId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', ...common });
   await d.sessionCommand(sessionId, 'Input.dispatchMouseEvent', { type: 'mousePressed', ...common });
   await d.sessionCommand(sessionId, 'Input.dispatchMouseEvent', { type: 'mouseReleased', ...common });
@@ -494,6 +756,7 @@ const TOOLS = [
         url: t.url,
         title: t.title,
         mcpOwned: mcpOwnedTabs.has(t.id),
+        devMode: devModeTabs.has(t.id),
         attention: attentionRequests.get(t.id) || null,
       }));
       return text(JSON.stringify({
@@ -741,32 +1004,57 @@ const TOOLS = [
       'Do NOT use for clicking, typing, or scrolling — use browser_click / browser_type / ' +
       'browser_press_key / browser_scroll, which dispatch trusted CDP events that bot detection ' +
       'can\'t distinguish from real input.\n\n' +
-      'Wrap multi-statement code as `(()=>{ ... })()` or `(async()=>{ ... })()`; await is supported. ' +
-      'Returns the value as JSON for objects/arrays, otherwise as a string. ' +
+      'Wrap multi-statement code as `(()=>{ ... })()` or `(async()=>{ ... })()`; await is supported ' +
+      '(the tool sets awaitPromise:true). Multi-step automation can be written as a single async IIFE ' +
+      'that performs sequential operations and returns a final result.\n\n' +
+      'Returns the value as JSON for objects/arrays, otherwise as a string. By default, return values ' +
+      'are JSON-stringified (returnByValue:true) — DOM nodes, functions, and circular refs become null. ' +
+      'Pass mode:"serialize-deep" for full CDP deep serialization (handles Maps, Sets, RegExp, Date, ' +
+      'Error, ArrayBuffer, typed arrays, Proxy, generators, WeakRef). ' +
       'Page exceptions return as text starting with "Exception:" and isError=true.',
     inputSchema: {
       type: 'object',
       properties: {
         tabId: { type: 'string' },
         expression: { type: 'string' },
+        mode: { type: 'string', enum: ['json', 'serialize-deep'], description: 'Return serialization mode. "json" (default): returnByValue. "serialize-deep": CDP deep serialization for complex types.' },
       },
       required: ['tabId', 'expression'],
     },
-    async run({ tabId, expression }, d) {
+    async run({ tabId, expression, mode }, d) {
       await d.poolAttach(tabId);
       const entry = d.sessionPool.get(tabId);
       if (!entry) throw new Error('tab not found: ' + tabId);
-      const r = await d.sessionCommand(entry.sessionId, 'Runtime.evaluate', {
+
+      const useDeep = mode === 'serialize-deep';
+      const evalParams = {
         expression,
-        returnByValue: true,
         awaitPromise: true,
         userGesture: true,
-      });
+      };
+      if (useDeep) {
+        evalParams.generatePreview = true;
+        evalParams.serializationOptions = { serialization: 'deep', maxDepth: 10 };
+      } else {
+        evalParams.returnByValue = true;
+      }
+
+      const r = await d.sessionCommand(entry.sessionId, 'Runtime.evaluate', evalParams);
       if (r.error) throw new Error(r.error.message);
       const ed = r.result?.exceptionDetails;
       if (ed) {
         return text('Exception: ' + (ed.text || '') + ' ' + (ed.exception?.description || ''), { isError: true });
       }
+
+      if (useDeep) {
+        const result = r.result?.result;
+        const deep = result?.deepSerializedValue;
+        if (deep) return text(JSON.stringify(deep, null, 2));
+        if (result?.preview) return text(JSON.stringify(result.preview, null, 2));
+        const val = result?.value;
+        return text(val !== undefined ? JSON.stringify(val, null, 2) : String(result?.description || result?.type || 'undefined'));
+      }
+
       const val = r.result?.result?.value;
       const out = (val !== null && typeof val === 'object') ? JSON.stringify(val, null, 2) : String(val);
       return text(out);
@@ -856,6 +1144,12 @@ const TOOLS = [
       'XPath, fallback when no snapshot UID applies).\n\n' +
       'Click target is the element\'s bounding-box center. Throws if the element is offscreen ' +
       '(call browser_scroll_into_view first) or if the UID is stale (call browser_get_snapshot again).\n\n' +
+      'Popup blocker note: CDP clicks carry userGesture context, so window.open triggered ' +
+      'within a click handler is NOT blocked by Chrome\'s popup blocker. If a link targets ' +
+      '_blank, the click will open a new tab — check browser_list_tabs after clicking links ' +
+      'that may open popups.\n\n' +
+      'Modifiers: pass ["ctrl"] (or ["meta"] on Mac) to Ctrl+click (opens links in new tab), ' +
+      '["shift"] for Shift+click, etc. Multiple modifiers can be combined.\n\n' +
       'Set includeSnapshot:true to receive an updated browser_get_snapshot view in the same ' +
       'response — useful when the click triggers DOM changes you need to inspect.',
     inputSchema: {
@@ -864,14 +1158,41 @@ const TOOLS = [
         tabId: { type: 'string' },
         uid: { type: 'string', description: 'UID from the most recent browser_get_snapshot for this tab.' },
         selector: { type: 'string', description: 'CSS selector or XPath. Use only if you don\'t have a snapshot UID.' },
+        modifiers: { type: 'array', items: { type: 'string', enum: ['alt', 'ctrl', 'meta', 'shift'] }, description: 'Modifier keys held during click. e.g. ["ctrl"] for Ctrl+click (open link in new tab).' },
         includeSnapshot: { type: 'boolean', description: 'Append a fresh browser_get_snapshot to the response.' },
       },
       required: ['tabId'],
     },
-    async run({ tabId, uid, selector, includeSnapshot }, d) {
+    async run({ tabId, uid, selector, modifiers: mods, includeSnapshot }, d) {
       if (!uid && !selector) throw new Error('browser_click: provide uid (preferred) or selector');
       const { entry, x, y } = await resolveTarget(d, tabId, { uid, selector });
-      await cdpClickAt(d, entry.sessionId, x, y);
+      let bits = 0;
+      if (mods) for (const m of mods) bits |= (MODIFIER_BITS[m] || 0);
+
+      // Ctrl/Meta+click opens links in a new tab. Chrome does not set openerId
+      // on the new target, so Target.targetCreated cannot inherit MCP ownership.
+      // Snapshot tab IDs before the click to detect new tabs after.
+      const mayOpenTab = (bits & (MODIFIER_BITS.ctrl | MODIFIER_BITS.meta)) && mcpOwnedTabs.has(tabId);
+      let tabIdsBefore;
+      if (mayOpenTab) {
+        tabIdsBefore = new Set((await d.getCdpTargets()).filter(t => t.type === 'page').map(t => t.id));
+      }
+
+      await cdpClickAt(d, entry.sessionId, x, y, bits);
+
+      if (tabIdsBefore) {
+        await new Promise(r => setTimeout(r, 500));
+        const tabsAfter = (await d.getCdpTargets()).filter(t => t.type === 'page');
+        for (const t of tabsAfter) {
+          if (!tabIdsBefore.has(t.id)) {
+            const r = inheritMcpOwnership(t.id, tabId);
+            for (const id of r.evicted) {
+              d.dispatchBridgeEvent({ type: 'closeTab', targetId: id }).catch(() => {});
+            }
+          }
+        }
+      }
+
       const result = { tabId, uid: uid || null, selector: selector || null, clickedAt: { x, y } };
       if (includeSnapshot) result.snapshot = await buildAndStoreSnapshot(d, tabId);
       return text(JSON.stringify(result, null, 2));
@@ -1327,6 +1648,8 @@ const TOOLS = [
     async run({ tabId, accept, promptText }, d) {
       const state = requireDevMode(tabId);
       if (!state.pendingDialog) throw new Error('no pending dialog on tab ' + tabId);
+      const handled = state.pendingDialog;
+      state.pendingDialog = null;
       await d.poolAttach(tabId);
       const entry = d.sessionPool.get(tabId);
       if (!entry) throw new Error('tab not found: ' + tabId);
@@ -1334,8 +1657,6 @@ const TOOLS = [
       if (promptText !== undefined) params.promptText = promptText;
       const r = await d.sessionCommand(entry.sessionId, 'Page.handleJavaScriptDialog', params);
       if (r.error) throw new Error(r.error.message);
-      const handled = state.pendingDialog;
-      state.pendingDialog = null;
       return text(JSON.stringify({ tabId, handled: handled.type, accept }, null, 2));
     },
   },

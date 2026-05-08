@@ -41,8 +41,12 @@ async function setup() {
 
 await setup();
 
+const filterArg = process.argv[2] || '';
+const filters = filterArg ? filterArg.split(',').map(s => s.trim()) : [];
+
 const tests = fs.readdirSync(dir)
   .filter(f => /^\d+-.*\.mjs$/.test(f))
+  .filter(f => filters.length === 0 || filters.some(p => f.includes(p)))
   .sort();
 
 let passed = 0;
@@ -85,7 +89,14 @@ for (const test of tests) {
     const stderr = err.stderr?.toString().trim() || '';
     const stdout = err.stdout?.toString().trim() || '';
     const output = stdout || stderr || err.message;
-    console.log(output.includes('FAIL:') ? output : 'FAIL: ' + test + ' — ' + output.split('\n')[0]);
+    if (output.includes('FAIL:')) {
+      console.log(output);
+    } else {
+      console.log('FAIL:', test);
+      if (stdout) console.log('  stdout:', stdout);
+      if (stderr) console.log('  stderr:', stderr);
+      if (!stdout && !stderr) console.log('  error:', err.message);
+    }
     failed++;
     failures.push(test);
   }
