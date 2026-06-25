@@ -187,6 +187,7 @@ Agents don't manage cleanup — FIFO auto-closes the oldest MCP-owned tab when y
 - **User-owned**: opened by the human in the viewer, or by another channel. Never counted against FIFO, never auto-closed.
 - `browser_navigate(tabId, url)` works on either without affecting ownership.
 - An attention-bearing tab — MCP-owned or user-owned — is **protected from FIFO eviction**. `browser_open` errors with a clear message naming the protected tab if it would be evicted.
+- **Survives restarts.** MCP-ownership and attention are persisted to the profile dir and re-established after a bridge or browser restart. Each owned tab carries a `sessionStorage` marker (history-hash fallback for opaque origins) that's matched back to the restored tab even though Chrome assigns new internal ids. Requires a persistent profile (`CHROME_USER_DATA_DIR` set) and, for a *browser* restart, that Chrome is configured to restore the session ("continue where you left off"); with an ephemeral profile there's nothing to restore and recovery is a no-op.
 
 #### Captcha / human-in-the-loop workflow
 

@@ -58,6 +58,22 @@ BROWSER_TEST_CONTAINER ?= browser-test
 
 TESTS ?=
 BRIDGE_LOG ?= info
+# Persistent Chrome profile dir for the test browser. Production mounts a
+# durable volume here; the tests need it non-empty so the bridge can resolve
+# the profile path (via chrome://version's --user-data-dir) and persist
+# MCP-ownership state — without it, persistence is a silent no-op and the
+# ownership-survives-restart test can't run. Container-local path: it survives
+# a bridge restart (Chrome stays up) and is discarded when the container is
+# recreated, keeping runs isolated.
+CHROME_USER_DATA_DIR ?= /tmp/browser-test-profile
+# Optional: container path to an unpacked extension to --load-extension into the
+# test browser. The tests/ dir is mounted at /opt/browser-bridge/tests, so fixtures
+# under it are reachable, e.g.
+#   LOAD_EXTENSION=/opt/browser-bridge/tests/fixtures/popup-ctx-ext
+# Passing it overrides the container command, so Chrome runs in exec mode (no
+# foreground supervisor / restart support) — use only for tests that don't
+# restart Chrome.
+LOAD_EXTENSION ?=
 
 remove-test-browser:
 	@docker rm -f $(BROWSER_TEST_CONTAINER) 2>/dev/null || true
@@ -68,11 +84,13 @@ start-test-browser:
 	@docker run -d --name $(BROWSER_TEST_CONTAINER) --shm-size=2g \
 		-p 6080:6080 -p 18800:18800 \
 		-e BRIDGE_LOG=$(BRIDGE_LOG) \
+		-e CHROME_USER_DATA_DIR=$(CHROME_USER_DATA_DIR) \
 		-v $(CURDIR)/browser/browser-bridge/server.mjs:/opt/browser-bridge/server.mjs:ro \
 		-v $(CURDIR)/browser/browser-bridge/mcp.mjs:/opt/browser-bridge/mcp.mjs:ro \
 		-v $(CURDIR)/browser/browser-bridge/index.html:/opt/browser-bridge/index.html:ro \
 		-v $(CURDIR)/browser/browser-bridge/tests:/opt/browser-bridge/tests:ro \
-		$(BROWSER_TEST_IMAGE)
+		$(BROWSER_TEST_IMAGE) \
+		$(if $(LOAD_EXTENSION),chrome --load-extension=$(LOAD_EXTENSION),)
 	@printf 'Waiting for bridge'
 	@for i in $$(seq 1 30); do \
 		docker exec $(BROWSER_TEST_CONTAINER) \

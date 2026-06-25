@@ -20,7 +20,7 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { WebSocketServer, WebSocket } from 'ws';
-import { createMcpHandler, getMcpState, noteTabClosed, onMcpStateChange, clearAttention, pruneStaleTabs, isDevMode, devModeSessionHandler, inheritMcpOwnership } from './mcp.mjs';
+import { createMcpHandler, getMcpState, noteTabClosed, onMcpStateChange, clearAttention, rehydrateOwnership, onOwnedTabNavigated, isDevMode, devModeSessionHandler, inheritMcpOwnership } from './mcp.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -814,6 +814,9 @@ function poolSessionHandler(targetId, entry, msg) {
   // Track main frame ID for all targets
   if (msg.method === 'Page.frameNavigated' && !msg.params.frame?.parentId) {
     entry.mainFrameId = msg.params.frame?.id;
+    // Refresh the persisted cross-restart fingerprint for MCP-owned tabs (and
+    // stamp the marker if a prior opaque origin blocked it). No-op otherwise.
+    onOwnedTabNavigated(targetId);
   }
 
   // Page events — only forward from active target
@@ -1122,11 +1125,6 @@ function reconnectToBrowser() {
         await ensureBrowserConnection();
         const targets = await getCdpTargets();
         const pages = targets.filter(t => t.type === 'page');
-        // After a chrome restart every targetId is brand-new — drop
-        // stale MCP-owned / attention tracking so counts stay consistent
-        // and the FIFO cap doesn't get pinned by entries no chrome
-        // process can match.
-        pruneStaleTabs(pages.map(p => p.id));
         // Invalidate disk-backed caches. Between WS-close and this
         // reconnect, getProfileStatus/getExtensions may have been called
         // (e.g. on a viewer refresh during the gap) and cached an empty
@@ -1141,6 +1139,11 @@ function reconnectToBrowser() {
           await poolAttach(page.id).catch(err =>
             log.error('reconnectToBrowser poolAttach failed:', err.message));
         }
+        // A chrome restart mints brand-new targetIds, so the old MCP-owned /
+        // attention keys no longer match. Rather than discard them, re-match
+        // persisted records to the restored tabs by sessionStorage UUID (then
+        // history-hash fallback) and rebuild ownership with the fresh ids.
+        await rehydrateOwnership(mcpDeps, pages);
         if (pages.length === 0) {
           const page = await ensureAtLeastOnePage();
           await enqueueOp(() => switchToTarget(page.id));
@@ -1205,7 +1208,46 @@ function jsonResponse(res, data, status = 200) {
 // stays focused on screencast/viewer. Tools are dispatched here through
 // dependency injection so mcp.mjs has no direct knowledge of bridge
 // internals beyond the documented surface.
-const mcpHandler = createMcpHandler({
+// MCP-owned/attention state is persisted next to the Chrome profile (one level
+// above Default, i.e. the user-data-dir root) so it lands on the same durable
+// volume the profile uses and survives container/browser restarts. With an
+// ephemeral profile the path lives under /tmp and is wiped on restart — then
+// the tabs don't restore either, so there's nothing to lose.
+const MCP_STATE_FILENAME = 'browser-bridge-mcp-state.json';
+// Resolve the user-data-dir root. CHROME_USER_DATA_DIR is the authoritative
+// source the launcher itself uses, and it's already in the bridge's env — so
+// we don't depend on ensureProfileDir(), which additionally requires a
+// Default/Preferences that a brand-new profile hasn't written yet. Fall back to
+// the chrome://version-derived profile dir for the puppeteer-compat launch path
+// (chrome --user-data-dir=...) where the env var isn't set.
+async function mcpStatePath() {
+  let root = process.env.CHROME_USER_DATA_DIR || null;
+  if (!root) {
+    await ensureProfileDir();
+    if (profileDir) root = path.dirname(profileDir);
+  }
+  if (!root) return null;
+  return path.join(root, MCP_STATE_FILENAME);
+}
+async function persistMcpState(jsonString) {
+  const file = await mcpStatePath();
+  if (!file) return;
+  // Write-then-rename so a crash mid-write never leaves a truncated file.
+  const tmp = file + '.tmp';
+  await fs.promises.writeFile(tmp, jsonString);
+  await fs.promises.rename(tmp, file);
+}
+async function loadMcpState() {
+  const file = await mcpStatePath();
+  if (!file) return null;
+  try {
+    return await fs.promises.readFile(file, 'utf8');
+  } catch {
+    return null;
+  }
+}
+
+const mcpDeps = {
   // Single shared dispatcher — MCP and viewer mutate state through the
   // same event API so behavior is uniform (MCP closing a tab triggers
   // the same tabClosing/Complete broadcast a viewer click does).
@@ -1222,8 +1264,12 @@ const mcpHandler = createMcpHandler({
   poolAttach,
   sessionPool,
   ensureBrowserConnection,
+  // Disk-backed persistence for cross-restart ownership recovery.
+  persistMcpState,
+  loadMcpState,
   log,
-});
+};
+const mcpHandler = createMcpHandler(mcpDeps);
 
 const server = http.createServer(async (req, res) => {
   const p = routePath(req.url);
@@ -1645,6 +1691,24 @@ viewerWss.on('connection', async (client, req) => {
           const extId = msg.extensionId;
           if (!extId) break;
           let opened = false;
+
+          // chrome.action.openPopup() binds the popup to Chrome's currently
+          // active tab in the focused window — that's where the popup's
+          // chrome.tabs.query({active,currentWindow}) reads from. The bridge's
+          // viewed tab (activeTargetId) can drift from Chrome's notion of the
+          // active tab (background helper-tab churn, a prior popup activation,
+          // multi-window), and the popup would then open with the wrong tab's
+          // context. Re-assert activation of the viewed tab first so the popup
+          // sees what the user is actually looking at. We can't reuse
+          // switchToTarget() for this: it early-returns when the target is
+          // already activeTargetId + screencasting (precisely the drift case),
+          // so it would skip the activateTarget call — use the same activation
+          // primitives it does (Target.activateTarget + Page.bringToFront).
+          if (activeTargetId) {
+            await browserCommand('Target.activateTarget', { targetId: activeTargetId }).catch(() => {});
+            const viewedEntry = sessionPool.get(activeTargetId);
+            if (viewedEntry) await sessionCommand(viewedEntry.sessionId, 'Page.bringToFront').catch(() => {});
+          }
 
           // Try native popup API so the popup gets correct active-tab context.
           // After openPopup(), poll using both /json/list (HTTP endpoint) and

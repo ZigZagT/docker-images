@@ -20,13 +20,18 @@
 // any regression. Runtime.evaluate is a one-shot command and does NOT
 // require enable; we use it directly.
 
+import crypto from 'node:crypto';
+
 const PROTOCOL_VERSION = '2025-06-18';
 const SERVER_INFO = { name: 'browser-bridge', version: '1.0.0' };
 
 const MCP_MAX_OPEN_TABS = Math.max(1, parseInt(process.env.MCP_MAX_OPEN_TABS || '3', 10));
 const MCP_MAX_ATTENTION = Math.max(1, parseInt(process.env.MCP_MAX_ATTENTION || '3', 10));
 
-// Insertion-order Map → FIFO. Key = targetId, value = { openedAt }.
+// Insertion-order Map → FIFO. Key = targetId, value = { openedAt, uuid,
+// markerInstalled }. uuid is the sessionStorage marker stamped into the tab
+// for cross-restart identity (see "Persistence & cross-restart identity"
+// below); markerInstalled tracks whether the stamp succeeded on this session.
 const mcpOwnedTabs = new Map();
 // Map<targetId, { message, since }>. Capacity-limited at MCP_MAX_ATTENTION.
 const attentionRequests = new Map();
@@ -209,6 +214,9 @@ function notifyStateChanged() {
   for (const fn of stateListeners) {
     try { fn(); } catch { /* ignore */ }
   }
+  // Every ownership/attention mutation flushes to disk (debounced) so the
+  // persisted snapshot tracks memory. schedulePersist is hoisted.
+  schedulePersist();
 }
 
 export function getMcpState() {
@@ -244,31 +252,13 @@ export function inheritMcpOwnership(childTargetId, openerTargetId) {
     mcpOwnedTabs.delete(oldest);
     evicted.push(oldest);
   }
-  mcpOwnedTabs.set(childTargetId, { openedAt: Date.now() });
+  mcpOwnedTabs.set(childTargetId, { openedAt: Date.now(), uuid: crypto.randomUUID(), markerInstalled: false });
   notifyStateChanged();
+  // Stamp the marker so the inherited child survives a restart too. Async +
+  // best-effort: the child target may not be attached yet, in which case
+  // stampOwnershipMarker re-tries on the tab's next navigation.
+  if (mcpDeps) stampOwnershipMarker(mcpDeps, childTargetId).catch(() => {});
   return { inherited: true, evicted };
-}
-
-// Drop tracking for any targetId no longer present in the live browser
-// (e.g. after a chrome restart, where every targetId is fresh and the
-// old in-memory MCP-owned/attention map would otherwise leak entries
-// forever, miscounting against the FIFO cap and breaking ownership UX).
-export function pruneStaleTabs(liveTargetIds) {
-  const live = new Set(liveTargetIds);
-  let changed = false;
-  for (const id of mcpOwnedTabs.keys()) {
-    if (!live.has(id)) { mcpOwnedTabs.delete(id); changed = true; }
-  }
-  for (const id of attentionRequests.keys()) {
-    if (!live.has(id)) { attentionRequests.delete(id); changed = true; }
-  }
-  for (const id of tabSnapshots.keys()) {
-    if (!live.has(id)) tabSnapshots.delete(id);
-  }
-  for (const id of devModeTabs.keys()) {
-    if (!live.has(id)) { devModeTabs.delete(id); changed = true; }
-  }
-  if (changed) notifyStateChanged();
 }
 
 // Used by the viewer's "dismiss" button on the attention floating box.
@@ -285,6 +275,256 @@ export function clearAttention(targetId) {
 export function onMcpStateChange(fn) {
   stateListeners.add(fn);
   return () => stateListeners.delete(fn);
+}
+
+// --- Persistence & cross-restart identity ---
+//
+// Background: MCP-owned/attention state lived only in these in-memory Maps, so
+// it evaporated on any bridge restart and — worse — on a browser (Chrome)
+// restart, where session-restore brings the *tabs* back but Chrome mints
+// brand-new targetIds. The old code's pruneStaleTabs() deliberately discarded
+// every entry whose targetId no longer matched, so ownership was lost. There
+// is no CDP-exposed identifier stable across a Chrome restart, so we anchor on
+// two restored properties instead of targetId, in priority order:
+//
+//   1. sessionStorage UUID — stamped into each owned tab and read back after
+//      restart. Chrome session-restore preserves sessionStorage, so the UUID
+//      is an exact, unique key. Stamped via Page.addScriptToEvaluateOnNewDocument
+//      (re-applies on every future document, so it self-heals across
+//      cross-origin navigations that would otherwise drop the per-origin value)
+//      plus an immediate Runtime.evaluate for the already-loaded document.
+//      Unavailable on opaque origins (data:, sandboxed) where sessionStorage
+//      throws — those fall back to (2).
+//   2. navigation-history hash — sha256 of the back/forward entry URL list +
+//      current index (Page.getNavigationHistory). This is *browser* metadata,
+//      restored regardless of the document's origin, so it covers the
+//      opaque-origin tabs the UUID can't. Hashed because a data: URL history
+//      entry can be huge. Matched only when it resolves to exactly ONE
+//      unclaimed live tab — an ambiguous match is left unclaimed rather than
+//      risk stealing a user tab. There is deliberately NO tab-order tier:
+//      restore does not guarantee stable order.
+//
+// about:blank / contentless tabs are intentionally unsupported: no marker, no
+// history, nothing to re-own — and they carry no state worth preserving.
+//
+// The whole scheme only pays off when Chrome is configured to restore the
+// session ("continue where you left off"); the launcher leaves that to the
+// user's chrome://settings (see chrome-launcher). Without restore the tabs
+// don't come back and there's nothing to match against — a no-op, not a bug.
+
+const MARKER_KEY = '__bb_mcp';
+
+// Module-level deps handle, set by createMcpHandler — lets mutation, persist,
+// and rehydrate paths reach CDP (sessionCommand/poolAttach) and disk
+// (persistMcpState/loadMcpState) without threading `deps` through every caller.
+let mcpDeps = null;
+
+function markerSource(uuid) {
+  // Stamp only the top document. Subframe sessionStorage is per-origin; marking
+  // frames would scatter extra detectable keys across embedded origins for no
+  // benefit (we only re-identify the top-level tab).
+  return `try{if(window.top===window){var k=${JSON.stringify(MARKER_KEY)};` +
+         `if(!sessionStorage.getItem(k))sessionStorage.setItem(k,${JSON.stringify(uuid)});}}catch(e){}`;
+}
+
+async function stampOwnershipMarker(d, targetId) {
+  const meta = mcpOwnedTabs.get(targetId);
+  if (!meta || meta.markerInstalled) return;
+  if (!meta.uuid) meta.uuid = crypto.randomUUID();
+  try {
+    await d.poolAttach(targetId);
+    const entry = d.sessionPool.get(targetId);
+    if (!entry) return;
+    // Register for every future document so the marker survives navigation...
+    await d.sessionCommand(entry.sessionId, 'Page.addScriptToEvaluateOnNewDocument', { source: markerSource(meta.uuid) });
+    // ...and stamp the document that's already loaded.
+    await d.sessionCommand(entry.sessionId, 'Runtime.evaluate', {
+      expression: `(()=>{try{if(window.top===window)sessionStorage.setItem(${JSON.stringify(MARKER_KEY)},${JSON.stringify(meta.uuid)});}catch(e){}})()`,
+      returnByValue: true,
+    });
+    meta.markerInstalled = true;
+  } catch {
+    // Opaque origin (sessionStorage throws) or transient CDP error. Leave
+    // markerInstalled false so onOwnedTabNavigated retries once the tab lands
+    // on a storable origin. History-hash identity still covers it meanwhile.
+  }
+}
+
+async function readOwnershipMarker(d, targetId) {
+  try {
+    await d.poolAttach(targetId);
+    const entry = d.sessionPool.get(targetId);
+    if (!entry) return null;
+    const r = await d.sessionCommand(entry.sessionId, 'Runtime.evaluate', {
+      expression: `(()=>{try{return window.top===window?(sessionStorage.getItem(${JSON.stringify(MARKER_KEY)})||null):null;}catch(e){return null;}})()`,
+      returnByValue: true,
+    });
+    return r.result?.result?.value || null;
+  } catch { return null; }
+}
+
+async function navHistoryHash(d, targetId) {
+  try {
+    await d.poolAttach(targetId);
+    const entry = d.sessionPool.get(targetId);
+    if (!entry) return null;
+    const r = await d.sessionCommand(entry.sessionId, 'Page.getNavigationHistory', {});
+    const h = r.result;
+    if (!h || !Array.isArray(h.entries) || h.entries.length === 0) return null;
+    const basis = h.entries.map(e => e.url).join('\n') + '\0' + h.currentIndex;
+    return crypto.createHash('sha256').update(basis).digest('hex');
+  } catch { return null; }
+}
+
+// Persist writes are serialized and coalesced. Serialization matters for
+// correctness: two overlapping persists could finish out of order and leave an
+// older snapshot on disk. The persisting/persistQueued pair guarantees a fresh
+// write always follows the latest mutation, with no overlap.
+let persistTimer = null;
+let persisting = false;
+let persistQueued = false;
+
+function schedulePersist() {
+  if (!mcpDeps || !mcpDeps.persistMcpState) return;
+  if (persistTimer) return;
+  persistTimer = setTimeout(() => { persistTimer = null; runPersist(); }, 400);
+}
+
+async function runPersist() {
+  if (persisting) { persistQueued = true; return; }
+  persisting = true;
+  try {
+    await persistNow(mcpDeps);
+  } catch (e) {
+    mcpDeps?.log?.error?.('mcp state persist failed:', e.message);
+  } finally {
+    persisting = false;
+    if (persistQueued) { persistQueued = false; runPersist(); }
+  }
+}
+
+async function persistNow(d) {
+  // Snapshot the id set + metadata synchronously, THEN read histories. The
+  // hash reads await, but the record set is fixed up front so it stays
+  // internally consistent even if a tool mutates the Maps mid-flight.
+  const ids = new Set([...mcpOwnedTabs.keys(), ...attentionRequests.keys()]);
+  const snap = [];
+  for (const id of ids) snap.push({ id, meta: mcpOwnedTabs.get(id) || null, att: attentionRequests.get(id) || null });
+  for (const s of snap) s.hash = await navHistoryHash(d, s.id);
+  const tabs = snap.map(s => ({
+    owned: !!s.meta,
+    uuid: s.meta?.uuid || null,
+    historyHash: s.hash,
+    openedAt: s.meta?.openedAt ?? null,
+    attention: s.att ? { message: s.att.message, since: s.att.since } : null,
+  }));
+  tabs.sort((a, b) => (a.openedAt ?? Infinity) - (b.openedAt ?? Infinity));
+  await d.persistMcpState(JSON.stringify({ version: 1, tabs }));
+}
+
+// Re-establish ownership after a (re)connect by matching persisted records to
+// live tabs. Serialized via a promise chain so a reconnect-triggered rehydrate
+// and the cold-start one never interleave. Called by server.mjs on reconnect,
+// and once lazily on the first tool call (ensureRehydrated) for a cold bridge.
+let rehydrateChain = Promise.resolve();
+let ensureRehydratedPromise = null;
+
+export function rehydrateOwnership(d, pages) {
+  rehydrateChain = rehydrateChain.then(() => doRehydrate(d, pages)).catch(e => {
+    d?.log?.error?.('mcp rehydrate failed:', e.message);
+  });
+  return rehydrateChain;
+}
+
+// Cold-bridge rehydration, run exactly once. Memoized as a PROMISE (not a
+// boolean) so concurrent first tool calls all await the same in-flight
+// rehydration — a boolean flag would let the second caller proceed against a
+// not-yet-rebuilt map.
+function ensureRehydrated(d) {
+  if (!ensureRehydratedPromise) {
+    ensureRehydratedPromise = (async () => {
+      let pages = [];
+      try {
+        const targets = await d.getCdpTargets();
+        pages = targets.filter(t => t.type === 'page');
+      } catch { /* not connected yet — nothing to rehydrate against */ }
+      await rehydrateOwnership(d, pages);
+    })();
+  }
+  return ensureRehydratedPromise;
+}
+
+async function doRehydrate(d, pages) {
+  if (!d.loadMcpState) return;
+  let records = [];
+  const raw = await d.loadMcpState();
+  if (raw) {
+    try {
+      const obj = JSON.parse(raw);
+      if (obj && Array.isArray(obj.tabs)) records = obj.tabs;
+    } catch { /* corrupt state file — start clean */ }
+  }
+  // Nothing persisted and nothing stale in memory → no work.
+  if (!records.length && mcpOwnedTabs.size === 0 && attentionRequests.size === 0) return;
+
+  const probes = await Promise.all(pages.map(async p => ({
+    id: p.id,
+    marker: await readOwnershipMarker(d, p.id),
+    hash: await navHistoryHash(d, p.id),
+  })));
+
+  records.sort((a, b) => (a.openedAt ?? Infinity) - (b.openedAt ?? Infinity));
+  const used = new Set();
+  const matched = []; // { rec, id }
+
+  // Pass 1 — exact UUID match (normal origins).
+  for (const rec of records) {
+    if (!rec.uuid) continue;
+    const m = probes.find(pr => !used.has(pr.id) && pr.marker && pr.marker === rec.uuid);
+    if (m) { used.add(m.id); matched.push({ rec, id: m.id }); rec._matched = true; }
+  }
+  // Pass 2 — history hash, only when it resolves to exactly one free tab
+  // (opaque-origin tabs the UUID couldn't reach). Ambiguous → left unclaimed.
+  for (const rec of records) {
+    if (rec._matched || !rec.historyHash) continue;
+    const cands = probes.filter(pr => !used.has(pr.id) && pr.hash && pr.hash === rec.historyHash);
+    if (cands.length === 1) { used.add(cands[0].id); matched.push({ rec, id: cands[0].id }); }
+  }
+
+  const owned = matched.filter(m => m.rec.owned)
+    .sort((a, b) => (a.rec.openedAt ?? Infinity) - (b.rec.openedAt ?? Infinity));
+  const live = new Set(pages.map(p => p.id));
+
+  // Synchronous commit — no awaits between clear and rebuild, so no concurrent
+  // tool handler ever observes a half-rebuilt Map. Map insertion order follows
+  // openedAt, preserving FIFO age.
+  mcpOwnedTabs.clear();
+  attentionRequests.clear();
+  for (const m of owned) {
+    mcpOwnedTabs.set(m.id, { openedAt: m.rec.openedAt ?? Date.now(), uuid: m.rec.uuid || null, markerInstalled: false });
+  }
+  for (const m of matched) {
+    if (m.rec.attention) attentionRequests.set(m.id, { message: m.rec.attention.message, since: m.rec.attention.since });
+  }
+  // targetIds changed on a browser restart; drop session-bound state for any id
+  // not live (same cleanup the old pruneStaleTabs did for these two Maps).
+  for (const id of tabSnapshots.keys()) if (!live.has(id)) tabSnapshots.delete(id);
+  for (const id of devModeTabs.keys()) if (!live.has(id)) devModeTabs.delete(id);
+  notifyStateChanged();
+
+  // Re-arm markers on the new sessions, and upgrade history-only matches (no
+  // uuid) to a fresh UUID so next restart can match them exactly. Best-effort,
+  // after the commit.
+  for (const id of mcpOwnedTabs.keys()) stampOwnershipMarker(d, id).catch(() => {});
+}
+
+// Called by server.mjs when an MCP-owned tab finishes a main-frame navigation:
+// refresh the persisted history fingerprint, and stamp the UUID marker if it
+// wasn't installable before (e.g. the tab just moved off an opaque origin).
+export function onOwnedTabNavigated(targetId) {
+  if (!mcpOwnedTabs.has(targetId)) return;
+  if (mcpDeps) stampOwnershipMarker(mcpDeps, targetId).catch(() => {});
+  schedulePersist();
 }
 
 // --- Server-level instructions ---
@@ -851,7 +1091,7 @@ const TOOLS = [
 
       const create = await d.dispatchBridgeEvent({ type: 'newTab', url });
       const tabId = create.targetId;
-      mcpOwnedTabs.set(tabId, { openedAt: Date.now() });
+      mcpOwnedTabs.set(tabId, { openedAt: Date.now(), uuid: crypto.randomUUID(), markerInstalled: false });
       notifyStateChanged();
       if (evicted.length) {
         notice =
@@ -862,6 +1102,8 @@ const TOOLS = [
 
       // Best-effort load wait — poll the URL until stable or 8s elapses.
       await d.poolAttach(tabId);
+      // Stamp the cross-restart marker now that the tab is attached.
+      await stampOwnershipMarker(d, tabId);
       const deadline = Date.now() + 8000;
       let lastUrl = '';
       while (Date.now() < deadline) {
@@ -1839,6 +2081,9 @@ async function dispatch(msg, deps, log) {
       if (!tool) return errorReply(id, -32602, 'Unknown tool: ' + params?.name);
       try {
         await deps.ensureBrowserConnection();
+        // Cold-bridge start: rebuild ownership from disk before the first tool
+        // acts, so FIFO counts and mcpOwned flags reflect the surviving tabs.
+        await ensureRehydrated(deps);
         const result = await tool.run(params.arguments || {}, deps);
         return reply(id, result);
       } catch (err) {
@@ -1879,6 +2124,8 @@ function errorReply(id, code, message) { return { jsonrpc: '2.0', id, error: { c
 //   log                             — { error, info, debug }
 export function createMcpHandler(deps) {
   const log = deps.log;
+  // Stash deps so mutation/persist/rehydrate paths can reach CDP + disk.
+  mcpDeps = deps;
   return async function handle(req, res) {
     if (req.method === 'GET' || req.method === 'DELETE') {
       res.writeHead(405, { 'Content-Type': 'application/json' });
