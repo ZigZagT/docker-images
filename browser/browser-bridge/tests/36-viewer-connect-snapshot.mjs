@@ -7,12 +7,13 @@
 //   - tabs:          list of all tabs (so tab bar is populated)
 //   - extensions:    extension icons (toolbar)
 //   - profileStatus: account state (avatar)
-//   - frame:         at least one frame (so canvas is not blank)
+//   - frame:         returned after the viewer asks for the latest frame
 import { WebSocket } from 'ws';
 import { delay, pass, fail } from './helpers.mjs';
 
 const ws = new WebSocket('ws://127.0.0.1:6080/ws');
 await new Promise(r => ws.on('open', r));
+ws.send(JSON.stringify({ type: 'requestFrame' }));
 
 const received = new Set();
 ws.on('message', d => {

@@ -507,6 +507,9 @@ let currentTargetId = null;
 let pendingNewTabFocus = false;
 const closingTabs = new Set();
 let profileInterval;
+let frameRequestInFlight = false;
+let frameLoopStarted = false;
+let frameRequestAt = 0;
 
 const extBar = document.getElementById('ext-bar');
 const findBar = document.getElementById('find-bar');
@@ -528,6 +531,8 @@ function connect() {
 
   ws.onopen = () => {
     setStatus('connecting...', 'connecting');
+    frameRequestInFlight = false;
+    startFrameLoop();
     requestTabs();
     send({ type: 'getExtensions' });
     send({ type: 'getProfileStatus' });
@@ -539,14 +544,15 @@ function connect() {
   };
   ws.onclose = () => {
     setStatus('disconnected', 'disconnected');
+    frameRequestInFlight = false;
     clearInterval(profileInterval);
     setTimeout(connect, 2000);
   };
   ws.onerror = (e) => { console.error('WebSocket error:', e); };
 
-  // Assign onload once — replacing it per-frame creates closure churn
-  // and races. The handler reads current img state, which is correct
-  // because img.src assignment is the latest.
+  // Assign onload once. The server only sends a frame after this viewer
+  // requests one; once decode+draw finishes, the next rAF can request the
+  // latest available frame instead of replaying stale frame history.
   img.onload = () => {
     if (img.naturalWidth !== frameWidth || img.naturalHeight !== frameHeight) {
       frameWidth = img.naturalWidth;
@@ -554,8 +560,13 @@ function connect() {
       resize();
     }
     ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    frameRequestInFlight = false;
+    send({ type: 'frameDrawn' });
   };
-  img.onerror = () => {};
+  img.onerror = () => {
+    frameRequestInFlight = false;
+    send({ type: 'frameDrawn' });
+  };
 
   ws.onmessage = (e) => {
     let msg;
@@ -575,6 +586,7 @@ function connect() {
     if (msg.type === 'targetChanged') {
       urlBar.value = msg.url || '';
       currentTargetId = msg.targetId;
+      frameRequestInFlight = false;
       const tcTab = currentTabs.find(t => t.id === msg.targetId);
       if (tcTab) {
         if (msg.url) tcTab.url = msg.url;
@@ -716,6 +728,28 @@ function connect() {
 
 function send(obj) {
   if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
+}
+
+function startFrameLoop() {
+  if (frameLoopStarted) return;
+  frameLoopStarted = true;
+  const tick = () => {
+    if (ws && ws.readyState === 1) {
+      // If a response vanished during reconnect or decode never fired, avoid a
+      // permanent stall. Normal flow clears this in img.onload/img.onerror.
+      if (frameRequestInFlight && performance.now() - frameRequestAt > 3000) {
+        frameRequestInFlight = false;
+        send({ type: 'frameDrawn' });
+      }
+      if (!frameRequestInFlight) {
+        frameRequestInFlight = true;
+        frameRequestAt = performance.now();
+        send({ type: 'requestFrame' });
+      }
+    }
+    requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
 }
 
 function requestTabs() { send({ type: 'getTabs' }); }

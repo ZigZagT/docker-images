@@ -78,6 +78,7 @@ let screencastActive = false;
 // user sees content immediately instead of a blank canvas while waiting
 // for Chrome to produce the next frame (which only happens on visual change).
 let lastFrame = null;
+let frameSeq = 0;
 
 // Operation queue — all state-mutating async operations (switchToTarget,
 // reconcileTabsGlobal) run through this queue sequentially.
@@ -708,6 +709,28 @@ function broadcastToViewers(obj) {
   }
 }
 
+function sendFrameToViewer(client, frame = lastFrame) {
+  if (!frame || client.readyState !== WebSocket.OPEN) return false;
+  if (client.lastFrameIdSent === frame.frameId) {
+    client.waitingForFrame = true;
+    return false;
+  }
+  client.waitingForFrame = false;
+  client.frameInFlight = true;
+  client.lastFrameIdSent = frame.frameId;
+  client.send(JSON.stringify(frame));
+  return true;
+}
+
+function satisfyWaitingFrameViewers() {
+  if (!lastFrame) return;
+  for (const client of viewerWss.clients) {
+    if (client.readyState === WebSocket.OPEN && client.waitingForFrame && !client.frameInFlight) {
+      sendFrameToViewer(client);
+    }
+  }
+}
+
 function activeSession() {
   if (!activeTargetId) return null;
   return sessionPool.get(activeTargetId) || null;
@@ -793,20 +816,21 @@ function poolSessionHandler(targetId, entry, msg) {
     log.info('bfcache rejected for', targetId.slice(0, 8) + ':', reasons.join(', ') || 'unknown');
   }
 
-  // Screencast frames — only from active target, broadcast to all viewers
+  // Screencast frames — only keep the latest active-target frame. Viewers pull
+  // frames when ready, so slow clients never replay stale frame history.
   if (msg.method === 'Page.screencastFrame') {
     sessionSend(entry.sessionId, 'Page.screencastFrameAck', {
       sessionId: msg.params.sessionId
     });
     if (targetId === activeTargetId) {
-      const frame = {
+      lastFrame = {
         type: 'frame',
+        frameId: ++frameSeq,
         data: msg.params.data,
         metadata: msg.params.metadata,
         sessionId: msg.params.sessionId
       };
-      lastFrame = frame;
-      broadcastToViewers(frame);
+      satisfyWaitingFrameViewers();
     }
     return;
   }
@@ -1412,6 +1436,16 @@ viewerWss.on('connection', async (client, req) => {
     if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify(obj));
   }
 
+  let viewerReady = false;
+  const earlyViewerMessages = [];
+  client.on('message', (data) => {
+    if (!viewerReady) {
+      earlyViewerMessages.push(data);
+      return;
+    }
+    handleViewerMessage(data);
+  });
+
   // Drain pending ops (e.g. reconciliation after tab closure by test
   // runner's cleanTabs) so the snapshot reflects settled state.
   await enqueueOp(() => {});
@@ -1443,9 +1477,6 @@ viewerWss.on('connection', async (client, req) => {
       clientSend({ type: 'tabs', tabs: tabPages, mcpLimits: mcpState.limits });
       clientSend({ type: 'extensions', extensions: exts });
       if (profile) clientSend({ type: 'profileStatus', ...profile });
-      // Replay last frame so canvas isn't blank while waiting for the
-      // next screencast frame (which only fires on visual change).
-      if (lastFrame) clientSend(lastFrame);
     } catch {}
   }
 
@@ -1455,6 +1486,22 @@ viewerWss.on('connection', async (client, req) => {
       await ensureBrowserConnection();
       const target = await findPageTarget(preferredTarget || null);
       await enqueueOp(() => switchToTarget(target.targetId));
+      const [tabTargets, exts, profile] = await Promise.all([
+        getCdpTargets(),
+        getExtensionInfo().catch(() => []),
+        getProfileStatus().catch(() => null)
+      ]);
+      const mcpState = getMcpState();
+      const tabPages = tabTargets.filter(t => t.type === 'page').map(t => ({
+        id: t.id, url: t.url, title: t.title,
+        active: t.id === activeTargetId,
+        mcpOwned: !!mcpState.owned[t.id],
+        devMode: !!mcpState.devMode[t.id],
+        attention: mcpState.attention[t.id] || null,
+      }));
+      clientSend({ type: 'tabs', tabs: tabPages, mcpLimits: mcpState.limits });
+      clientSend({ type: 'extensions', extensions: exts });
+      if (profile) clientSend({ type: 'profileStatus', ...profile });
     } catch (err) {
       log.error('viewer bootstrap failed:', err.message);
       clientSend({ type: 'status', message: 'Waiting for browser to start...' });
@@ -1467,12 +1514,24 @@ viewerWss.on('connection', async (client, req) => {
     // Nothing to clean up — session pool is independent of viewer lifecycle
   });
 
-  client.on('message', async (data) => {
+  viewerReady = true;
+  for (const data of earlyViewerMessages.splice(0)) handleViewerMessage(data);
+
+  async function handleViewerMessage(data) {
     try {
       const msg = JSON.parse(data.toString());
       const entry = activeSession();
 
       switch (msg.type) {
+        case 'requestFrame':
+          if (client.frameInFlight) break;
+          if (!sendFrameToViewer(client)) client.waitingForFrame = true;
+          break;
+
+        case 'frameDrawn':
+          client.frameInFlight = false;
+          break;
+
         case 'mouse':
           if (entry) sessionSend(entry.sessionId, 'Input.dispatchMouseEvent', {
             type: msg.action, x: msg.x, y: msg.y,
@@ -1904,7 +1963,7 @@ viewerWss.on('connection', async (client, req) => {
     } catch (err) {
       log.error('viewer message error:', err?.message || err);
     }
-  });
+  }
 });
 
 server.listen(PORT, '0.0.0.0', () => {
