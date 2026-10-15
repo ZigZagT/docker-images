@@ -606,7 +606,9 @@ far to scroll, not where to place the mouse pointer.
 
 Available interaction tools:
 
-- browser_click({tabId, uid}) or ({tabId, selector}) — trusted mouse click.
+- browser_click({tabId, at, mouseButton?, doubleClick?, delayMs?}) — click.
+  Choose at:{uid}, at:{selector}, or at:{x,y}; uid or selector also work without at.
+- browser_move_pointer({tabId, to, from?, mouseButton?}) — Move mouse pointer.
 - browser_type({tabId, text, uid?, selector?}) — trusted keystrokes; uid/selector
   to focus first, omit to continue typing into already-focused element.
 - browser_press_key({tabId, key}) — single named key (Enter, Tab, Escape,
@@ -1130,15 +1132,80 @@ async function buildAndStoreSnapshot(d, tabId) {
 
 // --- Internal helpers used by interaction tools ---
 
-// CDP dispatched mouse click — produces isTrusted=true events that bot-
-// detection scripts can't distinguish from real human input.
+// Each click or drag completes its press/move/release sequence within one call.
 const MODIFIER_BITS = { alt: 1, ctrl: 2, meta: 4, shift: 8 };
-
-async function cdpClickAt(d, sessionId, x, y, modifiers = 0) {
-  const common = { x, y, button: 'left', clickCount: 1, modifiers };
-  await d.sessionCommand(sessionId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', ...common });
-  await d.sessionCommand(sessionId, 'Input.dispatchMouseEvent', { type: 'mousePressed', ...common });
-  await d.sessionCommand(sessionId, 'Input.dispatchMouseEvent', { type: 'mouseReleased', ...common });
+const BUTTON_MASK = { left: 1, right: 2, middle: 4 };
+const spatialBusy = new Set();
+const spatialFaults = new Set();
+async function withSpatialInput(sid, fn) {
+  if (spatialFaults.has(sid)) throw new Error('Previous pointer cleanup failed; input state is uncertain. Use a fresh tab.');
+  if (spatialBusy.has(sid)) throw new Error('Another spatial gesture is in progress on this tab; retry after it finishes');
+  spatialBusy.add(sid);
+  try { return await fn(); } finally { spatialBusy.delete(sid); }
+}
+function pointerModifiers(modifiers = []) {
+  if (!Array.isArray(modifiers) || modifiers.some(name => !Object.hasOwn(MODIFIER_BITS, name))) throw new Error('modifiers must contain alt, ctrl, meta or shift');
+  return modifiers.reduce((bits, name) => bits | MODIFIER_BITS[name], 0);
+}
+function pointerOptions({ button = 'left', doubleClick = false, delayMs = 0 }) {
+  if (!Object.hasOwn(BUTTON_MASK, button)) throw new Error('mouseButton must be left, middle or right');
+  if (typeof doubleClick !== 'boolean') throw new Error('doubleClick must be boolean');
+  if (!Number.isInteger(delayMs) || delayMs < 0 || delayMs > 1000) throw new Error('delayMs must be 0–1000');
+  return { button, doubleClick, delayMs };
+}
+async function cdpPointer(d, sid, from, to, { button, modifiers = 0, doubleClick = false, delayMs = 0 } = {}) {
+  return withSpatialInput(sid, async () => {
+    const send = (type, pos, buttons, clickCount = 1) => inputCommand(d, sid, 'Input.dispatchMouseEvent', {
+      type, ...pos, button: button || 'none', buttons, modifiers, clickCount,
+    });
+    if (!button) {
+      await send('mouseMoved', to, 0, 0);
+      return;
+    }
+    let held = false, last = from;
+    try {
+      await send('mouseMoved', from, 0, 0);
+      for (let count = 1; count <= (doubleClick ? 2 : 1); count++) {
+        held = true; // A failed transport reply does not prove the press was rejected.
+        await send('mousePressed', from, BUTTON_MASK[button], count);
+        if (from.x !== to.x || from.y !== to.y) {
+          last = to;
+          await send('mouseMoved', to, BUTTON_MASK[button], 0);
+          // A second event at the same destination lets Chromium deliver dragover
+          // after dragenter.
+          await send('mouseMoved', to, BUTTON_MASK[button], 0);
+        }
+        if (delayMs) await new Promise(resolve => setTimeout(resolve, delayMs));
+        await send('mouseReleased', to, 0, count);
+        held = false;
+      }
+    } catch (error) {
+      if (held) {
+        let suppressed = false;
+        const cleanupErrors = [];
+        try {
+          // Cancellation must not activate a click/drop on the release target.
+          await inputCommand(d, sid, 'Input.setIgnoreInputEvents', { ignore: true });
+          suppressed = true;
+          try { await inputCommand(d, sid, 'Input.cancelDragging'); } catch (e) { cleanupErrors.push(e.message); }
+          try { await send('mouseReleased', last, 0, 0); } catch (e) { cleanupErrors.push(e.message); }
+        } catch (e) { cleanupErrors.push(e.message); }
+        finally {
+          // Re-enable input even when the suppression command fails.
+          try { await inputCommand(d, sid, 'Input.setIgnoreInputEvents', { ignore: false }); } catch (e) { cleanupErrors.push(e.message); }
+        }
+        if (!suppressed || cleanupErrors.length) {
+          spatialFaults.add(sid);
+          throw new Error(error.message + '; pointer cleanup failed; input state uncertain, use a fresh tab: ' + cleanupErrors.join('; '));
+        }
+      }
+      throw error;
+    }
+  });
+}
+async function cdpClickAt(d, sessionId, x, y, modifiers = 0, options = {}) {
+  const point = { x, y };
+  await cdpPointer(d, sessionId, point, point, { ...pointerOptions(options), modifiers });
 }
 
 // Common special-key map for browser_press_key.
@@ -1558,47 +1625,46 @@ const TOOLS = [
   {
     name: 'browser_click',
     description:
-      'Click an element via CDP-dispatched mouse events (isTrusted=true — passes captcha ' +
-      'and bot detection that synthetic JS clicks fail). Identify the element by EITHER ' +
-      '`uid` (preferred, from the most recent browser_get_snapshot) OR `selector` (CSS or ' +
-      'XPath, fallback when no snapshot UID applies).\n\n' +
-      'Click target is the element\'s bounding-box center. Throws if the element is offscreen ' +
-      '(call browser_scroll_into_view first) or if the UID is stale (call browser_get_snapshot again).\n\n' +
-      'Popup blocker note: CDP clicks carry userGesture context, so window.open triggered ' +
-      'within a click handler is NOT blocked by Chrome\'s popup blocker. If a link targets ' +
-      '_blank, the click will open a new tab — check browser_list_tabs after clicking links ' +
-      'that may open popups.\n\n' +
-      'Modifiers: pass ["ctrl"] (or ["meta"] on Mac) to Ctrl+click (opens links in new tab), ' +
-      '["shift"] for Shift+click, etc. Multiple modifiers can be combined.\n\n' +
-      'Set includeSnapshot:true to receive an updated browser_get_snapshot view in the same ' +
-      'response — useful when the click triggers DOM changes you need to inspect.',
+      'Click. Choose at:{uid}, at:{selector}, or at:{x,y}; alternatively, supply uid or selector without at.\n\n' +
+      'x/y are CSS-pixel positions in the visible web content area (page viewport): (0,0) is its top-left corner, x increases rightward and y downward. ' +
+      'Browser tabs, address bar and window borders are excluded. These are not element, document or OS-window coordinates; screenshot pixels may be scaled differently.\n\n' +
+      'mouseButton defaults to "left". doubleClick:true clicks twice; delayMs holds each press for 0–1000 ms (default 0). ' +
+      'Ctrl/Meta-click and middle-click may open tabs; check browser_list_tabs.\n\n' +
+      'Returns clickedAt, mouseButton, doubleClick and delayMs. includeSnapshot:true adds a fresh snapshot. ' +
+      'If an error reports uncertain mouse input state, use a new tab.',
     inputSchema: {
       type: 'object',
       properties: {
-        tabId: { type: 'string' },
-        uid: { type: 'string', description: 'UID from the most recent browser_get_snapshot for this tab.' },
-        selector: { type: 'string', description: 'CSS selector or XPath. Use only if you don\'t have a snapshot UID.' },
-        modifiers: { type: 'array', items: { type: 'string', enum: ['alt', 'ctrl', 'meta', 'shift'] }, description: 'Modifier keys held during click. e.g. ["ctrl"] for Ctrl+click (open link in new tab).' },
-        includeSnapshot: { type: 'boolean', description: 'Append a fresh browser_get_snapshot to the response.' },
+        tabId: { type: 'string', description: "ID of the tab to use, from browser_list_tabs or browser_open." },
+        at: { ...POINT_SCHEMA, description: 'Where to click. ' + POINT_SCHEMA.description },
+        mouseButton: { type: 'string', enum: ['left', 'middle', 'right'], default: 'left', description: "Mouse button to click: left (default), middle or right." },
+        doubleClick: { type: 'boolean', default: false, description: "Set true for a double-click, or false (default) for one click." },
+        delayMs: { type: 'integer', minimum: 0, maximum: 1000, default: 0, description: "How long to hold the mouse button before releasing it, in milliseconds (0\u20131000, default 0). Applies to each press, not the gap between clicks." },
+        uid: { type: 'string', description: "Element ID from the latest browser_get_snapshot for this tab. Choose uid, selector or at; do not combine them." },
+        selector: { type: 'string', description: "Find the first matching page element with a CSS selector, or an XPath beginning with / or (/. Searches the main document, not embedded frames or component interiors (shadow roots). Choose selector, uid or at; do not combine them." },
+        modifiers: { type: 'array', items: { type: 'string', enum: ['alt', 'ctrl', 'meta', 'shift'] }, description: "Keys held during the mouse action: alt, ctrl (Control), meta (Command on macOS), or shift. Omit or use [] for none." },
+        includeSnapshot: { type: 'boolean', description: "Set true to add a new browser_get_snapshot result after clicking. Omit or set false to return only the click result." },
       },
       required: ['tabId'],
+      oneOf: [{ required: ['at'] }, { required: ['uid'] }, { required: ['selector'] }],
     },
-    async run({ tabId, uid, selector, modifiers: mods, includeSnapshot }, d) {
-      if (!uid && !selector) throw new Error('browser_click: provide uid (preferred) or selector');
-      const { entry, x, y } = await resolveTarget(d, tabId, { uid, selector });
-      let bits = 0;
-      if (mods) for (const m of mods) bits |= (MODIFIER_BITS[m] || 0);
+    async run({ tabId, uid, selector, at, modifiers, mouseButton = 'left', doubleClick = false, delayMs = 0, includeSnapshot }, d) {
+      const options = pointerOptions({ button: mouseButton, doubleClick, delayMs });
+      const bits = pointerModifiers(modifiers);
+      if (at !== undefined && (uid !== undefined || selector !== undefined)) throw new Error('Use at OR uid/selector, not both');
+      const { x, y } = await inputPoint(d, tabId, at ?? { uid, selector });
+      const sid = await inputSession(d, tabId);
 
-      // Ctrl/Meta+click opens links in a new tab. Chrome does not set openerId
+      // Ctrl/Meta-click and middle-click open links in a new tab. Chrome does not set openerId
       // on the new target, so Target.targetCreated cannot inherit MCP ownership.
       // Snapshot tab IDs before the click to detect new tabs after.
-      const mayOpenTab = (bits & (MODIFIER_BITS.ctrl | MODIFIER_BITS.meta)) && mcpOwnedTabs.has(tabId);
+      const mayOpenTab = (mouseButton === 'middle' || (bits & (MODIFIER_BITS.ctrl | MODIFIER_BITS.meta))) && mcpOwnedTabs.has(tabId);
       let tabIdsBefore;
       if (mayOpenTab) {
         tabIdsBefore = new Set((await d.getCdpTargets()).filter(t => t.type === 'page').map(t => t.id));
       }
 
-      await cdpClickAt(d, entry.sessionId, x, y, bits);
+      await cdpClickAt(d, sid, x, y, bits, options);
 
       if (tabIdsBefore) {
         await new Promise(r => setTimeout(r, 500));
@@ -1613,7 +1679,44 @@ const TOOLS = [
         }
       }
 
-      const result = { tabId, uid: uid || null, selector: selector || null, clickedAt: { x, y } };
+      const result = { tabId, uid: uid || null, selector: selector || null, clickedAt: { x, y }, mouseButton, doubleClick, delayMs };
+      if (includeSnapshot) result.snapshot = await buildAndStoreSnapshot(d, tabId);
+      return text(JSON.stringify(result, null, 2));
+    },
+  },
+
+  {
+    name: 'browser_move_pointer',
+    description:
+      'Move mouse pointer.\n\n' +
+      'x/y are CSS-pixel positions in the visible web content area (page viewport): (0,0) is its top-left corner, x increases rightward and y downward. ' +
+      'Browser tabs, address bar and window borders are excluded. These are not element, document or OS-window coordinates; screenshot pixels may be scaled differently.\n\n' +
+      'Returns movedTo; dragging also returns movedFrom, mouseButton and released:true. A completed mouse action does not guarantee the page accepted a drop. ' +
+      'includeSnapshot:true adds a fresh snapshot. If an error reports uncertain mouse input state, use a new tab.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'string', description: "ID of the tab to use, from browser_list_tabs or browser_open." },
+        to: { ...POINT_SCHEMA, description: 'Where to move the mouse pointer or end a drag. ' + POINT_SCHEMA.description },
+        from: { ...POINT_SCHEMA, description: 'Drag starting point; requires mouseButton. Omit both to move without pressing. ' + POINT_SCHEMA.description },
+        mouseButton: { type: 'string', enum: ['left', 'middle', 'right'], description: "Button to press at from, hold while moving to to, then release: left, middle or right. Required for dragging; no default." },
+        modifiers: { type: 'array', items: { type: 'string', enum: ['alt', 'ctrl', 'meta', 'shift'] }, description: "Keys held during the mouse action: alt, ctrl (Control), meta (Command on macOS), or shift. Omit or use [] for none." },
+        includeSnapshot: { type: 'boolean', description: "Set true to add a new browser_get_snapshot result after moving or dragging. Omit or set false to return only the mouse action result." },
+      },
+      required: ['tabId', 'to'],
+      dependentRequired: { from: ['mouseButton'], mouseButton: ['from'] },
+    },
+    async run({ tabId, to, from, mouseButton, modifiers, includeSnapshot }, d) {
+      if ((from !== undefined) !== (mouseButton !== undefined)) throw new Error('A held-button move requires both from and mouseButton');
+      if (mouseButton !== undefined) pointerOptions({ button: mouseButton });
+      const bits = pointerModifiers(modifiers);
+      validatePoint(to);
+      if (from !== undefined) validatePoint(from);
+      const end = await inputPoint(d, tabId, to);
+      const start = from === undefined ? end : await inputPoint(d, tabId, from);
+      const sid = await inputSession(d, tabId);
+      await cdpPointer(d, sid, start, end, { button: mouseButton, modifiers: bits });
+      const result = { tabId, movedTo: end, ...(mouseButton ? { movedFrom: start, mouseButton, released: true } : {}) };
       if (includeSnapshot) result.snapshot = await buildAndStoreSnapshot(d, tabId);
       return text(JSON.stringify(result, null, 2));
     },
@@ -1723,7 +1826,8 @@ const TOOLS = [
       if (!['wheel', 'javascript'].includes(method)) throw new Error('method must be wheel or javascript');
       if (at !== undefined) validatePoint(at);
       const run = () => scrollAt(d, tabId, { deltaX, deltaY, at, method });
-      const result = method === 'wheel' ? await withScrollRendering(d, tabId, run) : await run();
+      const sid = await inputSession(d, tabId);
+      const result = await withSpatialInput(sid, () => method === 'wheel' ? withScrollRendering(d, tabId, run) : run());
       return text(JSON.stringify({ tabId, ...result }, null, 2));
     },
   },
@@ -1815,7 +1919,8 @@ const TOOLS = [
         const after = await positions();
         return { tabId, method, visible: true, steps, moved: JSON.stringify(before) !== JSON.stringify(after), before, after };
       });
-      const result = method === 'wheel' ? await withScrollRendering(d, tabId, run) : await run();
+      const sid = await inputSession(d, tabId);
+      const result = await withSpatialInput(sid, () => method === 'wheel' ? withScrollRendering(d, tabId, run) : run());
       if (includeSnapshot) result.snapshot = await buildAndStoreSnapshot(d, tabId);
       return text(JSON.stringify(result, null, 2));
     },
