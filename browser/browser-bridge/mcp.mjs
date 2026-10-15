@@ -596,6 +596,14 @@ The intended workflow:
 UIDs are stable until the next browser_get_snapshot on that tab. If the DOM
 mutates between actions, re-snapshot. Stale UIDs throw a clear error.
 
+Choose a location with {uid} for a snapshot element, {selector} for a matching
+page element, or {x,y} for a point on the page. x/y are CSS-pixel
+positions in the visible web content area (page viewport): (0,0) is its top-left
+corner, x increases rightward and y downward. Browser tabs, address bar and window
+borders are excluded. These are not element, document or OS-window coordinates;
+screenshot pixels may be scaled differently. Scroll deltaX/deltaY specify how
+far to scroll, not where to place the mouse pointer.
+
 Available interaction tools:
 
 - browser_click({tabId, uid}) or ({tabId, selector}) — trusted mouse click.
@@ -603,9 +611,10 @@ Available interaction tools:
   to focus first, omit to continue typing into already-focused element.
 - browser_press_key({tabId, key}) — single named key (Enter, Tab, Escape,
   ArrowDown, etc.). Acts on currently focused element.
-- browser_scroll({tabId, deltaX, deltaY}) — wheel scroll at viewport center.
-- browser_scroll_into_view({tabId, uid}) or ({tabId, selector}) — scroll until
-  element is in view.
+- browser_scroll({tabId, deltaX, deltaY, at?, method?}) — scroll the page or a
+  scrollable area at the chosen location. at defaults to the visible page center.
+- browser_scroll_into_view({tabId, uid}) or ({tabId, selector}) — scroll an
+  element into view. method:"javascript" scrolls without mouse wheel input.
 
 browser_evaluate is for JS evaluation specifically — reading window properties,
 computing values from the DOM, dispatching custom events you wrote. NOT for
@@ -935,6 +944,175 @@ async function resolveTarget(d, tabId, { uid, selector }) {
   const parsed = JSON.parse(r.result?.result?.value || '{}');
   if (parsed.error) throw new Error(parsed.error);
   return { entry, x: parsed.x, y: parsed.y };
+}
+
+// Spatial targets resolve to viewport coordinates without scrolling or focusing.
+const POINT_SCHEMA = {
+  type: 'object', additionalProperties: false,
+  description: 'Use {uid}, {selector}, or {x,y}. Elements must already be visible; the center of their visible area must not be covered. Coordinates must be inside the visible page and address whatever is there.',
+  properties: {
+    uid: { type: 'string', description: 'Element ID from the latest browser_get_snapshot for this tab. If the ID is no longer valid, get a new snapshot.' },
+    selector: { type: 'string', description: 'Find the first matching page element with a CSS selector, or an XPath beginning with / or (/. Searches the main document, not embedded frames or component interiors (shadow roots).' },
+    x: { type: 'number', description: 'Horizontal CSS-pixel position in the visible web content area (page viewport); x increases rightward. (0,0) is its top-left corner. Browser tabs, address bar and window borders are excluded. Not relative to an element, document or OS window; screenshot pixels may have a different scale.' },
+    y: { type: 'number', description: 'Vertical CSS-pixel position in the visible web content area (page viewport); y increases downward. (0,0) is its top-left corner. Browser tabs, address bar and window borders are excluded. Not relative to an element, document or OS window; screenshot pixels may have a different scale.' },
+  },
+  oneOf: [{ required: ['uid'] }, { required: ['selector'] }, { required: ['x', 'y'] }],
+};
+async function inputCommand(d, sid, method, params = {}, timeout) {
+  const r = await d.sessionCommand(sid, method, params, timeout);
+  if (r.error) throw new Error(method + ': ' + r.error.message);
+  if (r.result?.exceptionDetails) throw new Error(r.result.exceptionDetails.exception?.description || r.result.exceptionDetails.text);
+  return r.result;
+}
+async function inputSession(d, tabId) {
+  await d.poolAttach(tabId);
+  const entry = d.sessionPool.get(tabId);
+  if (!entry) throw new Error('tab not found: ' + tabId);
+  return entry.sessionId;
+}
+function validatePoint(target, elementOnly = false) {
+  if (!target || typeof target !== 'object' || Array.isArray(target)) throw new Error('Expected {uid}, {selector}, or {x,y}');
+  const keys = Object.keys(target).filter(k => target[k] !== undefined);
+  if (keys.length === 1 && ['uid', 'selector'].includes(keys[0]) && typeof target[keys[0]] === 'string' && target[keys[0]]) return;
+  if (!elementOnly && keys.length === 2 && keys.includes('x') && keys.includes('y') && Number.isFinite(target.x) && Number.isFinite(target.y)) return;
+  throw new Error(elementOnly ? 'Provide exactly one uid or selector' : 'Provide exactly one target: {uid}, {selector}, or finite {x,y}');
+}
+async function withElement(d, tabId, target, fn) {
+  validatePoint(target, true);
+  const sid = await inputSession(d, tabId);
+  let object;
+  if (target.uid !== undefined) {
+    const backendNodeId = tabSnapshots.get(tabId)?.idToBackend.get(target.uid);
+    if (backendNodeId === undefined) throw new Error('Missing/stale uid; call browser_get_snapshot');
+    object = (await inputCommand(d, sid, 'DOM.resolveNode', { backendNodeId })).object;
+  } else {
+    const q = JSON.stringify(target.selector);
+    const xpath = target.selector.startsWith('/') || target.selector.startsWith('(/');
+    object = (await inputCommand(d, sid, 'Runtime.evaluate', {
+      expression: xpath ? `document.evaluate(${q},document,null,XPathResult.FIRST_ORDERED_NODE_TYPE,null).singleNodeValue` : `document.querySelector(${q})`,
+    })).result;
+  }
+  if (!object?.objectId) throw new Error('Target not found');
+  try { return await fn(sid, object.objectId); }
+  finally { await d.sessionCommand(sid, 'Runtime.releaseObject', { objectId: object.objectId }).catch(() => {}); }
+}
+async function inspectElement(d, sid, objectId, fn) {
+  const r = await inputCommand(d, sid, 'Runtime.callFunctionOn', { objectId, functionDeclaration: fn.toString(), returnByValue: true });
+  if (r.result?.value?.error) throw new Error(r.result.value.error);
+  return r.result?.value;
+}
+async function inputPoint(d, tabId, target) {
+  validatePoint(target);
+  const sid = await inputSession(d, tabId);
+  if (target.x !== undefined) {
+    const { result } = await inputCommand(d, sid, 'Runtime.evaluate', { expression: '({width:innerWidth,height:innerHeight})', returnByValue: true });
+    if (target.x < 0 || target.y < 0 || target.x >= result.value.width || target.y >= result.value.height) throw new Error('Coordinates outside viewport');
+    return { x: target.x, y: target.y };
+  }
+  return withElement(d, tabId, target, (session, objectId) => inspectElement(d, session, objectId, function () {
+    const r = this.getBoundingClientRect();
+    let left = Math.max(0, r.left), right = Math.min(innerWidth, r.right);
+    let top = Math.max(0, r.top), bottom = Math.min(innerHeight, r.bottom);
+    const accepts = (x, y) => {
+      const hit = this.getRootNode().elementFromPoint?.(x, y) || document.elementFromPoint(x, y);
+      return hit === this || this.contains(hit);
+    };
+    // Browser hit-testing knows containing blocks: fixed/absolute descendants can
+    // escape an overflow ancestor, but not a transformed containing block's clip.
+    if (right > left && bottom > top && accepts((left + right) / 2, (top + bottom) / 2))
+      return { x: (left + right) / 2, y: (top + bottom) / 2 };
+    for (let el = this.parentElement; el; el = el.parentElement) {
+      const s = getComputedStyle(el), q = el.getBoundingClientRect();
+      if (s.overflowX !== 'visible') { left = Math.max(left, q.left); right = Math.min(right, q.right); }
+      if (s.overflowY !== 'visible') { top = Math.max(top, q.top); bottom = Math.min(bottom, q.bottom); }
+    }
+    if (right <= left || bottom <= top) return { error: 'Target is offscreen or clipped; scroll it into view first' };
+    const x = (left + right) / 2, y = (top + bottom) / 2;
+    const hit = this.getRootNode().elementFromPoint?.(x, y) || document.elementFromPoint(x, y);
+    if (hit !== this && !this.contains(hit)) return { error: 'Target is obscured or has no hit-test geometry' };
+    return { x, y };
+  }));
+}
+// Serialize activation to keep the wheel recipient rendering until dispatch completes.
+// Restore the viewed tab while leaving its screencast subscription unchanged.
+let scrollTail = Promise.resolve();
+async function withScrollRendering(d, tabId, fn) {
+  const previous = scrollTail;
+  let unlock;
+  scrollTail = new Promise(resolve => { unlock = resolve; });
+  await previous;
+  try {
+    const sid = await inputSession(d, tabId);
+    await inputCommand(d, sid, 'Page.bringToFront');
+    return await fn(sid);
+  } finally {
+    try {
+      const viewed = d.viewedTarget?.();
+      const entry = viewed && viewed !== tabId && d.sessionPool.get(viewed);
+      if (entry) await inputCommand(d, entry.sessionId, 'Page.bringToFront');
+    } finally { unlock(); }
+  }
+}
+async function scrollAt(d, tabId, { deltaX, deltaY, at, method }) {
+  const sid = await inputSession(d, tabId);
+  const pos = at ? await inputPoint(d, tabId, at) : (await inputCommand(d, sid, 'Runtime.evaluate', {
+    expression: '({x:innerWidth/2,y:innerHeight/2})', returnByValue: true,
+  })).result.value;
+  // Keep node identities through dispatch: re-hit-testing after movement would
+  // compare unrelated elements and incorrectly claim movement at boundaries.
+  const object = (await inputCommand(d, sid, 'Runtime.evaluate', {
+    expression: `(() => {
+      const nodes=[];
+      let hit=document.elementFromPoint(${pos.x},${pos.y});
+      // Document hit-testing retargets shadow descendants to the host. Descend
+      // through open roots, then retain the composed ancestry across slots/hosts.
+      while(hit?.shadowRoot) {
+        const inner=hit.shadowRoot.elementFromPoint(${pos.x},${pos.y});
+        if(!inner || inner===hit) break;
+        hit=inner;
+      }
+      for(let el=hit;el && !nodes.includes(el);el=el.assignedSlot || el.parentElement || el.getRootNode().host) nodes.push(el);
+      if(document.scrollingElement && !nodes.includes(document.scrollingElement)) nodes.push(document.scrollingElement);
+      return nodes;
+    })()`,
+  })).result;
+  if (!object?.objectId) throw new Error('Cannot observe scroll target');
+  const read = () => inspectElement(d, sid, object.objectId, function () {
+    return this.map(el => ({ tag: el.tagName, id: el.id, x: el.scrollLeft, y: el.scrollTop }));
+  });
+  try {
+    const before = await read();
+    if (method === 'javascript') {
+      await inputCommand(d, sid, 'Runtime.callFunctionOn', {
+        objectId: object.objectId,
+        functionDeclaration: `function(dx,dy) {
+          const root=document.scrollingElement;
+          for(const [axis,delta] of [['X',dx],['Y',dy]]) {
+            if(!delta) continue;
+            const el=this.find(el => {
+              const s=getComputedStyle(el), horizontal=axis==='X';
+              const pos=horizontal?el.scrollLeft:el.scrollTop;
+              const max=horizontal?el.scrollWidth-el.clientWidth:el.scrollHeight-el.clientHeight;
+              return (el===root || /auto|scroll/.test(horizontal?s.overflowX:s.overflowY)) && (delta>0?pos<max:pos>0);
+            });
+            if(el) el.scrollBy({left:axis==='X'?delta:0,top:axis==='Y'?delta:0,behavior:'instant'});
+          }
+        }`,
+        arguments: [{ value: deltaX }, { value: deltaY }], returnByValue: true,
+      });
+    } else {
+      await inputCommand(d, sid, 'Input.dispatchMouseEvent', { type: 'mouseMoved', ...pos, buttons: 0 });
+      await inputCommand(d, sid, 'Input.dispatchMouseEvent', { type: 'mouseWheel', ...pos, deltaX, deltaY }, 3000);
+    }
+    let after = before;
+    // CDP acknowledges wheel dispatch before asynchronous scrolling completes.
+    for (let i = 0; i < 10; i++) {
+      await new Promise(resolve => setTimeout(resolve, 30));
+      after = await read();
+      if (JSON.stringify(before) !== JSON.stringify(after)) break;
+    }
+    return { method, at: pos, deltaX, deltaY, moved: JSON.stringify(before) !== JSON.stringify(after), before, after };
+  } finally { await d.sessionCommand(sid, 'Runtime.releaseObject', { objectId: object.objectId }).catch(() => {}); }
 }
 
 // Build a fresh snapshot for a tab and store its uid map. Shared by
@@ -1518,95 +1696,126 @@ const TOOLS = [
   {
     name: 'browser_scroll',
     description:
-      'Scroll the page by (deltaX, deltaY) CSS pixels via CDP wheel event at the viewport center. ' +
-      'Positive deltaY scrolls down; positive deltaX scrolls right. Use browser_scroll_into_view ' +
-      'instead when you want a specific element on screen.',
+      'Scroll by deltaX horizontally and deltaY vertically, in CSS pixels: positive right/down, negative left/up. ' +
+      'at selects where to scroll; it defaults to the visible page center.\n\n' +
+      'x/y are CSS-pixel positions in the visible web content area (page viewport): (0,0) is its top-left corner, x increases rightward and y downward. ' +
+      'Browser tabs, address bar and window borders are excluded. These are not element, document or OS-window coordinates; screenshot pixels may be scaled differently.\n\n' +
+      'method:"wheel" (default) sends mouse wheel input. The page may scroll less than requested or prevent scrolling. ' +
+      'method:"javascript" scrolls the element at the chosen point or a containing element without mouse wheel input. ' +
+      'Wheel mode temporarily activates the tab, then restores the previously viewed tab.\n\n' +
+      'Returns at, the requested deltas, method, moved, and before/after lists. ' +
+      'Each list entry contains tag, id, and x/y scroll positions in CSS pixels (scrollLeft/scrollTop), measured before and after the call. ' +
+      'moved:true means a recorded scroll position changed; false means none changed. It does not confirm the requested distance was covered. ' +
+      'Measurements include containing elements and open shadow roots, but not closed shadow roots or embedded frames.',
     inputSchema: {
       type: 'object',
       properties: {
-        tabId: { type: 'string' },
-        deltaX: { type: 'number', description: 'Horizontal scroll delta in CSS px.' },
-        deltaY: { type: 'number', description: 'Vertical scroll delta in CSS px.' },
+        tabId: { type: 'string', description: "ID of the tab to use, from browser_list_tabs or browser_open." },
+        deltaX: { type: 'number', description: "How far to scroll horizontally, in CSS pixels: positive right, negative left, zero for no horizontal scroll." },
+        deltaY: { type: 'number', description: "How far to scroll vertically, in CSS pixels: positive down, negative up, zero for no vertical scroll." },
+        at: { ...POINT_SCHEMA, description: 'Where to scroll, for example inside a scrollable list; defaults to the visible page center. ' + POINT_SCHEMA.description },
+        method: { type: 'string', enum: ['wheel', 'javascript'], default: 'wheel', description: "wheel (default) sends mouse wheel input at the location chosen by at. javascript scrolls the element there or a containing element without mouse wheel input." },
       },
       required: ['tabId', 'deltaX', 'deltaY'],
     },
-    async run({ tabId, deltaX, deltaY }, d) {
-      await d.poolAttach(tabId);
-      const entry = d.sessionPool.get(tabId);
-      if (!entry) throw new Error('tab not found: ' + tabId);
-      // Why this uses window.scrollBy and not CDP Input.dispatchMouseEvent
-      // mouseWheel:
-      //   - In headless Chromium, wheel events only deliver to the page
-      //     when the renderer is actively rendering — i.e. when Page.start
-      //     Screencast is running. The viewer's tabs always have screencast
-      //     so its scroll works; MCP-opened tabs do not (we don't steal
-      //     focus to start screencast on them), so a CDP wheel event fires
-      //     but never reaches the page. window.scrollBy works regardless.
-      //   - Unlike click and key input, scroll has no trusted-event
-      //     security boundary — sites don't check isTrusted on scroll —
-      //     so the JS path is safe to use without breaking bot-protected
-      //     pages. browser_click and browser_type still go through CDP.
-      const r = await d.sessionCommand(entry.sessionId, 'Runtime.evaluate', {
-        expression: `(() => { window.scrollBy(${Number(deltaX)}, ${Number(deltaY)}); return JSON.stringify({x: window.scrollX, y: window.scrollY}); })()`,
-        returnByValue: true,
-      });
-      if (r.error) throw new Error(r.error.message);
-      const pos = JSON.parse(r.result?.result?.value || '{"x":0,"y":0}');
-      return text(JSON.stringify({ tabId, deltaX, deltaY, scrollX: pos.x, scrollY: pos.y }, null, 2));
+    async run({ tabId, deltaX, deltaY, at, method = 'wheel' }, d) {
+      if (!Number.isFinite(deltaX) || !Number.isFinite(deltaY)) throw new Error('deltaX/deltaY must be finite numbers');
+      if (!['wheel', 'javascript'].includes(method)) throw new Error('method must be wheel or javascript');
+      if (at !== undefined) validatePoint(at);
+      const run = () => scrollAt(d, tabId, { deltaX, deltaY, at, method });
+      const result = method === 'wheel' ? await withScrollRendering(d, tabId, run) : await run();
+      return text(JSON.stringify({ tabId, ...result }, null, 2));
     },
   },
 
   {
     name: 'browser_scroll_into_view',
     description:
-      'Scroll until an element is visible. Identify it by `uid` (preferred, from snapshot) ' +
-      'or `selector` (CSS or XPath fallback). Uses CDP DOM.scrollIntoViewIfNeeded — ' +
-      'programmatic, no input events.',
+      'Scroll until the element has a visible point that can receive mouse input. The whole element need not fit onscreen. ' +
+      'Choose uid or selector.\n\n' +
+      'method:"wheel" (default) scrolls containing areas from inner to outer where possible. ' +
+      'maxSteps limits wheel inputs to 1–100 (default 30). Failure can leave the page partly scrolled: scrolling may stop making progress, reach the limit, or leave the chosen point hidden or covered. ' +
+      'method:"javascript" scrolls without mouse wheel input; maxSteps must still be valid but does not limit this mode. ' +
+      'Both methods check that another element does not cover the chosen point. Wheel mode temporarily activates the tab, then restores the previously viewed tab.\n\n' +
+      'Returns visible:true, method, steps (wheel inputs; zero in javascript mode), moved, and before/after lists of containing elements. ' +
+      'Each entry contains tag, id, and x/y scroll positions in CSS pixels (scrollLeft/scrollTop), measured before and after the call. ' +
+      'moved:true means a recorded scroll position changed; false means none changed. Measurements exclude the target itself and stop at a shadow root. ' +
+      'includeSnapshot:true adds a fresh snapshot.',
     inputSchema: {
       type: 'object',
       properties: {
-        tabId: { type: 'string' },
-        uid: { type: 'string', description: 'UID from browser_get_snapshot.' },
-        selector: { type: 'string', description: 'CSS or XPath fallback if no UID.' },
-        includeSnapshot: { type: 'boolean', description: 'Append a fresh browser_get_snapshot to the response.' },
+        tabId: { type: 'string', description: "ID of the tab to use, from browser_list_tabs or browser_open." },
+        uid: { type: 'string', description: "Element ID from the latest browser_get_snapshot for this tab. Use uid or selector, not both." },
+        selector: { type: 'string', description: "Find the first matching page element with a CSS selector, or an XPath beginning with / or (/. Searches the main document, not embedded frames or component interiors (shadow roots). Use selector or uid, not both." },
+        method: { type: 'string', enum: ['wheel', 'javascript'], default: 'wheel', description: "wheel (default) uses mouse wheel input to reveal the element. javascript asks the browser to reveal it without mouse wheel input." },
+        maxSteps: { type: 'integer', minimum: 1, maximum: 100, default: 30, description: "Maximum number of mouse wheel inputs: 1\u2013100, default 30. Must be valid in either mode, but only limits wheel mode." },
+        includeSnapshot: { type: 'boolean', description: "Set true to add a new browser_get_snapshot result after scrolling. Omit or set false to return only the scrolling result." },
       },
       required: ['tabId'],
+      oneOf: [{ required: ['uid'] }, { required: ['selector'] }],
     },
-    async run({ tabId, uid, selector, includeSnapshot }, d) {
-      if (!uid && !selector) throw new Error('browser_scroll_into_view: provide uid (preferred) or selector');
-      await d.poolAttach(tabId);
-      const entry = d.sessionPool.get(tabId);
-      if (!entry) throw new Error('tab not found: ' + tabId);
-
-      let backendNodeId;
-      if (uid) {
-        const snap = tabSnapshots.get(tabId);
-        if (!snap) throw new Error('uid ' + uid + ' has no live snapshot — call browser_get_snapshot first');
-        backendNodeId = snap.idToBackend.get(String(uid));
-        if (backendNodeId === undefined) throw new Error('uid ' + uid + ' not in current snapshot');
-      } else {
-        // Selector path — resolve to a Runtime objectId, then pass that
-        // straight to DOM.scrollIntoViewIfNeeded (it accepts nodeId,
-        // backendNodeId, OR objectId per CDP spec). The earlier
-        // DOM.requestNode bounce was both unnecessary and unreliable
-        // because requestNode requires DOM.getDocument to have populated
-        // the inspector tree first.
-        const isXpath = selector.startsWith('/') || selector.startsWith('(/');
-        const expr = isXpath
-          ? `(() => { const r = document.evaluate(${JSON.stringify(selector)}, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null); return r.singleNodeValue; })()`
-          : `document.querySelector(${JSON.stringify(selector)})`;
-        const ev = await d.sessionCommand(entry.sessionId, 'Runtime.evaluate', { expression: expr });
-        const objId = ev.result?.result?.objectId;
-        if (!objId) throw new Error('no element matches: ' + selector);
-        const r = await d.sessionCommand(entry.sessionId, 'DOM.scrollIntoViewIfNeeded', { objectId: objId });
-        if (r.error) throw new Error(r.error.message);
-        const result = { tabId, selector, scrolled: true };
-        if (includeSnapshot) result.snapshot = await buildAndStoreSnapshot(d, tabId);
-        return text(JSON.stringify(result, null, 2));
-      }
-      const r = await d.sessionCommand(entry.sessionId, 'DOM.scrollIntoViewIfNeeded', { backendNodeId });
-      if (r.error) throw new Error(r.error.message);
-      const result = { tabId, uid, scrolled: true };
+    async run({ tabId, uid, selector, method = 'wheel', maxSteps = 30, includeSnapshot }, d) {
+      if (!['wheel', 'javascript'].includes(method)) throw new Error('method must be wheel or javascript');
+      if (!Number.isInteger(maxSteps) || maxSteps < 1 || maxSteps > 100) throw new Error('maxSteps must be 1–100');
+      const target = { uid, selector };
+      validatePoint(target, true);
+      const run = () => withElement(d, tabId, target, async (sid, objectId) => {
+        const positions = () => inspectElement(d, sid, objectId, function () {
+          const result = [];
+          for (let el = this.parentElement; el; el = el.parentElement) result.push({ tag: el.tagName, id: el.id, x: el.scrollLeft, y: el.scrollTop });
+          return result;
+        });
+        const before = await positions();
+        let steps = 0;
+        if (method === 'javascript') {
+          await inputCommand(d, sid, 'DOM.scrollIntoViewIfNeeded', { objectId });
+        } else {
+          for (;;) {
+            // A hit-testable target needs no scrolling, even if its DOM ancestors
+            // are clipped (e.g. fixed positioning outside a non-containing block).
+            try { await inputPoint(d, tabId, target); break; } catch {}
+            const plan = await inspectElement(d, sid, objectId, function () {
+              if (!this.isConnected) return { error: 'Target detached' };
+              const r = this.getBoundingClientRect();
+              if (!r.width || !r.height) return { error: 'Target has no geometry' };
+              const ancestors = [];
+              for (let el = this.parentElement; el; el = el.parentElement) ancestors.push(el);
+              for (const el of ancestors) {
+                const root = el === document.scrollingElement, s = getComputedStyle(el);
+                const q = root ? { left: 0, top: 0, right: innerWidth, bottom: innerHeight } : el.getBoundingClientRect();
+                // Aim for the nearest visible portion, including oversized targets.
+                const distance = (a, b, min, max) => a < min && b > max ? 0 : a < min ? a - min : b > max ? Math.min(b - max, a - min) : 0;
+                let left = Math.max(0, q.left), right = Math.min(innerWidth, q.right);
+                let top = Math.max(0, q.top), bottom = Math.min(innerHeight, q.bottom);
+                for (let parent = el.parentElement; parent; parent = parent.parentElement) {
+                  const p = parent.getBoundingClientRect(), style = getComputedStyle(parent);
+                  if (style.overflowX !== 'visible') { left = Math.max(left, p.left); right = Math.min(right, p.right); }
+                  if (style.overflowY !== 'visible') { top = Math.max(top, p.top); bottom = Math.min(bottom, p.bottom); }
+                }
+                if (right <= left || bottom <= top) continue;
+                // Seek into the reachable part of this scroller, not its full
+                // rectangle: an outer clip can hide an otherwise in-range target.
+                const dx = root || /auto|scroll/.test(s.overflowX) ? distance(r.left, r.right, left, right) : 0;
+                const dy = root || /auto|scroll/.test(s.overflowY) ? distance(r.top, r.bottom, top, bottom) : 0;
+                if (!dx && !dy) continue;
+                const x = (left + right) / 2, y = (top + bottom) / 2, hit = document.elementFromPoint(x, y);
+                if (!root && hit !== el && !el.contains(hit)) return { error: 'Scroll container is obscured' };
+                return { at: { x, y }, deltaX: Math.max(-600, Math.min(600, dx)), deltaY: Math.max(-600, Math.min(600, dy)) };
+              }
+              return { done: true };
+            });
+            if (plan.done) break;
+            if (steps >= maxSteps) throw new Error('Wheel scroll exceeded maxSteps; target may still be offscreen');
+            const result = await scrollAt(d, tabId, { ...plan, method });
+            steps++;
+            if (!result.moved) throw new Error('Wheel made no progress: scrolling prevented, clipped, or at boundary');
+          }
+        }
+        await inputPoint(d, tabId, target); // Verify actual visible, hit-testable geometry.
+        const after = await positions();
+        return { tabId, method, visible: true, steps, moved: JSON.stringify(before) !== JSON.stringify(after), before, after };
+      });
+      const result = method === 'wheel' ? await withScrollRendering(d, tabId, run) : await run();
       if (includeSnapshot) result.snapshot = await buildAndStoreSnapshot(d, tabId);
       return text(JSON.stringify(result, null, 2));
     },

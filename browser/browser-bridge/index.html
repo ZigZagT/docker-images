@@ -1065,7 +1065,8 @@ window.addEventListener('keydown', (e) => {
 }, true);
 
 // Keyboard
-// Use the viewer's native clipboard modifier; preserve Mac Ctrl chords remotely.
+// Copy/paste uses Command on macOS and Control elsewhere.
+// macOS Control+C/V is forwarded to the remote browser as keyboard input.
 const clipboardModifier = /Mac/.test(navigator.platform) ? 'metaKey' : 'ctrlKey';
 document.addEventListener('keydown', (e) => {
   if (document.activeElement !== canvas) return;

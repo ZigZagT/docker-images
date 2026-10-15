@@ -1282,8 +1282,8 @@ const mcpDeps = {
   // Lower-level CDP helpers for MCP-only operations (Runtime.evaluate,
   // Page.captureScreenshot — things the viewer protocol doesn't expose).
   sessionCommand,
-  // Fire-and-forget CDP send for commands whose response never arrives in
-  // headless (Input.dispatchMouseEvent mouseWheel — used for browser_scroll).
+  viewedTarget: () => viewerWss.clients.size ? activeTargetId : null,
+  // Unacknowledged CDP sends for commands that may not reply in headless mode.
   sessionSend,
   poolAttach,
   sessionPool,

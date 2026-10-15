@@ -1,5 +1,4 @@
-// Execute the viewer's real keyboard/paste handlers without a live browser.
-// This checks routing, not OS clipboard permissions or desktop integration.
+// Run viewer keyboard/paste handlers in a VM to test platform-specific routing.
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
@@ -47,13 +46,13 @@ for (const platform of ['Win32', 'MacIntel', 'Linux x86_64']) {
   v.key('keyup', 'v', modifier);
   assert.deepEqual(v.messages.splice(0), [{ type: 'paste', text: 'clipboard text' }], platform + ' paste sent once without key/char duplication');
 
-  // Other Ctrl shortcuts still reach the remote browser unchanged.
+  // Control+A is forwarded as remote keyboard input.
   v.key('keydown', 'a', 'ctrlKey');
   v.key('keyup', 'a', 'ctrlKey');
   assert.deepEqual(v.messages.splice(0).map(m => [m.type, m.action, m.modifiers]),
     [['key', 'keyDown', 2], ['key', 'char', 2], ['key', 'keyUp', 2]]);
 
-  // Local URL/search fields retain their native copy/paste behavior.
+  // Local URL/search fields use browser clipboard handling.
   v.document.activeElement = {};
   assert.equal(v.key('keydown', 'c', modifier).defaultPrevented, false);
   assert.equal(v.key('keydown', 'v', modifier).defaultPrevented, false);
@@ -61,8 +60,7 @@ for (const platform of ['Win32', 'MacIntel', 'Linux x86_64']) {
   assert.deepEqual(v.messages, []);
 }
 
-// On Mac, Control is not Command: retain remote Ctrl+C (e.g. terminal SIGINT)
-// and Ctrl+V rather than treating those as local clipboard shortcuts.
+// macOS Control+C/V is forwarded as remote keyboard input.
 const mac = viewer('MacIntel');
 for (const key of ['c', 'v']) {
   mac.key('keydown', key, 'ctrlKey');
