@@ -1065,13 +1065,12 @@ window.addEventListener('keydown', (e) => {
 }, true);
 
 // Keyboard
+// Use the viewer's native clipboard modifier; preserve Mac Ctrl chords remotely.
+const clipboardModifier = /Mac/.test(navigator.platform) ? 'metaKey' : 'ctrlKey';
 document.addEventListener('keydown', (e) => {
   if (document.activeElement !== canvas) return;
-  // Cmd+C/V: sync with host clipboard (macOS user's native shortcut)
-  // Ctrl+C/V: forward to Chrome as-is (Linux Chrome's native shortcut,
-  // also Ctrl+C for SIGINT in web terminals)
-  if (e.metaKey && e.key === 'v') return; // let browser paste event fire
-  if (e.metaKey && e.key === 'c') {
+  if (e[clipboardModifier] && e.key === 'v') return; // let browser paste event fire
+  if (e[clipboardModifier] && e.key === 'c') {
     e.preventDefault();
     send({ type: 'copy' });
     return;
@@ -1093,7 +1092,7 @@ document.addEventListener('keydown', (e) => {
 });
 document.addEventListener('keyup', (e) => {
   if (document.activeElement !== canvas) return;
-  if (e.metaKey && (e.key === 'v' || e.key === 'c')) return;
+  if (e[clipboardModifier] && (e.key === 'v' || e.key === 'c')) return;
   e.preventDefault();
   send({ type: 'key', action: 'keyUp', key: e.key, code: e.code, keyCode: e.keyCode, modifiers: modifiers(e) });
 });
