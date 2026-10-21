@@ -579,11 +579,13 @@ You don't manage cleanup — FIFO eviction handles MCP-owned tabs automatically.
 
 # Interacting with pages — use UIDs from snapshot, never browser_evaluate
 
-For ANY user input — clicks, typing, key presses, scrolling — use the dedicated
-tools. They dispatch trusted CDP input events (isTrusted=true) that bot-protected
-sites can't distinguish from a real human. Synthetic JS events from
-browser_evaluate (element.click(), dispatchEvent) carry isTrusted=false and
-will be rejected by captchas, payment flows, and login forms.
+For user input, use the dedicated tools instead of browser_evaluate. Click,
+type, pointer movement, selection, and key tools dispatch trusted CDP input events
+(isTrusted=true) that bot-protected sites can treat like real human input.
+Selection uses the native control's keyboard behavior, not assignments to its
+value or synthetic input/change events. Trusted input is not a guarantee that a
+site will accept automation. Synthetic JS events from browser_evaluate carry
+isTrusted=false and may be rejected by captchas, payment flows, and login forms.
 
 The intended workflow:
 
@@ -606,17 +608,47 @@ far to scroll, not where to place the mouse pointer.
 
 Available interaction tools:
 
-- browser_click({tabId, at, mouseButton?, doubleClick?, delayMs?}) — click.
+- browser_click({tabId, at}) — click; mouseButton selects the button,
+  doubleClick:true clicks twice, and delayMs sets how long each press is held.
   Choose at:{uid}, at:{selector}, or at:{x,y}; uid or selector also work without at.
-- browser_move_pointer({tabId, to, from?, mouseButton?}) — Move mouse pointer.
-- browser_type({tabId, text, uid?, selector?}) — trusted keystrokes; uid/selector
-  to focus first, omit to continue typing into already-focused element.
+  Element actions use an exposed point without scrolling when possible, otherwise
+  reveal the element with native wheel input. A normal left click on a native
+  option without geometry selects that exact option through keyboard input.
+- browser_type({tabId, text, uid}) — click the target, then insert text.
+  browser_type({tabId, text}) continues in the focused element.
+  Add replace:true to select all with Ctrl+A (Command+A on macOS) before typing.
+  With replace:true, text:"" clears the field; without it, an empty string does
+  not delete existing text.
+- browser_move_pointer({tabId, to:{uid}}) — move to the target without pressing.
+  The to field accepts {uid}, {selector}, or {x,y}.
+- browser_select({tabId, values, uid}) — select native option values
+  through mouse/keyboard input, including noncontiguous select[multiple] choices.
+  Provide selector instead of uid when targeting by CSS or XPath.
+  Use this on the parent select when a native popup option has no pointer geometry.
+  The bridge opts ordinary dropdowns and their pickers into visible in-page
+  rendering. Author overrides can retain native popups; keyboard selection
+  still works when those menus are absent from bridge frames.
 - browser_press_key({tabId, key}) — single named key (Enter, Tab, Escape,
   ArrowDown, etc.). Acts on currently focused element.
 - browser_scroll({tabId, deltaX, deltaY, at?, method?}) — scroll the page or a
   scrollable area at the chosen location. at defaults to the visible page center.
 - browser_scroll_into_view({tabId, uid}) or ({tabId, selector}) — scroll an
   element into view. method:"javascript" scrolls without mouse wheel input.
+
+Dragging uses one browser_move_pointer call with an explicit origin:
+
+browser_move_pointer({tabId, from: {uid: sourceUid}, to: {uid: destinationUid}, mouseButton: "left"})
+
+The call positions the pointer at from, presses the button, moves to to with it
+held, then releases it. No separate release call is needed. Both from and
+mouseButton are required for a drag; omit both for ordinary movement. Either
+point accepts {uid}, {selector}, or {x,y}. The mouseButton can also be "middle"
+or "right". Always specify the origin: another agent or the viewer can move the
+pointer between calls.
+
+Input tools temporarily activate their target tab so Chromium can deliver input
+to background pages, then restore the tab currently shown in the viewer.
+Tool and viewer input share a queue; press/move/release gestures do not interleave.
 
 browser_evaluate is for JS evaluation specifically — reading window properties,
 computing values from the DOM, dispatching custom events you wrote. NOT for
@@ -849,109 +881,10 @@ function renderSnapshot(nodes) {
   return { text: lines.join('\n'), idToBackend };
 }
 
-// Shared JS body for selecting an <option> element and returning the
-// parent <select>'s center. Used by both UID and selector resolve paths.
-const OPTION_SELECT_JS = `
-  if (this.tagName !== 'OPTION') return null;
-  this.selected = true;
-  const sel = this.closest('select');
-  if (!sel) return null;
-  sel.dispatchEvent(new Event('input', {bubbles: true}));
-  sel.dispatchEvent(new Event('change', {bubbles: true}));
-  const r = sel.getBoundingClientRect();
-  return { x: r.left + r.width/2, y: r.top + r.height/2 };
-`;
-
-// Resolve a uid (or selector) to bounding-box center coords. Used by
-// click and type for trusted CDP input dispatch.
-async function resolveTarget(d, tabId, { uid, selector }) {
-  await d.poolAttach(tabId);
-  const entry = d.sessionPool.get(tabId);
-  if (!entry) throw new Error('tab not found: ' + tabId);
-
-  // UID path — look up backendNodeId in the per-tab snapshot map, then
-  // ask CDP for the box model. UIDs are stable only within the most
-  // recent snapshot for that tab; older UIDs throw.
-  if (uid) {
-    const snap = tabSnapshots.get(tabId);
-    if (!snap) throw new Error('uid ' + uid + ' has no live snapshot — call browser_get_snapshot first');
-    const backend = snap.idToBackend.get(String(uid));
-    if (backend === undefined) {
-      throw new Error('uid ' + uid + ' not in current snapshot — re-snapshot the page (the DOM may have changed)');
-    }
-    const box = await d.sessionCommand(entry.sessionId, 'DOM.getBoxModel', { backendNodeId: backend });
-    if (!box.error) {
-      // content quad is 8 numbers: [x1,y1, x2,y2, x3,y3, x4,y4] (TL, TR, BR, BL).
-      const c = box.result.model.content;
-      const cx = (c[0] + c[4]) / 2;
-      const cy = (c[1] + c[5]) / 2;
-      return { entry, x: cx, y: cy };
-    }
-    // getBoxModel fails for elements in CSS top layer (e.g. base-select
-    // popover options). Resolve via JS instead.
-    const resolved = await d.sessionCommand(entry.sessionId, 'DOM.resolveNode', { backendNodeId: backend });
-    if (resolved.error) throw new Error('uid ' + uid + ' has no box and cannot be resolved: ' + resolved.error.message);
-    const objId = resolved.result.object.objectId;
-    // <option> elements have zero geometry even in base-select pickers.
-    // Select via JS and return the parent <select>'s center so the
-    // subsequent cdpClickAt closes the picker.
-    const optResult = await d.sessionCommand(entry.sessionId, 'Runtime.callFunctionOn', {
-      objectId: objId,
-      functionDeclaration: `function() {${OPTION_SELECT_JS}}`,
-      returnByValue: true,
-    });
-    if (!optResult.error && optResult.result?.result?.value) {
-      const coords = optResult.result.result.value;
-      return { entry, x: coords.x, y: coords.y };
-    }
-    // General fallback: getBoundingClientRect for non-option top-layer elements.
-    const rectResult = await d.sessionCommand(entry.sessionId, 'Runtime.callFunctionOn', {
-      objectId: objId,
-      functionDeclaration: 'function() { const r = this.getBoundingClientRect(); return { x: r.left + r.width/2, y: r.top + r.height/2, w: r.width, h: r.height }; }',
-      returnByValue: true,
-    });
-    if (rectResult.error) throw new Error('uid ' + uid + ' has no box (offscreen or zero-size): ' + box.error.message);
-    const rect = rectResult.result?.result?.value;
-    if (!rect || (rect.w === 0 && rect.h === 0)) {
-      throw new Error('uid ' + uid + ' has no box (offscreen or zero-size): ' + box.error.message);
-    }
-    return { entry, x: rect.x, y: rect.y };
-  }
-
-  // Selector path — CSS or XPath.
-  if (!selector) throw new Error('uid or selector required');
-  const expr = `(() => {
-    const path = ${JSON.stringify(selector)};
-    const isXpath = path.startsWith('/') || path.startsWith('(/');
-    let el;
-    try {
-      if (isXpath) {
-        const r = document.evaluate(path, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
-        el = r.singleNodeValue;
-      } else {
-        el = document.querySelector(path);
-      }
-    } catch (e) { return JSON.stringify({ error: 'invalid selector: ' + e.message }); }
-    if (!el) return JSON.stringify({ error: 'no element matches: ' + path });
-    const r = el.getBoundingClientRect();
-    if (r.width === 0 && r.height === 0) {
-      const optCoords = (function() {${OPTION_SELECT_JS}}).call(el);
-      if (optCoords) return JSON.stringify(optCoords);
-      return JSON.stringify({ error: 'element has zero size — call browser_scroll_into_view first' });
-    }
-    return JSON.stringify({ x: r.left + r.width/2, y: r.top + r.height/2 });
-  })()`;
-  const r = await d.sessionCommand(entry.sessionId, 'Runtime.evaluate', { expression: expr, returnByValue: true });
-  if (r.error) throw new Error(r.error.message);
-  const parsed = JSON.parse(r.result?.result?.value || '{}');
-  if (parsed.error) throw new Error(parsed.error);
-  return { entry, x: parsed.x, y: parsed.y };
-}
-
 // Spatial targets resolve to viewport coordinates without scrolling or focusing.
 const POINT_SCHEMA = {
   type: 'object', additionalProperties: false,
-  description: 'Use {uid}, {selector}, or {x,y}. Elements must already be visible; the center of their visible area must not be covered. Coordinates must be inside the visible page and address whatever is there.',
+  description: 'Use {uid}, {selector}, or {x,y}. Element actions choose an exposed point and scroll when needed. Coordinates must be inside the visible page and address whatever is there; coordinate targets do not trigger scrolling.',
   properties: {
     uid: { type: 'string', description: 'Element ID from the latest browser_get_snapshot for this tab. If the ID is no longer valid, get a new snapshot.' },
     selector: { type: 'string', description: 'Find the first matching page element with a CSS selector, or an XPath beginning with / or (/. Searches the main document, not embedded frames or component interiors (shadow roots).' },
@@ -980,10 +913,18 @@ function validatePoint(target, elementOnly = false) {
   throw new Error(elementOnly ? 'Provide exactly one uid or selector' : 'Provide exactly one target: {uid}, {selector}, or finite {x,y}');
 }
 async function withElement(d, tabId, target, fn) {
-  validatePoint(target, true);
+  if (target !== undefined) validatePoint(target, true);
   const sid = await inputSession(d, tabId);
   let object;
-  if (target.uid !== undefined) {
+  if (target === undefined) {
+    object = (await inputCommand(d, sid, 'Runtime.evaluate', {
+      expression: `(() => {
+        let el = document.activeElement;
+        while (el?.shadowRoot?.activeElement) el = el.shadowRoot.activeElement;
+        return el;
+      })()`,
+    })).result;
+  } else if (target.uid !== undefined) {
     const backendNodeId = tabSnapshots.get(tabId)?.idToBackend.get(target.uid);
     if (backendNodeId === undefined) throw new Error('Missing/stale uid; call browser_get_snapshot');
     object = (await inputCommand(d, sid, 'DOM.resolveNode', { backendNodeId })).object;
@@ -996,12 +937,79 @@ async function withElement(d, tabId, target, fn) {
   }
   if (!object?.objectId) throw new Error('Target not found');
   try { return await fn(sid, object.objectId); }
-  finally { await d.sessionCommand(sid, 'Runtime.releaseObject', { objectId: object.objectId }).catch(() => {}); }
+  finally {
+    await inputCommand(d, sid, 'Runtime.releaseObject', { objectId: object.objectId })
+      .catch(err => d.log.error('input object cleanup failed:', err.message));
+  }
 }
-async function inspectElement(d, sid, objectId, fn) {
-  const r = await inputCommand(d, sid, 'Runtime.callFunctionOn', { objectId, functionDeclaration: fn.toString(), returnByValue: true });
-  if (r.result?.value?.error) throw new Error(r.result.value.error);
+async function inspectElement(d, sid, objectId, fn, args = []) {
+  const r = await inputCommand(d, sid, 'Runtime.callFunctionOn', {
+    objectId, functionDeclaration: fn.toString(), arguments: args.map(value => ({ value })), returnByValue: true,
+  });
+  if (r.result?.value === undefined) throw new Error('Element inspection returned no value');
+  if (r.result?.value?.error) throw Object.assign(new Error(r.result.value.error), { code: r.result.value.code });
   return r.result?.value;
+}
+function inspectLayout(d, sid, objectId, fn, args = []) {
+  return inspectElement(d, sid, objectId, `function(...args) {
+    function parentElement(el) {
+      return el.assignedSlot || el.parentElement || el.getRootNode().host;
+    }
+    function clientRect(el) {
+      const r = el.getBoundingClientRect();
+      const sx = el.offsetWidth ? r.width / el.offsetWidth : 1;
+      const sy = el.offsetHeight ? r.height / el.offsetHeight : 1;
+      const left = r.left + el.clientLeft * sx, top = r.top + el.clientTop * sy;
+      return { left, top, right: left + el.clientWidth * sx, bottom: top + el.clientHeight * sy };
+    }
+    function hitPoint(el) {
+      if (!el.isConnected) return { error: 'Target detached', code: 'detached' };
+      let rects = Array.from(el.getClientRects()).filter(r => r.width > 0 && r.height > 0);
+      if (!rects.length && getComputedStyle(el).display === 'contents') {
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        rects = Array.from(range.getClientRects()).filter(r => r.width > 0 && r.height > 0);
+      }
+      if (!rects.length) return { error: 'Target has no geometry; it is hidden or collapsed', code: 'no-geometry' };
+      let blocker;
+      let visible = false;
+      const sample = (left, top, right, bottom) => {
+        if (right <= left || bottom <= top) return null;
+        visible = true;
+        const dx = Math.min(1, (right - left) / 2), dy = Math.min(1, (bottom - top) / 2);
+        for (const y of [(top + bottom) / 2, top + dy, bottom - dy]) {
+          for (const x of [(left + right) / 2, left + dx, right - dx]) {
+            const hit = el.getRootNode().elementFromPoint?.(x, y) || document.elementFromPoint(x, y);
+            if (hit === el || el.contains(hit)) return { x, y };
+            blocker = hit;
+          }
+        }
+        return null;
+      };
+      for (const r of rects) {
+        let left = Math.max(0, r.left), right = Math.min(innerWidth, r.right);
+        let top = Math.max(0, r.top), bottom = Math.min(innerHeight, r.bottom);
+        // Browser hit-testing knows containing blocks: fixed/absolute descendants can
+        // escape an overflow ancestor, but not a transformed containing block's clip.
+        let point = sample(left, top, right, bottom);
+        if (point) return point;
+        for (let parent = parentElement(el); parent; parent = parentElement(parent)) {
+          const style = getComputedStyle(parent), q = clientRect(parent);
+          if (style.overflowX !== 'visible') { left = Math.max(left, q.left); right = Math.min(right, q.right); }
+          if (style.overflowY !== 'visible') { top = Math.max(top, q.top); bottom = Math.min(bottom, q.bottom); }
+        }
+        point = sample(left, top, right, bottom);
+        if (point) return point;
+      }
+      if (!visible) return { error: 'Target is offscreen or clipped', code: 'offscreen' };
+      const label = blocker ? blocker.tagName.toLowerCase() + (blocker.id ? '#' + blocker.id : '') : 'page hit-testing';
+      return { error: 'Target is obscured or clipped by ' + label, code: 'obscured' };
+    }
+    return (${fn.toString()}).apply(this, args);
+  }`, args);
+}
+function elementPoint(d, sid, objectId) {
+  return inspectLayout(d, sid, objectId, function() { return hitPoint(this); });
 }
 async function inputPoint(d, tabId, target) {
   validatePoint(target);
@@ -1011,37 +1019,106 @@ async function inputPoint(d, tabId, target) {
     if (target.x < 0 || target.y < 0 || target.x >= result.value.width || target.y >= result.value.height) throw new Error('Coordinates outside viewport');
     return { x: target.x, y: target.y };
   }
-  return withElement(d, tabId, target, (session, objectId) => inspectElement(d, session, objectId, function () {
-    const r = this.getBoundingClientRect();
-    let left = Math.max(0, r.left), right = Math.min(innerWidth, r.right);
-    let top = Math.max(0, r.top), bottom = Math.min(innerHeight, r.bottom);
-    const accepts = (x, y) => {
-      const hit = this.getRootNode().elementFromPoint?.(x, y) || document.elementFromPoint(x, y);
-      return hit === this || this.contains(hit);
-    };
-    // Browser hit-testing knows containing blocks: fixed/absolute descendants can
-    // escape an overflow ancestor, but not a transformed containing block's clip.
-    if (right > left && bottom > top && accepts((left + right) / 2, (top + bottom) / 2))
-      return { x: (left + right) / 2, y: (top + bottom) / 2 };
-    for (let el = this.parentElement; el; el = el.parentElement) {
-      const s = getComputedStyle(el), q = el.getBoundingClientRect();
-      if (s.overflowX !== 'visible') { left = Math.max(left, q.left); right = Math.min(right, q.right); }
-      if (s.overflowY !== 'visible') { top = Math.max(top, q.top); bottom = Math.min(bottom, q.bottom); }
+  return withElement(d, tabId, target, (session, objectId) => elementPoint(d, session, objectId));
+}
+async function revealElement(d, tabId, sid, objectId, method = 'wheel', maxSteps = 30) {
+  const positions = () => inspectLayout(d, sid, objectId, function() {
+    const result = [];
+    for (let el = parentElement(this); el; el = parentElement(el)) {
+      result.push({ tag: el.tagName, id: el.id, x: el.scrollLeft, y: el.scrollTop });
     }
-    if (right <= left || bottom <= top) return { error: 'Target is offscreen or clipped; scroll it into view first' };
-    const x = (left + right) / 2, y = (top + bottom) / 2;
-    const hit = this.getRootNode().elementFromPoint?.(x, y) || document.elementFromPoint(x, y);
-    if (hit !== this && !this.contains(hit)) return { error: 'Target is obscured or has no hit-test geometry' };
-    return { x, y };
-  }));
+    return result;
+  });
+  const before = await positions();
+  let steps = 0;
+  if (method === 'javascript') await inputCommand(d, sid, 'DOM.scrollIntoViewIfNeeded', { objectId });
+  let point;
+  let retries = 0;
+  for (;;) {
+    let blocked;
+    try {
+      point = await elementPoint(d, sid, objectId);
+      break;
+    } catch (error) {
+      if (!['offscreen', 'obscured', 'no-geometry'].includes(error.code)) throw error;
+      blocked = error;
+    }
+    if (blocked.code === 'no-geometry' || method === 'javascript') throw blocked;
+    const plan = await inspectLayout(d, sid, objectId, function() {
+      if (!this.isConnected) return { error: 'Target detached', code: 'detached' };
+      const r = this.getBoundingClientRect();
+      for (let el = parentElement(this); el; el = parentElement(el)) {
+        const root = el === document.scrollingElement, style = getComputedStyle(el);
+        const q = root ? { left: 0, top: 0, right: innerWidth, bottom: innerHeight } : clientRect(el);
+        let left = Math.max(0, q.left), right = Math.min(innerWidth, q.right);
+        let top = Math.max(0, q.top), bottom = Math.min(innerHeight, q.bottom);
+        for (let parent = parentElement(el); parent; parent = parentElement(parent)) {
+          const p = clientRect(parent), s = getComputedStyle(parent);
+          if (s.overflowX !== 'visible') { left = Math.max(left, p.left); right = Math.min(right, p.right); }
+          if (s.overflowY !== 'visible') { top = Math.max(top, p.top); bottom = Math.min(bottom, p.bottom); }
+        }
+        if (right <= left || bottom <= top) continue;
+        // Aim for the nearest visible portion, including oversized targets.
+        const distance = (a, b, min, max) => a < min && b > max ? 0 : a < min ? a - min : b > max ? Math.min(b - max, a - min) : 0;
+        let dx = distance(r.left, r.right, left, right), dy = distance(r.top, r.bottom, top, bottom);
+        if (!dx && !dy) {
+          dx = (r.left + r.right - left - right) / 2;
+          dy = (r.top + r.bottom - top - bottom) / 2;
+        }
+        const maxX = el.scrollWidth - el.clientWidth, maxY = el.scrollHeight - el.clientHeight;
+        const minX = style.direction === 'rtl' ? -maxX : 0;
+        const limitX = style.direction === 'rtl' ? 0 : maxX;
+        dx = root || /auto|scroll/.test(style.overflowX) ? Math.max(minX - el.scrollLeft, Math.min(limitX - el.scrollLeft, dx)) : 0;
+        dy = root || /auto|scroll/.test(style.overflowY) ? Math.max(-el.scrollTop, Math.min(maxY - el.scrollTop, dy)) : 0;
+        if (!dx && !dy) continue;
+        const at = hitPoint(el);
+        if (at.error) continue;
+        return { at, deltaX: Math.max(-600, Math.min(600, dx)), deltaY: Math.max(-600, Math.min(600, dy)) };
+      }
+      return { done: true };
+    });
+    if (plan.done) {
+      if (retries++ < 3) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+        continue;
+      }
+      throw new Error('Cannot safely reveal target: ' + blocked.message + '. The covering or clipping element must be handled first.');
+    }
+    if (steps >= maxSteps) throw new Error('Wheel scroll exceeded maxSteps; target may still be offscreen');
+    const result = await scrollAt(d, tabId, { ...plan, method });
+    steps++;
+    if (!result.moved) {
+      try {
+        point = await elementPoint(d, sid, objectId);
+        break;
+      } catch (error) {
+        if (!['offscreen', 'obscured', 'no-geometry'].includes(error.code)) throw error;
+        throw new Error('Wheel made no progress: scrolling prevented, clipped, or at boundary; ' + error.message);
+      }
+    }
+  }
+  const after = await positions();
+  return { tabId, method, visible: true, steps, moved: JSON.stringify(before) !== JSON.stringify(after), before, after, point };
+}
+async function actionElementPoint(d, tabId, sid, objectId) {
+  try { return await elementPoint(d, sid, objectId); }
+  catch (error) {
+    if (!['offscreen', 'obscured'].includes(error.code)) throw error;
+    return (await revealElement(d, tabId, sid, objectId)).point;
+  }
+}
+async function actionPoint(d, tabId, target) {
+  validatePoint(target);
+  if (target.x !== undefined) return inputPoint(d, tabId, target);
+  return withElement(d, tabId, target, (sid, objectId) => actionElementPoint(d, tabId, sid, objectId));
 }
 // Serialize activation to keep the wheel recipient rendering until dispatch completes.
 // Restore the viewed tab while leaving its screencast subscription unchanged.
-let scrollTail = Promise.resolve();
-async function withScrollRendering(d, tabId, fn) {
-  const previous = scrollTail;
+let renderingTail = Promise.resolve();
+async function withInputRendering(d, tabId, fn) {
+  const previous = renderingTail;
   let unlock;
-  scrollTail = new Promise(resolve => { unlock = resolve; });
+  renderingTail = new Promise(resolve => { unlock = resolve; });
   await previous;
   try {
     const sid = await inputSession(d, tabId);
@@ -1103,8 +1180,10 @@ async function scrollAt(d, tabId, { deltaX, deltaY, at, method }) {
         arguments: [{ value: deltaX }, { value: deltaY }], returnByValue: true,
       });
     } else {
-      await inputCommand(d, sid, 'Input.dispatchMouseEvent', { type: 'mouseMoved', ...pos, buttons: 0 });
-      await inputCommand(d, sid, 'Input.dispatchMouseEvent', { type: 'mouseWheel', ...pos, deltaX, deltaY }, 3000);
+      const entry = d.sessionPool.get(tabId);
+      if (entry.mouseButtons) throw new Error('Cannot scroll while another input is holding a mouse button');
+      await dispatchMouseInput(d, entry, { type: 'mouseMoved', ...pos, button: 'none', buttons: 0 });
+      await dispatchMouseInput(d, entry, { type: 'mouseWheel', ...pos, deltaX, deltaY }, 3000);
     }
     let after = before;
     // CDP acknowledges wheel dispatch before asynchronous scrolling completes.
@@ -1135,14 +1214,6 @@ async function buildAndStoreSnapshot(d, tabId) {
 // Each click or drag completes its press/move/release sequence within one call.
 const MODIFIER_BITS = { alt: 1, ctrl: 2, meta: 4, shift: 8 };
 const BUTTON_MASK = { left: 1, right: 2, middle: 4 };
-const spatialBusy = new Set();
-const spatialFaults = new Set();
-async function withSpatialInput(sid, fn) {
-  if (spatialFaults.has(sid)) throw new Error('Previous pointer cleanup failed; input state is uncertain. Use a fresh tab.');
-  if (spatialBusy.has(sid)) throw new Error('Another spatial gesture is in progress on this tab; retry after it finishes');
-  spatialBusy.add(sid);
-  try { return await fn(); } finally { spatialBusy.delete(sid); }
-}
 function pointerModifiers(modifiers = []) {
   if (!Array.isArray(modifiers) || modifiers.some(name => !Object.hasOwn(MODIFIER_BITS, name))) throw new Error('modifiers must contain alt, ctrl, meta or shift');
   return modifiers.reduce((bits, name) => bits | MODIFIER_BITS[name], 0);
@@ -1153,59 +1224,120 @@ function pointerOptions({ button = 'left', doubleClick = false, delayMs = 0 }) {
   if (!Number.isInteger(delayMs) || delayMs < 0 || delayMs > 1000) throw new Error('delayMs must be 0–1000');
   return { button, doubleClick, delayMs };
 }
-async function cdpPointer(d, sid, from, to, { button, modifiers = 0, doubleClick = false, delayMs = 0 } = {}) {
-  return withSpatialInput(sid, async () => {
-    const send = (type, pos, buttons, clickCount = 1) => inputCommand(d, sid, 'Input.dispatchMouseEvent', {
-      type, ...pos, button: button || 'none', buttons, modifiers, clickCount,
-    });
-    if (!button) {
-      await send('mouseMoved', to, 0, 0);
+async function cdpPointer(d, entry, from, to, { button, modifiers = 0, doubleClick = false, delayMs = 0 } = {}) {
+  if (entry.mouseButtons) throw new Error('Another input is holding a mouse button');
+  const sid = entry.sessionId;
+  const send = (type, pos, buttons, clickCount = 1) => dispatchMouseInput(d, entry, {
+    type, ...pos, button: button || 'none', buttons, modifiers, clickCount,
+  });
+  let held = false, last = from;
+  const move = async buttons => {
+    if (from.x === to.x && from.y === to.y) {
+      await send('mouseMoved', to, buttons, 0);
       return;
     }
-    let held = false, last = from;
-    try {
-      await send('mouseMoved', from, 0, 0);
-      for (let count = 1; count <= (doubleClick ? 2 : 1); count++) {
-        held = true; // A failed transport reply does not prove the press was rejected.
-        await send('mousePressed', from, BUTTON_MASK[button], count);
-        if (from.x !== to.x || from.y !== to.y) {
-          last = to;
-          await send('mouseMoved', to, BUTTON_MASK[button], 0);
-          // A second event at the same destination lets Chromium deliver dragover
-          // after dragenter.
-          await send('mouseMoved', to, BUTTON_MASK[button], 0);
-        }
-        if (delayMs) await new Promise(resolve => setTimeout(resolve, delayMs));
-        await send('mouseReleased', to, 0, count);
-        held = false;
-      }
-    } catch (error) {
-      if (held) {
-        let suppressed = false;
-        const cleanupErrors = [];
-        try {
-          // Cancellation must not activate a click/drop on the release target.
-          await inputCommand(d, sid, 'Input.setIgnoreInputEvents', { ignore: true });
-          suppressed = true;
-          try { await inputCommand(d, sid, 'Input.cancelDragging'); } catch (e) { cleanupErrors.push(e.message); }
-          try { await send('mouseReleased', last, 0, 0); } catch (e) { cleanupErrors.push(e.message); }
-        } catch (e) { cleanupErrors.push(e.message); }
-        finally {
-          // Re-enable input even when the suppression command fails.
-          try { await inputCommand(d, sid, 'Input.setIgnoreInputEvents', { ignore: false }); } catch (e) { cleanupErrors.push(e.message); }
-        }
-        if (!suppressed || cleanupErrors.length) {
-          spatialFaults.add(sid);
-          throw new Error(error.message + '; pointer cleanup failed; input state uncertain, use a fresh tab: ' + cleanupErrors.join('; '));
-        }
-      }
-      throw error;
+    for (let i = 1; i <= 8; i++) {
+      await new Promise(resolve => setTimeout(resolve, 16));
+      last = { x: from.x + (to.x - from.x) * i / 8, y: from.y + (to.y - from.y) * i / 8 };
+      await send('mouseMoved', last, buttons, 0);
     }
-  });
+  };
+  if (!button) {
+    await move(0);
+    return;
+  }
+  try {
+    await send('mouseMoved', from, 0, 0);
+    for (let count = 1; count <= (doubleClick ? 2 : 1); count++) {
+      held = true; // A failed transport reply does not prove the press was rejected.
+      await send('mousePressed', from, BUTTON_MASK[button], count);
+      if (from.x !== to.x || from.y !== to.y) {
+        await move(BUTTON_MASK[button]);
+        // A second event at the same destination lets Chromium deliver dragover
+        // after dragenter.
+        await send('mouseMoved', to, BUTTON_MASK[button], 0);
+      }
+      if (delayMs) await new Promise(resolve => setTimeout(resolve, delayMs));
+      await send('mouseReleased', to, 0, count);
+      held = false;
+    }
+  } catch (error) {
+    if (held) {
+      let suppressed = false;
+      const cleanupErrors = [];
+      try {
+        // Cancellation must not activate a click/drop on the release target.
+        await inputCommand(d, sid, 'Input.setIgnoreInputEvents', { ignore: true });
+        suppressed = true;
+        try { await inputCommand(d, sid, 'Input.cancelDragging'); } catch (e) { cleanupErrors.push(e.message); }
+        try {
+          await inputCommand(d, sid, 'Input.dispatchMouseEvent', {
+            type: 'mouseReleased', ...last, button, buttons: 0, modifiers, clickCount: 0,
+          });
+        } catch (e) { cleanupErrors.push(e.message); }
+      } catch (e) { cleanupErrors.push(e.message); }
+      finally {
+        // Re-enable input even when the suppression command fails.
+        try { await inputCommand(d, sid, 'Input.setIgnoreInputEvents', { ignore: false }); } catch (e) { cleanupErrors.push(e.message); }
+      }
+      if (!suppressed || cleanupErrors.length) {
+        entry.inputFault = true;
+        throw new Error(error.message + '; pointer cleanup failed; input state uncertain, use a fresh tab: ' + cleanupErrors.join('; '));
+      }
+      entry.inputFault = false;
+      entry.mouseButtons = 0;
+    }
+    throw error;
+  }
 }
-async function cdpClickAt(d, sessionId, x, y, modifiers = 0, options = {}) {
+async function cdpClickAt(d, entry, x, y, modifiers = 0, options = {}) {
   const point = { x, y };
-  await cdpPointer(d, sessionId, point, point, { ...pointerOptions(options), modifiers });
+  await cdpPointer(d, entry, point, point, { ...pointerOptions(options), modifiers });
+}
+
+export async function dispatchMouseInput(d, entry, params, timeout) {
+  if (entry.inputFault) throw new Error('Previous input failed; input state is uncertain. Use a fresh tab.');
+  let buttons = entry.mouseButtons || 0;
+  if (params.type === 'mousePressed') buttons |= BUTTON_MASK[params.button] || 0;
+  if (params.type === 'mouseReleased') buttons &= ~(BUTTON_MASK[params.button] || 0);
+  if (params.buttons !== undefined) buttons = params.buttons;
+  try {
+    await inputCommand(d, entry.sessionId, 'Input.dispatchMouseEvent', { ...params, buttons }, timeout);
+  } catch (err) {
+    if (buttons || params.type === 'mousePressed' || params.type === 'mouseReleased') entry.inputFault = true;
+    throw err;
+  }
+  entry.mouseButtons = buttons;
+}
+
+async function requireFocused(d, sid, objectId, allowDescendants = false) {
+  await inspectElement(d, sid, objectId, function(allowDescendants) {
+    if (!this.isConnected) return { error: 'target was detached during input' };
+    const active = this.getRootNode().activeElement;
+    if (active !== this && !(allowDescendants && this.contains(active))) {
+      return { error: 'target is not focused; input was intercepted' };
+    }
+    return true;
+  }, [allowDescendants]);
+}
+
+// Compound gestures share focus and button state. Queue input tools per tab so
+// concurrent callers cannot type into each other's selection or interrupt a drag.
+const inputQueues = new Map();
+
+export async function runInput(d, tabId, run, render = true) {
+  const previous = inputQueues.get(tabId) || Promise.resolve();
+  const result = previous.then(() => {
+    if (d.sessionPool.get(tabId)?.inputFault) throw new Error('Previous input failed; input state is uncertain. Use a fresh tab.');
+    return render ? withInputRendering(d, tabId, run) : run();
+  });
+  const settled = result.then(() => {}, () => {});
+  inputQueues.set(tabId, settled);
+  try {
+    return await result;
+  } finally {
+    if (inputQueues.get(tabId) === settled) inputQueues.delete(tabId);
+  }
 }
 
 // Common special-key map for browser_press_key.
@@ -1225,6 +1357,106 @@ const KEY_MAP = {
   PageDown:  { code: 'PageDown',  key: 'PageDown',  vk: 34 },
   Space:     { code: 'Space',     key: ' ',         vk: 32, text: ' ' },
 };
+
+async function cdpPressKey(d, sessionId, meta, modifiers = 0) {
+  const base = { code: meta.code, key: meta.key, windowsVirtualKeyCode: meta.vk, modifiers };
+  const downEvent = { ...base, type: 'keyDown' };
+  if (meta.text) downEvent.text = meta.text;
+  let pressError;
+  try {
+    await inputCommand(d, sessionId, 'Input.dispatchKeyEvent', downEvent);
+  } catch (err) {
+    pressError = err;
+  }
+  try {
+    await inputCommand(d, sessionId, 'Input.dispatchKeyEvent', { ...base, type: 'keyUp' });
+  } catch (err) {
+    const entry = [...d.sessionPool.values()].find(e => e.sessionId === sessionId);
+    if (entry) entry.inputFault = true;
+    throw new Error((pressError ? pressError.message + '; ' : '') + 'key release failed: ' + err.message);
+  }
+  if (pressError) throw pressError;
+}
+
+async function selectNative(d, tabId, sid, objectId, values, requestedIndices) {
+  const options = await inspectElement(d, sid, objectId, function(values, requestedIndices) {
+    if (!(this instanceof HTMLSelectElement)) return { error: 'target is not a native <select>' };
+    if (this.matches(':disabled')) return { error: 'target is disabled' };
+    if (!this.multiple && (values || requestedIndices).length > 1) return { error: 'multiple values require a <select multiple>' };
+    if (values) {
+      const available = new Set(Array.from(this.options, o => o.value));
+      const missing = values.filter(value => !available.has(value));
+      if (missing.length) return { error: 'option value(s) not found: ' + missing.join(', ') };
+    }
+    const navigable = Array.from(this.options).filter(option => {
+      const group = option.closest('optgroup');
+      return !option.matches(':disabled') && !option.closest('[hidden]') &&
+        getComputedStyle(option).display !== 'none' && getComputedStyle(option).visibility === 'visible' &&
+        (!group || getComputedStyle(group).display !== 'none');
+    });
+    const indices = [];
+    for (let i = 0; i < navigable.length; i++) {
+      if (requestedIndices ? requestedIndices.includes(navigable[i].index) : values.includes(navigable[i].value)) indices.push(i);
+    }
+    for (const wanted of requestedIndices || values) {
+      if (!navigable.some(option => requestedIndices ? option.index === wanted : option.value === wanted)) {
+        return { error: 'option is disabled, hidden, or no longer available: ' + wanted };
+      }
+    }
+    if (!this.multiple) indices.splice(1);
+    return { indices, selectedIndices: indices.map(i => navigable[i].index),
+      picker: !this.multiple && this.size <= 1,
+      open: this.matches(':open'),
+      modifier: navigator.platform.startsWith('Mac') ? 'meta' : 'ctrl' };
+  }, [values, requestedIndices]);
+  const { x, y } = await actionElementPoint(d, tabId, sid, objectId);
+  if (!options.picker || !options.open) await cdpClickAt(d, d.sessionPool.get(tabId), x, y);
+  const press = async (key, modifiers = 0) => {
+    await requireFocused(d, sid, objectId, true);
+    await cdpPressKey(d, sid, KEY_MAP[key], modifiers);
+  };
+  // Keep dropdowns open until Enter; closed-control arrows would commit each intermediate value.
+  if (!options.picker) await press('Escape');
+  await press('Home');
+  for (let i = 0; i < options.indices[0]; i++) await press('ArrowDown');
+  const modifier = MODIFIER_BITS[options.modifier];
+  for (let i = 1; i < options.indices.length; i++) {
+    for (let j = options.indices[i - 1]; j < options.indices[i]; j++) await press('ArrowDown', modifier);
+    await press('Space', modifier);
+  }
+  if (options.picker) await press('Enter');
+  const selected = await inspectElement(d, sid, objectId, function() {
+    if (!this.isConnected) return { error: 'target was detached during selection' };
+    return { values: Array.from(this.selectedOptions, option => option.value),
+      indices: Array.from(this.selectedOptions, option => option.index) };
+  });
+  if (JSON.stringify(selected.indices) !== JSON.stringify(options.selectedIndices)) {
+    throw new Error('native keyboard selection did not reach the requested options; selected: ' + JSON.stringify(selected.values));
+  }
+  return selected.values;
+}
+
+async function selectOptionTarget(d, tabId, target) {
+  return withElement(d, tabId, target, async (sid, objectId) => {
+    const index = await inspectElement(d, sid, objectId, function() {
+      return this.tagName === 'OPTION' && this.closest('select') ? this.index : null;
+    });
+    if (index === null) return null;
+    const parent = (await inputCommand(d, sid, 'Runtime.callFunctionOn', {
+      objectId, functionDeclaration: 'function() { return this.closest("select"); }',
+    })).result;
+    if (!parent?.objectId) throw new Error('Select parent no longer exists');
+    try {
+      const selectedValues = await selectNative(d, tabId, sid, parent.objectId, undefined, [index]);
+      const selected = await inspectElement(d, sid, objectId, function() { return this.isConnected && this.selected; });
+      if (!selected) throw new Error('Option changed during selection');
+      return selectedValues;
+    } finally {
+      await inputCommand(d, sid, 'Runtime.releaseObject', { objectId: parent.objectId })
+        .catch(error => d.log.error('input object cleanup failed:', error.message));
+    }
+  });
+}
 
 const TOOLS = [
   {
@@ -1624,8 +1856,12 @@ const TOOLS = [
 
   {
     name: 'browser_click',
+    input: true,
     description:
       'Click. Choose at:{uid}, at:{selector}, or at:{x,y}; alternatively, supply uid or selector without at.\n\n' +
+      'Element targets are revealed automatically with native scrolling when needed. An exposed portion is used without scrolling when possible. ' +
+      'Hidden or genuinely blocked elements are not force-clicked. A plain left click on an option without geometry uses native keyboard selection ' +
+      'and returns method:"keyboard" with selectedValues instead of clickedAt.\n\n' +
       'x/y are CSS-pixel positions in the visible web content area (page viewport): (0,0) is its top-left corner, x increases rightward and y downward. ' +
       'Browser tabs, address bar and window borders are excluded. These are not element, document or OS-window coordinates; screenshot pixels may be scaled differently.\n\n' +
       'mouseButton defaults to "left". doubleClick:true clicks twice; delayMs holds each press for 0–1000 ms (default 0). ' +
@@ -1652,9 +1888,20 @@ const TOOLS = [
       const options = pointerOptions({ button: mouseButton, doubleClick, delayMs });
       const bits = pointerModifiers(modifiers);
       if (at !== undefined && (uid !== undefined || selector !== undefined)) throw new Error('Use at OR uid/selector, not both');
-      const { x, y } = await inputPoint(d, tabId, at ?? { uid, selector });
-      const sid = await inputSession(d, tabId);
-
+      const target = at ?? { uid, selector };
+      let point;
+      try {
+        point = await actionPoint(d, tabId, target);
+      } catch (error) {
+        if (error.code !== 'no-geometry' || target.x !== undefined ||
+            mouseButton !== 'left' || bits || doubleClick || delayMs) throw error;
+        const selectedValues = await selectOptionTarget(d, tabId, target);
+        if (selectedValues === null) throw error;
+        const result = { tabId, uid: uid || null, selector: selector || null, method: 'keyboard', selectedValues };
+        if (includeSnapshot) result.snapshot = await buildAndStoreSnapshot(d, tabId);
+        return text(JSON.stringify(result, null, 2));
+      }
+      const { x, y } = point;
       // Ctrl/Meta-click and middle-click open links in a new tab. Chrome does not set openerId
       // on the new target, so Target.targetCreated cannot inherit MCP ownership.
       // Snapshot tab IDs before the click to detect new tabs after.
@@ -1664,7 +1911,7 @@ const TOOLS = [
         tabIdsBefore = new Set((await d.getCdpTargets()).filter(t => t.type === 'page').map(t => t.id));
       }
 
-      await cdpClickAt(d, sid, x, y, bits, options);
+      await cdpClickAt(d, d.sessionPool.get(tabId), x, y, bits, options);
 
       if (tabIdsBefore) {
         await new Promise(r => setTimeout(r, 500));
@@ -1687,8 +1934,12 @@ const TOOLS = [
 
   {
     name: 'browser_move_pointer',
+    input: true,
     description:
-      'Move mouse pointer.\n\n' +
+      'Move to the destination without pressing a button. For a drag, provide from and mouseButton together: ' +
+      'the call moves to from, presses the button, follows a short interpolated path to to, and releases. ' +
+      'Element targets are revealed automatically. Both drag endpoints must be visible together before pressing. ' +
+      'Dragging never depends on a previous call or a tracked pointer position.\n\n' +
       'x/y are CSS-pixel positions in the visible web content area (page viewport): (0,0) is its top-left corner, x increases rightward and y downward. ' +
       'Browser tabs, address bar and window borders are excluded. These are not element, document or OS-window coordinates; screenshot pixels may be scaled differently.\n\n' +
       'Returns movedTo; dragging also returns movedFrom, mouseButton and released:true. A completed mouse action does not guarantee the page accepted a drop. ' +
@@ -1705,17 +1956,28 @@ const TOOLS = [
       },
       required: ['tabId', 'to'],
       dependentRequired: { from: ['mouseButton'], mouseButton: ['from'] },
+      additionalProperties: false,
     },
-    async run({ tabId, to, from, mouseButton, modifiers, includeSnapshot }, d) {
+    async run({ tabId, to, from, mouseButton, modifiers, includeSnapshot, ...extra }, d) {
+      if (Object.keys(extra).length) throw new Error('Unknown pointer parameters: ' + Object.keys(extra).join(', ') + '. Use to, with from and mouseButton for a drag.');
       if ((from !== undefined) !== (mouseButton !== undefined)) throw new Error('A held-button move requires both from and mouseButton');
       if (mouseButton !== undefined) pointerOptions({ button: mouseButton });
       const bits = pointerModifiers(modifiers);
       validatePoint(to);
       if (from !== undefined) validatePoint(from);
+      if (from !== undefined) await actionPoint(d, tabId, from);
+      await actionPoint(d, tabId, to);
       const end = await inputPoint(d, tabId, to);
-      const start = from === undefined ? end : await inputPoint(d, tabId, from);
-      const sid = await inputSession(d, tabId);
-      await cdpPointer(d, sid, start, end, { button: mouseButton, modifiers: bits });
+      const entry = d.sessionPool.get(tabId);
+      let start = end;
+      if (from !== undefined) {
+        try { start = await inputPoint(d, tabId, from); }
+        catch (error) {
+          if (!['offscreen', 'obscured'].includes(error.code)) throw error;
+          throw new Error('Cannot drag: both endpoints must be visible together before pressing; ' + error.message);
+        }
+      }
+      await cdpPointer(d, entry, start, end, { button: mouseButton, modifiers: bits });
       const result = { tabId, movedTo: end, ...(mouseButton ? { movedFrom: start, mouseButton, released: true } : {}) };
       if (includeSnapshot) result.snapshot = await buildAndStoreSnapshot(d, tabId);
       return text(JSON.stringify(result, null, 2));
@@ -1724,11 +1986,15 @@ const TOOLS = [
 
   {
     name: 'browser_type',
+    input: true,
     description:
       'Type text into a focused element via CDP Input.insertText (trusted input). With `uid` ' +
-      'or `selector`, the tool first clicks (CDP) to focus the target, then types. Without ' +
+      'or `selector`, the tool reveals the target if needed, clicks (CDP) to focus it, then types. Without ' +
       'either, types into whatever is currently focused (use this when continuing typing into ' +
       'an input you just focused).\n\n' +
+      'Set replace:true to select all existing text with Ctrl+A (Command+A on macOS) ' +
+      'before inserting. Works on editable inputs, textareas, and contenteditable elements; ' +
+      'an empty string with replace:true clears the field. The default preserves existing text.\n\n' +
       'Special keys (Enter, Tab, Escape) go through browser_press_key, not this tool.\n\n' +
       'Set includeSnapshot:true to receive an updated browser_get_snapshot in the response.',
     inputSchema: {
@@ -1738,23 +2004,54 @@ const TOOLS = [
         text: { type: 'string', description: 'Text to type. Multi-character; no special key escapes.' },
         uid: { type: 'string', description: 'UID from browser_get_snapshot to focus first.' },
         selector: { type: 'string', description: 'CSS or XPath fallback if no UID.' },
+        replace: { type: 'boolean', default: false, description: 'Select all and replace existing text. Default false; otherwise insert at the current caret/selection.' },
         includeSnapshot: { type: 'boolean', description: 'Append a fresh browser_get_snapshot to the response.' },
       },
       required: ['tabId', 'text'],
     },
-    async run({ tabId, text: textToType, uid, selector, includeSnapshot }, d) {
-      await d.poolAttach(tabId);
-      const entry = d.sessionPool.get(tabId);
-      if (!entry) throw new Error('tab not found: ' + tabId);
-      if (uid || selector) {
-        const r = await resolveTarget(d, tabId, { uid, selector });
-        await cdpClickAt(d, entry.sessionId, r.x, r.y);
-      }
-      // Input.insertText is the simplest way to type a string and produces
-      // trusted input events. dispatchKeyEvent per char is also valid but
-      // more verbose and harder to get right for IME / unicode.
-      const r = await d.sessionCommand(entry.sessionId, 'Input.insertText', { text: textToType });
-      if (r.error) throw new Error(r.error.message);
+    async run({ tabId, text: textToType, uid, selector, includeSnapshot, replace = false }, d) {
+      if (typeof textToType !== 'string') throw new Error('browser_type: text must be a string');
+      if (typeof replace !== 'boolean') throw new Error('browser_type: replace must be a boolean');
+      const target = uid !== undefined || selector !== undefined ? { uid, selector } : undefined;
+      const typeInto = async (sid, objectId) => {
+        let shortcut;
+        if (replace) {
+          shortcut = await inspectElement(d, sid, objectId, function() {
+            const textInputTypes = new Set(['text', 'search', 'email', 'url', 'tel', 'password', 'number']);
+            const editable = this instanceof HTMLTextAreaElement ||
+              (this instanceof HTMLInputElement && textInputTypes.has(this.type)) || this.isContentEditable;
+            if (!editable) return { error: 'target is not an editable input, textarea, or contenteditable element' };
+            if (this.matches(':disabled')) return { error: 'target is disabled' };
+            if (this.readOnly) return { error: 'target is readonly' };
+            return navigator.platform.startsWith('Mac') ? 'meta' : 'ctrl';
+          });
+        }
+        if (target) {
+          const { x, y } = await actionPoint(d, tabId, target);
+          await cdpClickAt(d, d.sessionPool.get(tabId), x, y);
+        }
+        if (replace) {
+          await requireFocused(d, sid, objectId);
+          await cdpPressKey(d, sid, { code: 'KeyA', key: 'a', vk: 65 }, MODIFIER_BITS[shortcut]);
+          await requireFocused(d, sid, objectId);
+          if (textToType === '') await cdpPressKey(d, sid, KEY_MAP.Backspace);
+        }
+        // Input.insertText is the simplest way to type a string and produces
+        // trusted input events. dispatchKeyEvent per char is also valid but
+        // more verbose and harder to get right for IME / unicode.
+        if (textToType !== '') await inputCommand(d, sid, 'Input.insertText', { text: textToType });
+        if (replace) {
+          const value = await inspectElement(d, sid, objectId, function() {
+            if (!this.isConnected) return { error: 'target was detached during input' };
+            // Chromium retains a lone line break as the caret placeholder after clearing an editor.
+            if (this.isContentEditable && this.childNodes.length === 1 && this.firstChild.nodeName === 'BR') return '';
+            return this.isContentEditable ? this.innerText : this.value;
+          });
+          if (value !== textToType) throw new Error('Text replacement did not reach the requested value; the page modified or prevented input');
+        }
+      };
+      if (replace) await withElement(d, tabId, target, typeInto);
+      else await typeInto(await inputSession(d, tabId));
       const result = { tabId, typed: textToType.length + ' chars', uid: uid || null, selector: selector || null };
       if (includeSnapshot) result.snapshot = await buildAndStoreSnapshot(d, tabId);
       return text(JSON.stringify(result, null, 2));
@@ -1762,7 +2059,33 @@ const TOOLS = [
   },
 
   {
+    name: 'browser_select',
+    input: true,
+    description: 'Select one or more values on a native select through trusted mouse and keyboard input. Supports select[multiple]. Reveals and focuses the control, then uses Home/ArrowDown plus modified navigation/Space for multiple choices. Single dropdowns commit with Enter; multi-select operations can emit intermediate trusted input/change events. Rejects disabled/unavailable options and verifies the final selection. Keyboard selection also works if author styles retain a native popup outside bridge frames.',
+    inputSchema: { type: 'object', properties: {
+      tabId: { type: 'string', description: 'Existing tab ID.' },
+      values: { type: 'array', items: { type: 'string' }, minItems: 1, description: 'Option values to select. A non-multiple select accepts exactly one value.' },
+      uid: { type: 'string', description: 'UID from the latest browser_get_snapshot for this tab.' },
+      selector: { type: 'string', description: 'CSS selector or XPath fallback when no UID applies.' },
+      includeSnapshot: { type: 'boolean', description: 'Append a fresh browser_get_snapshot after selecting.' },
+    }, required: ['tabId', 'values'], oneOf: [{ required: ['uid'] }, { required: ['selector'] }] },
+    async run({ tabId, values, uid, selector, includeSnapshot }, d) {
+      if (!uid && !selector) throw new Error('browser_select: provide uid (preferred) or selector');
+      if (!Array.isArray(values) || values.length === 0 || values.some(v => typeof v !== 'string')) {
+        throw new Error('browser_select: values must contain at least one string value');
+      }
+      return withElement(d, tabId, { uid, selector }, async (sid, objectId) => {
+        const selectedValues = await selectNative(d, tabId, sid, objectId, values);
+        const result = { tabId, uid: uid || null, selector: selector || null, selectedValues };
+        if (includeSnapshot) result.snapshot = await buildAndStoreSnapshot(d, tabId);
+        return text(JSON.stringify(result, null, 2));
+      });
+    },
+  },
+
+  {
     name: 'browser_press_key',
+    input: true,
     description:
       'Dispatch a single named key (Enter, Tab, Escape, Backspace, Delete, ArrowUp/Down/Left/Right, ' +
       'Home, End, PageUp, PageDown, Space) via trusted CDP key events. Acts on the currently ' +
@@ -1783,13 +2106,7 @@ const TOOLS = [
       await d.poolAttach(tabId);
       const entry = d.sessionPool.get(tabId);
       if (!entry) throw new Error('tab not found: ' + tabId);
-      const base = { code: meta.code, key: meta.key, windowsVirtualKeyCode: meta.vk, modifiers: 0 };
-      const downEvent = { ...base, type: 'keyDown' };
-      if (meta.text) downEvent.text = meta.text;
-      const r1 = await d.sessionCommand(entry.sessionId, 'Input.dispatchKeyEvent', downEvent);
-      if (r1.error) throw new Error(r1.error.message);
-      const r2 = await d.sessionCommand(entry.sessionId, 'Input.dispatchKeyEvent', { ...base, type: 'keyUp' });
-      if (r2.error) throw new Error(r2.error.message);
+      await cdpPressKey(d, entry.sessionId, meta);
       const result = { tabId, key };
       if (includeSnapshot) result.snapshot = await buildAndStoreSnapshot(d, tabId);
       return text(JSON.stringify(result, null, 2));
@@ -1798,17 +2115,18 @@ const TOOLS = [
 
   {
     name: 'browser_scroll',
+    input: true,
     description:
       'Scroll by deltaX horizontally and deltaY vertically, in CSS pixels: positive right/down, negative left/up. ' +
-      'at selects where to scroll; it defaults to the visible page center.\n\n' +
+      'at selects where to scroll; it defaults to the visible page center. Element locations are revealed automatically first.\n\n' +
       'x/y are CSS-pixel positions in the visible web content area (page viewport): (0,0) is its top-left corner, x increases rightward and y downward. ' +
       'Browser tabs, address bar and window borders are excluded. These are not element, document or OS-window coordinates; screenshot pixels may be scaled differently.\n\n' +
       'method:"wheel" (default) sends mouse wheel input. The page may scroll less than requested or prevent scrolling. ' +
       'method:"javascript" scrolls the element at the chosen point or a containing element without mouse wheel input. ' +
       'Wheel mode temporarily activates the tab, then restores the previously viewed tab.\n\n' +
-      'Returns at, the requested deltas, method, moved, and before/after lists. ' +
+      'Returns at, the requested deltas, method, moved, and before/after lists. If revealing the location moved an ancestor, revealed contains that preparation step and its before/after positions. ' +
       'Each list entry contains tag, id, and x/y scroll positions in CSS pixels (scrollLeft/scrollTop), measured before and after the call. ' +
-      'moved:true means a recorded scroll position changed; false means none changed. It does not confirm the requested distance was covered. ' +
+      'moved:true means a recorded scroll position changed during preparation or the requested scroll; false means none changed. It does not confirm the requested distance was covered. ' +
       'Measurements include containing elements and open shadow roots, but not closed shadow roots or embedded frames.',
     inputSchema: {
       type: 'object',
@@ -1825,15 +2143,28 @@ const TOOLS = [
       if (!Number.isFinite(deltaX) || !Number.isFinite(deltaY)) throw new Error('deltaX/deltaY must be finite numbers');
       if (!['wheel', 'javascript'].includes(method)) throw new Error('method must be wheel or javascript');
       if (at !== undefined) validatePoint(at);
-      const run = () => scrollAt(d, tabId, { deltaX, deltaY, at, method });
-      const sid = await inputSession(d, tabId);
-      const result = await withSpatialInput(sid, () => method === 'wheel' ? withScrollRendering(d, tabId, run) : run());
+      let location = at;
+      let revealed;
+      if (at && at.x === undefined) {
+        const preparation = await withElement(d, tabId, at,
+          (sid, objectId) => revealElement(d, tabId, sid, objectId, method));
+        location = preparation.point;
+        if (preparation.moved) {
+          revealed = { method, steps: preparation.steps, before: preparation.before, after: preparation.after };
+        }
+      }
+      const result = await scrollAt(d, tabId, { deltaX, deltaY, at: location, method });
+      if (revealed) {
+        result.revealed = revealed;
+        result.moved = true;
+      }
       return text(JSON.stringify({ tabId, ...result }, null, 2));
     },
   },
 
   {
     name: 'browser_scroll_into_view',
+    input: true,
     description:
       'Scroll until the element has a visible point that can receive mouse input. The whole element need not fit onscreen. ' +
       'Choose uid or selector.\n\n' +
@@ -1843,7 +2174,7 @@ const TOOLS = [
       'Both methods check that another element does not cover the chosen point. Wheel mode temporarily activates the tab, then restores the previously viewed tab.\n\n' +
       'Returns visible:true, method, steps (wheel inputs; zero in javascript mode), moved, and before/after lists of containing elements. ' +
       'Each entry contains tag, id, and x/y scroll positions in CSS pixels (scrollLeft/scrollTop), measured before and after the call. ' +
-      'moved:true means a recorded scroll position changed; false means none changed. Measurements exclude the target itself and stop at a shadow root. ' +
+      'moved:true means a recorded scroll position changed; false means none changed. Measurements exclude the target itself and follow containing elements across shadow roots. ' +
       'includeSnapshot:true adds a fresh snapshot.',
     inputSchema: {
       type: 'object',
@@ -1863,64 +2194,8 @@ const TOOLS = [
       if (!Number.isInteger(maxSteps) || maxSteps < 1 || maxSteps > 100) throw new Error('maxSteps must be 1–100');
       const target = { uid, selector };
       validatePoint(target, true);
-      const run = () => withElement(d, tabId, target, async (sid, objectId) => {
-        const positions = () => inspectElement(d, sid, objectId, function () {
-          const result = [];
-          for (let el = this.parentElement; el; el = el.parentElement) result.push({ tag: el.tagName, id: el.id, x: el.scrollLeft, y: el.scrollTop });
-          return result;
-        });
-        const before = await positions();
-        let steps = 0;
-        if (method === 'javascript') {
-          await inputCommand(d, sid, 'DOM.scrollIntoViewIfNeeded', { objectId });
-        } else {
-          for (;;) {
-            // A hit-testable target needs no scrolling, even if its DOM ancestors
-            // are clipped (e.g. fixed positioning outside a non-containing block).
-            try { await inputPoint(d, tabId, target); break; } catch {}
-            const plan = await inspectElement(d, sid, objectId, function () {
-              if (!this.isConnected) return { error: 'Target detached' };
-              const r = this.getBoundingClientRect();
-              if (!r.width || !r.height) return { error: 'Target has no geometry' };
-              const ancestors = [];
-              for (let el = this.parentElement; el; el = el.parentElement) ancestors.push(el);
-              for (const el of ancestors) {
-                const root = el === document.scrollingElement, s = getComputedStyle(el);
-                const q = root ? { left: 0, top: 0, right: innerWidth, bottom: innerHeight } : el.getBoundingClientRect();
-                // Aim for the nearest visible portion, including oversized targets.
-                const distance = (a, b, min, max) => a < min && b > max ? 0 : a < min ? a - min : b > max ? Math.min(b - max, a - min) : 0;
-                let left = Math.max(0, q.left), right = Math.min(innerWidth, q.right);
-                let top = Math.max(0, q.top), bottom = Math.min(innerHeight, q.bottom);
-                for (let parent = el.parentElement; parent; parent = parent.parentElement) {
-                  const p = parent.getBoundingClientRect(), style = getComputedStyle(parent);
-                  if (style.overflowX !== 'visible') { left = Math.max(left, p.left); right = Math.min(right, p.right); }
-                  if (style.overflowY !== 'visible') { top = Math.max(top, p.top); bottom = Math.min(bottom, p.bottom); }
-                }
-                if (right <= left || bottom <= top) continue;
-                // Seek into the reachable part of this scroller, not its full
-                // rectangle: an outer clip can hide an otherwise in-range target.
-                const dx = root || /auto|scroll/.test(s.overflowX) ? distance(r.left, r.right, left, right) : 0;
-                const dy = root || /auto|scroll/.test(s.overflowY) ? distance(r.top, r.bottom, top, bottom) : 0;
-                if (!dx && !dy) continue;
-                const x = (left + right) / 2, y = (top + bottom) / 2, hit = document.elementFromPoint(x, y);
-                if (!root && hit !== el && !el.contains(hit)) return { error: 'Scroll container is obscured' };
-                return { at: { x, y }, deltaX: Math.max(-600, Math.min(600, dx)), deltaY: Math.max(-600, Math.min(600, dy)) };
-              }
-              return { done: true };
-            });
-            if (plan.done) break;
-            if (steps >= maxSteps) throw new Error('Wheel scroll exceeded maxSteps; target may still be offscreen');
-            const result = await scrollAt(d, tabId, { ...plan, method });
-            steps++;
-            if (!result.moved) throw new Error('Wheel made no progress: scrolling prevented, clipped, or at boundary');
-          }
-        }
-        await inputPoint(d, tabId, target); // Verify actual visible, hit-testable geometry.
-        const after = await positions();
-        return { tabId, method, visible: true, steps, moved: JSON.stringify(before) !== JSON.stringify(after), before, after };
-      });
-      const sid = await inputSession(d, tabId);
-      const result = await withSpatialInput(sid, () => method === 'wheel' ? withScrollRendering(d, tabId, run) : run());
+      const { point, ...result } = await withElement(d, tabId, target,
+        (sid, objectId) => revealElement(d, tabId, sid, objectId, method, maxSteps));
       if (includeSnapshot) result.snapshot = await buildAndStoreSnapshot(d, tabId);
       return text(JSON.stringify(result, null, 2));
     },
@@ -2398,7 +2673,10 @@ async function dispatch(msg, deps, log) {
         // Cold-bridge start: rebuild ownership from disk before the first tool
         // acts, so FIFO counts and mcpOwned flags reflect the surviving tabs.
         await ensureRehydrated(deps);
-        const result = await tool.run(params.arguments || {}, deps);
+        const args = params.arguments || {};
+        const result = await (tool.input
+          ? runInput(deps, args.tabId, () => tool.run(args, deps), args.method !== 'javascript')
+          : tool.run(args, deps));
         return reply(id, result);
       } catch (err) {
         log.error('mcp tool', tool.name, 'failed:', err.message);

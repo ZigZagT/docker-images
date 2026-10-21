@@ -1,18 +1,14 @@
-// MCP/CDP integration tests launch a dedicated headless Chromium process.
-// Set PLAYWRIGHT_MODULE and CHROMIUM_PATH to override the local test binaries.
+// Use isolated tabs in the test container; no host-installed browser libraries.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
 import { Readable } from 'node:stream';
 import { createMcpHandler } from '../mcp.mjs';
-const require = createRequire(import.meta.url);
-const { chromium } = require(process.env.PLAYWRIGHT_MODULE || '/usr/lib/node_modules/openclaw/node_modules/playwright-core');
+import { createCdpPage, pass } from './helpers.mjs';
 
 test('native wheel, nested seeking, explicit javascript and inactive headless tabs', { timeout: 60000 }, async () => {
-  const browser = await chromium.launch({ executablePath: process.env.CHROMIUM_PATH || '/usr/local/bin/chrome-raw', headless: true, args: ['--no-sandbox'] });
+  const page = await createCdpPage();
+  let viewer;
   try {
-    const context = await browser.newContext({ viewport: { width: 1000, height: 700 } });
-    const page = await context.newPage();
     await page.setContent(`<!doctype html><style>
       body{margin:0;height:3200px} #nested{position:absolute;left:30px;top:30px;width:320px;height:200px;overflow:auto;border:2px solid}
       #content{width:1000px;height:1200px} #deep{position:relative;top:1000px;left:750px}
@@ -27,8 +23,8 @@ test('native wheel, nested seeking, explicit javascript and inactive headless ta
       <button id="bottom">Bottom</button><button id="hidden">Hidden</button>
       <script>window.wheels=[];document.addEventListener('wheel',e=>wheels.push({trusted:e.isTrusted,x:e.deltaX,y:e.deltaY,target:e.target.id}),true);
       blocked.addEventListener('wheel',e=>e.preventDefault(),{passive:false});</script>`);
-    const viewer = await context.newPage();
-    const sessions = new Map([['page', await context.newCDPSession(page)], ['viewer', await context.newCDPSession(viewer)]]);
+    viewer = await createCdpPage();
+    const sessions = new Map([['page', page], ['viewer', viewer]]);
     const commands = [];
     let failWheel = false;
     const deps = {
@@ -38,7 +34,7 @@ test('native wheel, nested seeking, explicit javascript and inactive headless ta
       sessionCommand: async (sid, method, params) => {
         commands.push({ sid, method, params });
         if (method === 'Input.dispatchMouseEvent' && params.type === 'mouseWheel' && failWheel) return { error: { message: 'injected wheel failure' } };
-        try { return { result: await sessions.get(sid).send(method, params) }; }
+        try { return { result: await sessions.get(sid).command(method, params) }; }
         catch (error) { return { error: { message: error.message } }; }
       },
     };
@@ -169,5 +165,9 @@ test('native wheel, nested seeking, explicit javascript and inactive headless ta
       assert.equal(result.moved, true, method);
       assert.ok(result.after.find(el => el.id === 'slottedScroller').y > 0);
     }
-  } finally { await browser.close(); }
+    pass('mcp-scroll (native wheel, nested seeking, explicit javascript, shadow roots, errors)');
+  } finally {
+    try { if (viewer) await viewer.close(); }
+    finally { await page.close(); }
+  }
 });

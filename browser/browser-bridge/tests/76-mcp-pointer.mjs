@@ -1,17 +1,13 @@
-// MCP pointer integration tests launch headless Chromium and inject CDP failures.
+// Isolated test-container tabs exercise pointer input and injected failures.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
 import { Readable } from 'node:stream';
 import { createMcpHandler } from '../mcp.mjs';
-const require = createRequire(import.meta.url);
-const { chromium } = require(process.env.PLAYWRIGHT_MODULE || '/usr/lib/node_modules/openclaw/node_modules/playwright-core');
+import { createCdpPage, pass } from './helpers.mjs';
 
 test('unified move, native click options, balanced release and non-activating failures', { timeout: 60000 }, async () => {
-  const browser = await chromium.launch({ executablePath: process.env.CHROMIUM_PATH || '/usr/local/bin/chrome-raw', headless: true, args: ['--no-sandbox'] });
+  const page = await createCdpPage();
   try {
-    const context = await browser.newContext({ viewport: { width: 1000, height: 700 } });
-    const page = await context.newPage();
     await page.setContent(`<!doctype html><style>
       body{margin:0} #click{position:absolute;left:30px;top:30px;width:120px;height:50px}
       #handle{position:absolute;left:30px;top:150px;width:120px;height:50px;background:orange}
@@ -32,7 +28,7 @@ test('unified move, native click options, balanced release and non-activating fa
       source.addEventListener('dragstart',e=>e.dataTransfer.setData('text/plain','payload'));
       destination.addEventListener('dragover',e=>e.preventDefault());
       destination.addEventListener('drop',e=>{e.preventDefault();drops++;});</script>`);
-    const session = await context.newCDPSession(page);
+    // CDP mouse input requires this background fixture tab to have an active renderer.
     const commands = [];
     let fault = null;
     const deps = {
@@ -43,7 +39,7 @@ test('unified move, native click options, balanced release and non-activating fa
         const injection = fault?.(method, params);
         if (injection === 'before') return { error: { message: 'injected failure' } };
         try {
-          const result = await session.send(method, params);
+          const result = await page.command(method, params);
           return injection === 'after' ? { error: { message: 'injected lost reply' } } : { result };
         } catch (error) { return { error: { message: error.message } }; }
       },
@@ -76,10 +72,9 @@ test('unified move, native click options, balanced release and non-activating fa
     const tools = definitions.map(t => t.name);
     assert.ok(tools.includes('browser_move_pointer'));
     assert.ok(!tools.includes('browser_hover') && !tools.includes('browser_drag'));
+    assert.ok(definitions.find(t => t.name === 'browser_move_pointer').inputSchema.properties.from);
+    await call('browser_move_pointer', { to: { selector: '#destination' }, mouseButton: 'left' }, /both from and mouseButton/);
 
-    await move({ to: { selector: '#click' } });
-    assert.ok((await events()).some(e => e.type === 'pointermove' && e.target === 'click' && e.trusted && e.buttons === 0));
-    assert.ok(!(await events()).some(e => e.type === 'pointerdown'));
     await reset();
     const moved = await move({ from: { selector: '#handle' }, to: { x: 400, y: 175 }, mouseButton: 'left' });
     assert.equal(moved.mouseButton, 'left');
@@ -89,9 +84,14 @@ test('unified move, native click options, balanced release and non-activating fa
     assert.ok(drag.filter(e => e.type.startsWith('pointer')).every(e => e.trusted));
     assert.equal(drag.filter(e => e.type === 'pointerdown').length, 1);
     assert.equal(drag.filter(e => e.type === 'pointerup').length, 1);
-    assert.equal(commands.filter(c => c.method === 'Input.dispatchMouseEvent' && c.params.type === 'mouseMoved').length, 3);
+    assert.equal(commands.filter(c => c.method === 'Input.dispatchMouseEvent' && c.params.type === 'mouseMoved').length, 10);
     await move({ to: { x: 450, y: 175 } });
     assert.equal((await events()).filter(e => e.type === 'pointermove').at(-1).buttons, 0);
+
+    await reset();
+    await move({ to: { selector: '#click' } });
+    assert.ok((await events()).some(e => e.type === 'pointermove' && e.target === 'click' && e.trusted && e.buttons === 0));
+    assert.ok(!(await events()).some(e => e.type === 'pointerdown'));
 
     await reset();
     await move({ from: { selector: '#source' }, to: { selector: '#destination' }, mouseButton: 'left' });
@@ -120,18 +120,19 @@ test('unified move, native click options, balanced release and non-activating fa
     assert.ok(uid, snap);
     await click({ at: { uid } });
 
-    for (const args of [{ from: { x: 1, y: 1 }, to: { x: 2, y: 2 } }, { to: { x: 2, y: 2 }, mouseButton: 'left' }])
-      await call('browser_move_pointer', args, /both from and mouseButton/);
+    await call('browser_move_pointer', { from: { x: 1, y: 1 }, to: { x: 2, y: 2 } }, /both from and mouseButton/);
+    await call('browser_move_pointer', { to: { x: 2, y: 2 }, button: 'left' }, /Unknown pointer parameters/);
     await call('browser_move_pointer', { to: { selector: '#covered' } }, /obscured/);
-    await call('browser_click', { at: { selector: '#hidden' } }, /offscreen or clipped/);
+    await call('browser_click', { at: { selector: '#hidden' } }, /no geometry/);
     await call('browser_click', { at: { x: 9000, y: 20 } }, /outside viewport/);
     await call('browser_click', { selector: '#click', at: { x: 20, y: 20 } }, /not both/);
     await call('browser_click', { selector: '#click', mouseButton: 'invalid' }, /mouseButton/);
     await call('browser_click', { selector: '#click', delayMs: -1 }, /delayMs/);
     await call('browser_click', { selector: '#click', doubleClick: 'yes' }, /boolean/);
     await call('browser_click', { selector: '#click', modifiers: ['invalid'] }, /modifiers/);
-    await call('browser_click', { at: { selector: '#option' } }, /offscreen or clipped|geometry/);
-    assert.equal(await page.evaluate(() => select.value), 'a'); // Failed hit-testing leaves the selected option unchanged.
+    const selectedOption = await click({ at: { selector: '#option' } });
+    assert.equal(selectedOption.method, 'keyboard');
+    assert.equal(await page.evaluate(() => select.value), 'b');
 
     // Fixed targets escape overflow wrappers but remain clipped by transformed
     // containing blocks.
@@ -198,13 +199,16 @@ test('unified move, native click options, balanced release and non-activating fa
     await move({ to: { x: 450, y: 175 } });
     assert.equal((await events()).filter(e => e.type === 'pointermove').at(-1).buttons, 0);
 
-    // A held click rejects concurrent spatial gestures on the same tab.
+    // Queued input must not release or redirect another call's held click.
     await reset();
     const pending = click({ selector: '#click', delayMs: 250 });
     await page.waitForFunction(() => events.some(e => e.type === 'pointerdown'));
-    await call('browser_move_pointer', { to: { x: 450, y: 175 } }, /gesture is in progress/);
-    await call('browser_scroll', { deltaX: 0, deltaY: 20 }, /gesture is in progress/);
-    await pending;
+    await Promise.all([pending, move({ to: { x: 450, y: 175 } }), call('browser_scroll', { deltaX: 0, deltaY: 20 })]);
+    const concurrent = await events();
+    const releaseIndex = concurrent.findIndex(e => e.type === 'pointerup');
+    assert.ok(releaseIndex >= 0);
+    assert.ok(concurrent.findIndex(e => e.type === 'pointermove' && e.x === 450) > releaseIndex);
+    assert.equal(concurrent.filter(e => e.type === 'click').length, 1);
 
     // Failed input suppression blocks release and subsequent spatial gestures.
     await reset();
@@ -217,5 +221,6 @@ test('unified move, native click options, balanced release and non-activating fa
     assert.equal(commands.filter(c => c.method === 'Input.dispatchMouseEvent' && c.params.type === 'mouseReleased').length, 0);
     assert.ok(commands.some(c => c.method === 'Input.setIgnoreInputEvents' && !c.params.ignore));
     await call('browser_move_pointer', { to: { x: 450, y: 175 } }, /fresh tab/);
-  } finally { await browser.close(); }
+    pass('mcp-pointer (explicit drag origin, click options, trusted input, serialization, failure cleanup)');
+  } finally { await page.close(); }
 });

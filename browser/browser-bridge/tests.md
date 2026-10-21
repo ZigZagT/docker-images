@@ -240,3 +240,18 @@ URL is known, the broadcast is suppressed and `Page.navigate` re-fires.
 - `index.html` — viewer (`visibilitychange` sends switchTab with `currentTargetId`)
 - `tests/13-browser-viewer-navigate.mjs` — reproduces the bug via Chrome-hosted viewer
 - `tests/run-all.mjs` — sequential runner, 120s timeout per test
+
+## MCP interaction coverage
+
+- `42-mcp-endpoint.mjs` checks the consolidated interaction tool names, replacement/button schemas, and initialization guidance.
+- `49-mcp-interactions.mjs` covers trusted click/text insertion/replacement, empty strings with and without replacement, readonly/disabled targets, intercepted input, concurrent input isolation, drag interpolation and button release, explicit drag origins despite intervening viewer movement, native single/multiple selection with trusted events, unavailable options, snapshots, keys, scrolling, and reload.
+- `75-mcp-scroll.mjs` checks native wheel input, nested scrolling, explicit JavaScript scrolling, shadow-root offsets, prevented input, and error propagation.
+- `76-mcp-pointer.mjs` checks click options, dragging from explicit origins without prior movement, target validation, input serialization, lost responses, and non-activating cancellation after failures.
+- `77-native-select.mjs` measures actual viewer-frame pixels separately from screenshots and selection changes. It compares native controls, the previous incomplete stylesheet, the current bridge stylesheet, and explicit customizable-select opt-in. It checks upgrades of an existing bridge stylesheet, visible/mouse-operable current menus, single-dropdown commits without intermediate values, and native option keyboard fallback. Native capture and mouse-routing limits remain explicitly reported.
+- `78-automatic-targets.mjs` checks no-scroll exposed points, nested and offscreen actions, sticky overlays, shadow-root scrolling, `display: contents`, exact duplicate-value option targeting, transient and persistent blockers, and preservation of native input.
+
+The scroll and pointer tests use isolated tabs in the container's browser through `tests/helpers.mjs`. They require no host-installed Playwright package or separate browser installation.
+
+Native select evidence, the compatibility policy, and remaining native-popup
+limits are recorded in `browser/README.md` under "Native select rendering and remaining limits". Reproduce the matrix with
+`make TESTS=77-native-select run-browser-test`.

@@ -8,10 +8,12 @@
 import http from 'http';
 import { pass, fail } from './helpers.mjs';
 
-function rpc(method, params, id = Math.floor(Math.random() * 1e9)) {
+const BRIDGE_PORT = parseInt(process.env.BRIDGE_PORT || '6080', 10);
+
+function rpc(method, params, id = method.startsWith('notifications/') ? undefined : Math.floor(Math.random() * 1e9)) {
   return new Promise((res, rej) => {
     const body = JSON.stringify({ jsonrpc: '2.0', id, method, params });
-    const req = http.request('http://127.0.0.1:6080/mcp', {
+    const req = http.request(`http://127.0.0.1:${BRIDGE_PORT}/mcp`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -59,6 +61,7 @@ const expected = ['browser_list_tabs', 'browser_navigate', 'browser_open',
                   'browser_reload', 'browser_close_tab',
                   'browser_get_snapshot', 'browser_get_text', 'browser_evaluate',
                   'browser_get_html', 'browser_click', 'browser_type',
+                  'browser_move_pointer', 'browser_select',
                   'browser_press_key', 'browser_scroll', 'browser_scroll_into_view',
                   'browser_screenshot', 'browser_wait_for',
                   'browser_set_attention', 'browser_dismiss_attention',
@@ -68,8 +71,24 @@ const expected = ['browser_list_tabs', 'browser_navigate', 'browser_open',
                   'browser_get_network_requests', 'browser_get_network_response',
                   'browser_list_frames', 'browser_navigate_frame'];
 const got = (list.json?.result?.tools || []).map(t => t.name);
+if (new Set(got).size !== got.length) fail('mcp-endpoint', 'tool names must be unique');
 for (const name of expected) {
   if (!got.includes(name)) fail('mcp-endpoint', 'missing tool: ' + name + '; have ' + got.join(','));
+}
+for (const name of ['browser_hover', 'browser_fill', 'browser_drag']) {
+  if (got.includes(name)) fail('mcp-endpoint', 'superseded tool is still exposed: ' + name);
+}
+const typeSchema = list.json.result.tools.find(t => t.name === 'browser_type').inputSchema;
+if (typeSchema.properties.replace?.type !== 'boolean') fail('mcp-endpoint', 'browser_type missing replacement option');
+if (typeSchema.properties.replace.default !== false) fail('mcp-endpoint', 'replacement must remain opt-in');
+const pointerSchema = list.json.result.tools.find(t => t.name === 'browser_move_pointer').inputSchema;
+if (!pointerSchema.properties.from || pointerSchema.properties.sourceUid || pointerSchema.properties.sourceSelector ||
+    !pointerSchema.properties.to || pointerSchema.properties.mouseButton?.enum.join(',') !== 'left,middle,right') {
+  fail('mcp-endpoint', 'pointer tool must expose explicit from/to and mouseButton parameters');
+}
+if (pointerSchema.dependentRequired?.from?.[0] !== 'mouseButton' ||
+    pointerSchema.dependentRequired?.mouseButton?.[0] !== 'from') {
+  fail('mcp-endpoint', 'dragging must require from and mouseButton together');
 }
 
 // 3b. initialize response carries server-level instructions so agents
@@ -81,18 +100,27 @@ const instr = init2.json?.result?.instructions || '';
 if (!instr.includes('FIFO') || !instr.includes('attention') || !instr.includes('browser_open')) {
   fail('mcp-endpoint', 'initialize missing/incomplete instructions field');
 }
+if (!instr.includes('browser_move_pointer') || !instr.includes('replace:true') ||
+    ['browser_hover', 'browser_fill', 'browser_drag', 'documented exception'].some(s => instr.includes(s))) {
+  fail('mcp-endpoint', 'initialize instructions contain stale interaction guidance');
+}
+if (!instr.includes('browser_move_pointer({tabId, from: {uid: sourceUid}, to: {uid: destinationUid}, mouseButton: "left"})') ||
+    !instr.includes('No separate release call is needed')) {
+  fail('mcp-endpoint', 'initialize must explain a self-contained drag and release behavior');
+}
 
 // 4. browser_open creates a tab and returns the resolved URL.
+const pageUrl = 'data:text/html,' + encodeURIComponent('<!doctype html><title>Example</title><h1>Example page</h1>');
 const nav = await rpc('tools/call', {
   name: 'browser_open',
-  arguments: { url: 'https://example.com' },
+  arguments: { url: pageUrl },
 });
 const navText = nav.json?.result?.content?.[0]?.text || '';
 let navResult;
 try { navResult = JSON.parse(navText); }
 catch { fail('mcp-endpoint', 'open non-JSON content: ' + navText); }
 if (!navResult.tabId) fail('mcp-endpoint', 'open missing tabId: ' + navText);
-if (!navResult.url?.includes('example')) fail('mcp-endpoint', 'open wrong URL: ' + navText);
+if (navResult.url !== pageUrl) fail('mcp-endpoint', 'open wrong URL: ' + navText);
 const tabId = navResult.tabId;
 
 // 5. browser_evaluate runs JS and returns the value.

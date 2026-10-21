@@ -153,16 +153,107 @@ The MCP server also sends an `instructions` field at the `initialize` handshake 
 | `browser_evaluate(tabId, expression)` | Run JS in the page for reading only. NOT for clicks/typing/scrolling. |
 | `browser_screenshot(tabId, fullPage?)` | Visual confirmation only (base64 PNG). |
 
-**Interacting (trusted CDP input — passes bot detection):**
+**Interacting (trusted Chrome DevTools Protocol input):**
 
 | Tool | Purpose |
 | --- | --- |
-| `browser_click(tabId, uid\|selector, includeSnapshot?)` | Trusted mouse click. Prefer `uid` (from snapshot). |
-| `browser_type(tabId, text, uid?, selector?, includeSnapshot?)` | Trusted text input via `Input.insertText`. Clicks-to-focus first if uid/selector given. |
+| `browser_click(tabId, at?, uid?, selector?, mouseButton?, doubleClick?, delayMs?, modifiers?, includeSnapshot?)` | Trusted mouse click. Provide `at: {uid}`, `at: {selector}`, or `at: {x, y}`; alternatively provide `uid` or `selector` directly. Use only one targeting field. Reveals element targets automatically. A plain left click on an option without geometry selects it through native keyboard input. Supports left/middle/right buttons, double-click, and a press duration of 0–1000 milliseconds. |
+| `browser_type(tabId, text, uid?, selector?, replace?, includeSnapshot?)` | Trusted text input via `Input.insertText`. Reveals and clicks-to-focus first if uid/selector given; otherwise uses the focused field. `replace` defaults to `false`. `replace: true` selects all with Ctrl+A (Command+A on macOS) before typing; an empty string with `replace: true` clears the field. Otherwise inserts at the current caret/selection. |
+| `browser_move_pointer(tabId, to, from?, mouseButton?, modifiers?, includeSnapshot?)` | Provide `to: {uid}`, `to: {selector}`, or `to: {x, y}` as the destination. For dragging, also provide `from` and `mouseButton: "left"` (or `"middle"`/`"right"`). The call positions at `from`, presses, moves along a short interpolated path, and releases. |
+| `browser_select(tabId, values, uid?, selector?, includeSnapshot?)` | Provide `uid` or `selector` for a native `<select>`. Selects values with mouse/keyboard input. Single dropdowns commit with Enter; multiple choices can emit intermediate trusted `input`/`change` events. Disabled/hidden choices are rejected and the final selection is verified. |
 | `browser_press_key(tabId, key, includeSnapshot?)` | Named key (Enter, Tab, Escape, ArrowDown, …) via trusted keydown/keyup. |
-| `browser_scroll(tabId, deltaX, deltaY)` | Scroll the page by delta pixels. |
-| `browser_scroll_into_view(tabId, uid\|selector)` | Scroll until element is visible. |
+| `browser_scroll(tabId, deltaX, deltaY, at?, method?)` | Native wheel input at `at: {uid}`, `at: {selector}`, or `at: {x, y}`; defaults to the viewport center. Reports observed scroll positions and whether they changed. `method: "javascript"` explicitly requests programmatic scrolling instead. |
+| `browser_scroll_into_view(tabId, uid?, selector?, method?, maxSteps?, includeSnapshot?)` | Provide `uid` or `selector`. Uses native wheel input and verifies a visible, unobscured point. `maxSteps` limits wheel inputs (default 30). `method: "javascript"` explicitly requests programmatic scrolling instead. |
 | `browser_wait_for(tabId, expression, timeoutMs, intervalMs?)` | Poll a JS expression until truthy or timeout. |
+
+Text replacement, pointer movement, and selection follow browser input behavior rather than assigning values or dispatching synthetic DOM (Document Object Model) events. Tool and viewer input are serialized per tab so compound gestures do not interleave. Drags use an explicit origin rather than relying on pointer position left by earlier input. Native option clicks use keyboard selection when pointer geometry is unavailable. Trusted events alone do not guarantee acceptance by bot detection.
+
+Element clicks, typing, selection, scrolling locations, and pointer movement first use an exposed
+point without scrolling. They automatically use native wheel input when the
+target is offscreen or clipped, including nested scroll containers. Partially
+covered elements can be clicked on an exposed part; sticky overlays can be
+avoided by repositioning the target. Briefly covered targets are retried.
+Coordinate targets stay literal, and drag endpoints must be visible together.
+
+The tools do not remove overlays, force-click hidden elements, or silently
+switch to JavaScript scrolling. A persistent modal, hidden control, or page
+that prevents scrolling still produces an explicit error rather than clicking
+the wrong element. Native option selection is the semantic fallback: a normal
+left click without modifiers, double-click, or hold delay selects that exact
+option using keyboard input and returns `method: "keyboard"` and
+`selectedValues`, rather than a fictitious `clickedAt`.
+When `browser_scroll` first reveals an offscreen location, its `revealed` field
+reports that preparation separately from the requested scroll.
+
+Native input temporarily activates the target tab so Chromium can deliver events to background pages, then restores the tab currently shown in the viewer. Explicit JavaScript scrolling does not activate the tab.
+
+Dragging uses one call:
+
+```js
+browser_move_pointer({
+  tabId, from: { uid: sourceUid }, to: { uid: destinationUid }, mouseButton: "left"
+})
+```
+
+Both `from` and `mouseButton` are required for dragging; omit both for ordinary movement. Each point accepts `{uid}`, `{selector}`, or `{x, y}`. Another agent or the viewer can move the pointer between calls, so a previous move is not a drag origin. Coordinates are CSS (Cascading Style Sheets) pixels relative to the visible page's top-left corner, not document or screen coordinates.
+
+#### Native select rendering and remaining limits
+
+Changing a native selection and displaying its popup are separate capabilities.
+The bridge now opts both ordinary dropdown controls and their `::picker(select)`
+into `appearance: base-select`. This completes the existing styling workaround
+so menus are visible and mouse-operable in bridge frames. Multiple and sized
+listboxes remain native to preserve their keyboard behavior.
+Existing bridge styles are updated in place when a tab is attached, so a
+bridge-only restart also upgrades pages carrying the previous incomplete rule.
+
+Measured on Linux headless **Chrome/153.0.8010.12**, 2026-10-21, through the actual
+bridge and its viewer frame protocol (`tests/77-native-select.mjs`):
+
+| Rendering mode | Menu in bridge frames | Menu in screenshots | Keyboard and `browser_select` | Mouse selection |
+| --- | --- | --- | --- | --- |
+| Native `appearance: auto` | No | Yes | Worked, trusted events | Failed in the fixture |
+| Previous bridge rule: `base-select` on the control only | No | Yes | Worked, trusted events | Failed in the fixture |
+| Current bridge rule: `base-select` on both the control and `::picker(select)` | Yes | Yes | Worked, trusted events | Worked, trusted events |
+
+The measurement compares pixels outside the closed control in fresh bridge
+frames, not just the document's option values. Native and previous-bridge modes
+produced zero changed pixels there, while screenshots contained the popup.
+Their options had zero document geometry. Fully opted-in options had geometry
+and the menu appeared in both capture paths.
+
+Keyboard input and value-based selection worked with initially open and closed
+pickers in all three modes. Native popup mouse selection failed both through
+the viewer and direct Chrome DevTools Protocol input, using option coordinates
+measured from screenshots. `Page.bringToFront` left the popup open, so the
+failure is not explained solely by the bridge's activation wrapper. The exact
+native-popup mouse-routing cause remains unverified. Public
+`Input.synthesizeTapGesture` calls with mouse and touch sources also failed to
+change the native selection in this fixture; they are not a fallback.
+
+The previous injected rule was incomplete.
+[Chrome's customizable-select documentation](https://developer.chrome.com/blog/a-customizable-select)
+requires opting in **both** the control and its picker. It also documents
+changes to sizing, placement, and operating-system integration. Applying that
+mode changes website rendering; this is a compatibility workaround, not native
+popup capture. Higher-priority author styles and controls outside the injected
+document styles, including shadow roots, can retain native popups. Their option
+actions fall back to trusted keyboard selection, but that does not repair native
+popup mouse routing or put those menus into screencast frames.
+
+Screenshots and screencasts use different capture paths:
+[the protocol](https://chromedevtools.github.io/devtools-protocol/#/Page.captureScreenshot)
+does not expose an equivalent popup-inclusion switch on `startScreencast`.
+Chromium's `RenderWidgetHostViewAura::CopyFromSurfaceImpl` calls
+[`CopyMainAndPopupFromSurface`](https://github.com/chromium/chromium/blob/b857adbc17d4d198b8081316a9f6a0fe11db9d29/content/browser/renderer_host/render_widget_host_view_aura.cc#L1201-L1218),
+whereas `PageHandler::StartScreencast` uses a video consumer. These source paths
+explain why screenshot visibility must not be treated as screencast coverage.
+
+**Native popup capture and mouse routing remain separate limitations.** The
+current policy completes the existing stylesheet without replacing website
+controls or changing the capture architecture. Passing selection tests alone
+does not establish native-popup rendering support; test 77 measures the actual
+bridge frames and input paths separately.
 
 **Human-in-the-loop:**
 

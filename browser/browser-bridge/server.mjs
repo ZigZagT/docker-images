@@ -20,7 +20,7 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { WebSocketServer, WebSocket } from 'ws';
-import { createMcpHandler, getMcpState, noteTabClosed, onMcpStateChange, clearAttention, rehydrateOwnership, onOwnedTabNavigated, isDevMode, devModeSessionHandler, inheritMcpOwnership } from './mcp.mjs';
+import { createMcpHandler, getMcpState, noteTabClosed, onMcpStateChange, clearAttention, rehydrateOwnership, onOwnedTabNavigated, isDevMode, devModeSessionHandler, inheritMcpOwnership, dispatchMouseInput, runInput } from './mcp.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -767,19 +767,18 @@ async function poolAttach(targetId) {
     }).catch(err => log.error('setUserAgentOverride failed for', targetId.slice(0, 8) + ':', err.message));
   }
 
-  // Render <select> as in-page DOM popovers (appearance: base-select) so
-  // dropdowns are visible in screencast instead of being invisible
-  // OS-level popup windows. Viewer mouse clicks can't select options
-  // (Chrome gives <option> elements zero hit-test geometry in the
-  // base-select picker), but keyboard navigation works (arrow keys +
-  // Enter). MCP browser_click handles options via JS in resolveTarget().
+  // Both the control and picker must opt in for menus to reach bridge frames.
+  // Listboxes stay native: applying base-select to them broke keyboard input.
+  // Author overrides and controls outside this document's styles can remain
+  // native; option actions then use keyboard selection rather than synthetic clicks.
   const baseSelectScript = `(() => {
     const inject = () => {
-      if (document.getElementById("__bb_base_select")) return;
-      const s = document.createElement("style");
+      // Bridge-only restarts keep documents alive, including their older bridge styles.
+      const s = document.getElementById("__bb_base_select") || document.createElement("style");
       s.id = "__bb_base_select";
-      s.textContent = "select { appearance: base-select !important; }";
-      (document.head || document.documentElement).appendChild(s);
+      const selector = 'select:not([multiple]):is(:not([size]), [size="0"], [size="1"])';
+      s.textContent = selector + ', ' + selector + '::picker(select) { appearance: base-select !important; }';
+      if (!s.isConnected) (document.head || document.documentElement).appendChild(s);
     };
     if (document.head) inject();
     else document.addEventListener("DOMContentLoaded", inject);
@@ -1533,33 +1532,33 @@ viewerWss.on('connection', async (client, req) => {
           break;
 
         case 'mouse':
-          if (entry) sessionSend(entry.sessionId, 'Input.dispatchMouseEvent', {
+          if (entry) await runInput(mcpDeps, activeTargetId, () => dispatchMouseInput(mcpDeps, entry, {
             type: msg.action, x: msg.x, y: msg.y,
             button: msg.button || 'left',
             clickCount: msg.clickCount || 0,
             modifiers: msg.modifiers || 0
-          });
+          }));
           break;
 
         case 'key':
-          if (entry) sessionSend(entry.sessionId, 'Input.dispatchKeyEvent', {
+          if (entry) await runInput(mcpDeps, activeTargetId, () => sessionSend(entry.sessionId, 'Input.dispatchKeyEvent', {
             type: msg.action, key: msg.key, code: msg.code,
             text: msg.text || '',
             windowsVirtualKeyCode: msg.keyCode || 0,
             modifiers: msg.modifiers || 0
-          });
+          }));
           break;
 
         case 'scroll':
-          if (entry) sessionSend(entry.sessionId, 'Input.dispatchMouseEvent', {
+          if (entry) await runInput(mcpDeps, activeTargetId, () => dispatchMouseInput(mcpDeps, entry, {
             type: 'mouseWheel', x: msg.x, y: msg.y,
             deltaX: msg.deltaX || 0, deltaY: msg.deltaY || 0
-          });
+          }));
           break;
 
         case 'paste':
           if (entry && msg.text) {
-            sessionSend(entry.sessionId, 'Input.insertText', { text: msg.text });
+            await runInput(mcpDeps, activeTargetId, () => sessionSend(entry.sessionId, 'Input.insertText', { text: msg.text }));
           }
           break;
 
