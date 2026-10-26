@@ -71,6 +71,16 @@ Single workflow: `.github/workflows/build-and-push.yml`
 - READMEs sync to DockerHub descriptions via `scripts/sync-readme.sh`
 - Environment: `action-build-and-push` (contains DOCKERHUB_TOKEN, MAXMIND_LICENSE_KEY secrets)
 
+## Registry Mirrors
+
+CI build may trigger 429 from container registries. We configured multiple mirrors in [`buildkitd.toml`](buildkitd.toml) to mitigate this.
+
+For local builds:
+
+```bash
+docker buildx create --use --buildkitd-config buildkitd.toml
+```
+
 ## Version Discovery
 
 QEMU and Cloud Hypervisor have "edge" tags built from latest upstream releases, discovered at build time:

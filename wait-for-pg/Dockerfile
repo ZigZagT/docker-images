@@ -1,4 +1,4 @@
-FROM public.ecr.aws/docker/library/alpine
+FROM alpine
 
 ENV LANG=C.UTF-8 TERM=dumb TZ=UTC
 ENV DB_HOST DB_PORT DB_USERNAME DB_PASSWORD

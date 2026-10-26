@@ -1,0 +1,2 @@
+[registry."docker.io"]
+  mirrors = ["public.ecr.aws/docker", "mirror.gcr.io"]
