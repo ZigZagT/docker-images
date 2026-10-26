@@ -305,7 +305,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ github.token }}
 
       - name: Build and push ubuntu:${{ matrix.upstream_tag }}
         run: |
@@ -316,12 +316,7 @@ jobs:
             LATEST_TAG="$LATEST_TAG" \
             TZ="$TZ" \
             APT_MIRROR="$APT_MIRROR" \
-            PUSH="$PUSH"
-        env:
-          LATEST_TAG: ${{ env.LATEST_TAG }}
-          TZ: ${{ env.TZ }}
-          APT_MIRROR: ${{ env.APT_MIRROR }}
-          PUSH: ${{ github.event_name != 'pull_request' && 'true' || 'false' }}
+            PUSH="${{ github.event_name != 'pull_request' && 'true' || 'false' }}"
 
   merge-ubuntu-base:
     name: Merge ubuntu manifests
@@ -350,7 +345,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ github.token }}
 
       - name: Merge manifests
         run: |
@@ -390,6 +385,8 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
+        with:
+          buildkitd-config: ./buildkitd.toml
 
       - name: Login to DockerHub
         if: github.event_name != 'pull_request'
@@ -404,7 +401,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ github.token }}
 
       - name: Build and push ubuntu-nodejs images
         run: |
@@ -415,13 +412,7 @@ jobs:
             LATEST_TAG="$LATEST_TAG" \
             NODEJS_VERSIONS="$NODEJS_VERSIONS" \
             DEFAULT_NODEJS_VERSION="$DEFAULT_NODEJS_VERSION" \
-            PUSH="$PUSH"
-        env:
-          UPSTREAM_TAGS: ${{ env.UPSTREAM_TAGS }}
-          LATEST_TAG: ${{ env.LATEST_TAG }}
-          NODEJS_VERSIONS: ${{ env.NODEJS_VERSIONS }}
-          DEFAULT_NODEJS_VERSION: ${{ env.DEFAULT_NODEJS_VERSION }}
-          PUSH: ${{ github.event_name != 'pull_request' && 'true' || 'false' }}
+            PUSH="${{ github.event_name != 'pull_request' && 'true' || 'false' }}"
 
   merge-ubuntu-nodejs:
     name: Merge ubuntu-nodejs manifests
@@ -450,7 +441,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ github.token }}
 
       - name: Merge manifests
         run: |
@@ -484,6 +475,8 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
+        with:
+          buildkitd-config: ./buildkitd.toml
 
       - name: Login to DockerHub
         if: github.event_name != 'pull_request'
@@ -498,7 +491,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ github.token }}
 
       - name: Build and push ubuntu-rust images
         run: |
@@ -507,11 +500,7 @@ jobs:
             PLATFORM="${{ matrix.platform }}" \
             TAG_SUFFIX="${{ matrix.suffix }}" \
             LATEST_TAG="$LATEST_TAG" \
-            PUSH="$PUSH"
-        env:
-          UPSTREAM_TAGS: ${{ env.UPSTREAM_TAGS }}
-          LATEST_TAG: ${{ env.LATEST_TAG }}
-          PUSH: ${{ github.event_name != 'pull_request' && 'true' || 'false' }}
+            PUSH="${{ github.event_name != 'pull_request' && 'true' || 'false' }}"
 
   merge-ubuntu-rust:
     name: Merge ubuntu-rust manifests
@@ -540,7 +529,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ github.token }}
 
       - name: Merge manifests
         run: |
@@ -573,6 +562,8 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
+        with:
+          buildkitd-config: ./buildkitd.toml
 
       - name: Login to DockerHub
         if: github.event_name != 'pull_request'
@@ -587,7 +578,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ github.token }}
 
       - name: Build and push ubuntu-bun images
         run: |
@@ -596,11 +587,7 @@ jobs:
             PLATFORM="${{ matrix.platform }}" \
             TAG_SUFFIX="${{ matrix.suffix }}" \
             LATEST_TAG="$LATEST_TAG" \
-            PUSH="$PUSH"
-        env:
-          UPSTREAM_TAGS: ${{ env.UPSTREAM_TAGS }}
-          LATEST_TAG: ${{ env.LATEST_TAG }}
-          PUSH: ${{ github.event_name != 'pull_request' && 'true' || 'false' }}
+            PUSH="${{ github.event_name != 'pull_request' && 'true' || 'false' }}"
 
   merge-ubuntu-bun:
     name: Merge ubuntu-bun manifests
@@ -629,7 +616,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ github.token }}
 
       - name: Merge manifests
         run: |
@@ -759,6 +746,8 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
+        with:
+          buildkitd-config: ./buildkitd.toml
 
       - name: Login to DockerHub
         if: github.event_name != 'pull_request'
@@ -773,7 +762,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ github.token }}
 
       - name: Restore MaxMind versions from cache
         uses: actions/cache/restore@v5
@@ -798,10 +787,7 @@ jobs:
             PLATFORM="${{ matrix.platform }}" \
             TAG_SUFFIX="${{ matrix.suffix }}" \
             LATEST_TAG="$LATEST_TAG" \
-            PUSH="$PUSH"
-        env:
-          LATEST_TAG: ${{ env.LATEST_TAG }}
-          PUSH: ${{ github.event_name != 'pull_request' && 'true' || 'false' }}
+            PUSH="${{ github.event_name != 'pull_request' && 'true' || 'false' }}"
 
   merge-ubuntu-geoip:
     name: Merge ubuntu-geoip manifests
@@ -830,7 +816,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ github.token }}
 
       - name: Merge manifests
         run: |
@@ -883,6 +869,8 @@ jobs:
       - name: Set up Docker Buildx
         if: steps.should-build.outputs.build == 'true'
         uses: docker/setup-buildx-action@v4
+        with:
+          buildkitd-config: ./buildkitd.toml
 
       - name: Login to DockerHub
         if: steps.should-build.outputs.build == 'true' && github.event_name != 'pull_request'
@@ -897,7 +885,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ github.token }}
 
       - name: Build image
         if: steps.should-build.outputs.build == 'true'
@@ -942,7 +930,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ github.token }}
 
       - name: Merge dnsmasq
         if: needs.detect-changes.outputs.dnsmasq == 'true'
@@ -1014,6 +1002,8 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
+        with:
+          buildkitd-config: ./buildkitd.toml
 
       - name: Login to DockerHub
         if: github.event_name != 'pull_request'
@@ -1028,7 +1018,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ github.token }}
 
       - name: Build image
         run: |
@@ -1037,8 +1027,6 @@ jobs:
             TAG_SUFFIX="${{ matrix.suffix }}" \
             LATEST_TAG="$LATEST_TAG" \
             PUSH="${{ github.event_name != 'pull_request' && 'true' || 'false' }}"
-        env:
-          LATEST_TAG: ${{ env.LATEST_TAG }}
 
   merge-shadowsocks:
     name: Merge shadowsocks manifests
@@ -1067,7 +1055,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ github.token }}
 
       - name: Merge manifests
         run: |
@@ -1105,6 +1093,8 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
+        with:
+          buildkitd-config: ./buildkitd.toml
 
       - name: Login to DockerHub
         if: github.event_name != 'pull_request'
@@ -1119,7 +1109,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ github.token }}
 
       - name: Build and push browser
         run: |
@@ -1155,7 +1145,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ github.token }}
 
       - name: Merge manifests
         run: make merge-browser
@@ -1220,7 +1210,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ github.token }}
 
       - name: Build image
         if: steps.should-build.outputs.build == 'true'
@@ -1258,7 +1248,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ github.token }}
 
       - name: Merge dnsmasq-exporter
         if: needs.detect-changes.outputs.dnsmasq-exporter == 'true'
