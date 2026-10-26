@@ -80,6 +80,10 @@ env:
   CH_LATEST: ${{ github.event.inputs.ch_latest || '51.1' }}
 
 jobs:
+  # Jobs gate on `contains(needs.*.result, 'success') && !failure()`: at least
+  # one dependency succeeded and none failed. Replacing implicit success() which
+  # skips a job when any ancestor was skipped (GitHub docs: jobs.<job_id>.needs),
+  # For us a skipped build only means part of build artifacts can be reused.
   detect-changes:
     name: Detect Changed Images
     runs-on: ubuntu-latest
@@ -263,7 +267,9 @@ jobs:
     name: Build ubuntu:${{ matrix.upstream_tag }} (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
     needs: detect-changes
-    if: needs.detect-changes.outputs.ubuntu == 'true'
+    if: |
+      contains(needs.*.result, 'success') && !failure() &&
+      needs.detect-changes.outputs.ubuntu == 'true'
     environment: action-build-and-push
     strategy:
       fail-fast: false
@@ -320,8 +326,10 @@ jobs:
   merge-ubuntu-base:
     name: Merge ubuntu manifests
     runs-on: ubuntu-latest
-    needs: [detect-changes, build-ubuntu-base]
-    if: needs.build-ubuntu-base.result == 'success' && github.event_name != 'pull_request'
+    needs: build-ubuntu-base
+    if: |
+      contains(needs.*.result, 'success') && !failure() &&
+      github.event_name != 'pull_request'
     environment: action-build-and-push
     steps:
       - name: Checkout code
@@ -362,9 +370,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     needs: [detect-changes, build-ubuntu-base]
     if: |
-      always() &&
-      needs.detect-changes.outputs.ubuntu == 'true' &&
-      (needs.build-ubuntu-base.result == 'success' || needs.build-ubuntu-base.result == 'skipped')
+      contains(needs.*.result, 'success') && !failure() &&
+      needs.detect-changes.outputs.ubuntu == 'true'
     environment: action-build-and-push
     strategy:
       fail-fast: false
@@ -420,7 +427,9 @@ jobs:
     name: Merge ubuntu-nodejs manifests
     runs-on: ubuntu-latest
     needs: build-ubuntu-nodejs
-    if: needs.build-ubuntu-nodejs.result == 'success' && github.event_name != 'pull_request'
+    if: |
+      contains(needs.*.result, 'success') && !failure() &&
+      github.event_name != 'pull_request'
     environment: action-build-and-push
     steps:
       - name: Checkout code
@@ -455,9 +464,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     needs: [detect-changes, build-ubuntu-base]
     if: |
-      always() &&
-      needs.detect-changes.outputs.ubuntu == 'true' &&
-      (needs.build-ubuntu-base.result == 'success' || needs.build-ubuntu-base.result == 'skipped')
+      contains(needs.*.result, 'success') && !failure() &&
+      needs.detect-changes.outputs.ubuntu == 'true'
     environment: action-build-and-push
     strategy:
       fail-fast: false
@@ -509,7 +517,9 @@ jobs:
     name: Merge ubuntu-rust manifests
     runs-on: ubuntu-latest
     needs: build-ubuntu-rust
-    if: needs.build-ubuntu-rust.result == 'success' && github.event_name != 'pull_request'
+    if: |
+      contains(needs.*.result, 'success') && !failure() &&
+      github.event_name != 'pull_request'
     environment: action-build-and-push
     steps:
       - name: Checkout code
@@ -543,9 +553,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     needs: [detect-changes, build-ubuntu-base]
     if: |
-      always() &&
-      needs.detect-changes.outputs.ubuntu == 'true' &&
-      (needs.build-ubuntu-base.result == 'success' || needs.build-ubuntu-base.result == 'skipped')
+      contains(needs.*.result, 'success') && !failure() &&
+      needs.detect-changes.outputs.ubuntu == 'true'
     environment: action-build-and-push
     strategy:
       fail-fast: false
@@ -597,7 +606,9 @@ jobs:
     name: Merge ubuntu-bun manifests
     runs-on: ubuntu-latest
     needs: build-ubuntu-bun
-    if: needs.build-ubuntu-bun.result == 'success' && github.event_name != 'pull_request'
+    if: |
+      contains(needs.*.result, 'success') && !failure() &&
+      github.event_name != 'pull_request'
     environment: action-build-and-push
     steps:
       - name: Checkout code
@@ -633,8 +644,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: detect-changes
     if: |
-      needs.detect-changes.outputs.ubuntu-geoip == 'true' ||
-      github.event_name != 'pull_request'
+      contains(needs.*.result, 'success') && !failure() &&
+      (needs.detect-changes.outputs.ubuntu-geoip == 'true' || github.event_name != 'pull_request')
     environment: action-build-and-push
     outputs:
       maxmind-changed: ${{ steps.maxmind.outputs.changed }}
@@ -726,10 +737,9 @@ jobs:
     runs-on: ${{ matrix.runner }}
     needs: [detect-changes, build-ubuntu-base, prepare-geoip-databases]
     if: |
-      always() &&
+      contains(needs.*.result, 'success') && !failure() &&
       (needs.detect-changes.outputs.ubuntu-geoip == 'true' || needs.prepare-geoip-databases.outputs.maxmind-changed == 'true') &&
-      needs.prepare-geoip-databases.result == 'success' &&
-      (needs.build-ubuntu-base.result == 'success' || needs.build-ubuntu-base.result == 'skipped')
+      needs.prepare-geoip-databases.result == 'success'
     environment: action-build-and-push
     strategy:
       fail-fast: false
@@ -798,8 +808,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-ubuntu-geoip
     if: |
-      always() &&
-      needs.build-ubuntu-geoip.result == 'success' &&
+      contains(needs.*.result, 'success') && !failure() &&
       github.event_name != 'pull_request'
     environment: action-build-and-push
     steps:
@@ -842,9 +851,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     needs: [detect-changes, build-ubuntu-base]
     if: |
-      always() &&
-      (needs.detect-changes.outputs.dnsmasq == 'true' || needs.detect-changes.outputs.qemu == 'true' || needs.detect-changes.outputs.cloud-hypervisor == 'true') &&
-      (needs.build-ubuntu-base.result == 'success' || needs.build-ubuntu-base.result == 'skipped')
+      contains(needs.*.result, 'success') && !failure() &&
+      (needs.detect-changes.outputs.dnsmasq == 'true' || needs.detect-changes.outputs.qemu == 'true' || needs.detect-changes.outputs.cloud-hypervisor == 'true')
     environment: action-build-and-push
     strategy:
       fail-fast: false
@@ -911,7 +919,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [detect-changes, build-ubuntu-base-derived]
     if: |
-      always() &&
+      contains(needs.*.result, 'success') && !failure() &&
       needs.build-ubuntu-base-derived.result == 'success' &&
       github.event_name != 'pull_request'
     environment: action-build-and-push
@@ -986,10 +994,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     needs: [detect-changes, build-ubuntu-base, build-ubuntu-rust]
     if: |
-      always() &&
-      needs.detect-changes.outputs.shadowsocks == 'true' &&
-      (needs.build-ubuntu-base.result == 'success' || needs.build-ubuntu-base.result == 'skipped') &&
-      (needs.build-ubuntu-rust.result == 'success' || needs.build-ubuntu-rust.result == 'skipped')
+      contains(needs.*.result, 'success') && !failure() &&
+      needs.detect-changes.outputs.shadowsocks == 'true'
     environment: action-build-and-push
     strategy:
       fail-fast: false
@@ -1039,8 +1045,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-shadowsocks
     if: |
-      always() &&
-      needs.build-shadowsocks.result == 'success' &&
+      contains(needs.*.result, 'success') && !failure() &&
       github.event_name != 'pull_request'
     environment: action-build-and-push
     steps:
@@ -1080,9 +1085,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     needs: [detect-changes, build-ubuntu-nodejs]
     if: |
-      always() &&
-      needs.detect-changes.outputs.browser == 'true' &&
-      (needs.build-ubuntu-nodejs.result == 'success' || needs.build-ubuntu-nodejs.result == 'skipped')
+      contains(needs.*.result, 'success') && !failure() &&
+      needs.detect-changes.outputs.browser == 'true'
     environment: action-build-and-push
     strategy:
       fail-fast: false
@@ -1129,8 +1133,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-browser
     if: |
-      always() &&
-      needs.build-browser.result == 'success' &&
+      contains(needs.*.result, 'success') && !failure() &&
       github.event_name != 'pull_request'
     environment: action-build-and-push
     steps:
@@ -1169,6 +1172,8 @@ jobs:
     name: Build ${{ matrix.image }} (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
     needs: detect-changes
+    if: |
+      contains(needs.*.result, 'success') && !failure()
     environment: action-build-and-push
     strategy:
       fail-fast: false
@@ -1230,7 +1235,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [detect-changes, build-other-images]
     if: |
-      always() &&
+      contains(needs.*.result, 'success') && !failure() &&
       needs.build-other-images.result == 'success' &&
       github.event_name != 'pull_request'
     environment: action-build-and-push
