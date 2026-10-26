@@ -12,7 +12,7 @@ QEMU built from source, optimized for KVM Windows guest with VFIO/PCI passthroug
 
 ## Tags
 
-- `deaddev/qemu:<version>` — pinned QEMU version (e.g., `10.2.1`)
+- `deaddev/qemu:<version>` — pinned QEMU version (e.g., `11.1.2`)
 - `deaddev/qemu:latest` — latest pinned version
 - `deaddev/qemu:edge` — latest stable version auto-discovered from upstream
 

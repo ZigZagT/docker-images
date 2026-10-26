@@ -46,22 +46,22 @@ on:
       qemu_versions:
         description: 'QEMU versions to build (space-separated)'
         required: false
-        default: '10.2.1'
+        default: '11.1.2'
         type: string
       qemu_latest:
         description: 'Which QEMU version should the "latest" tag point to'
         required: false
-        default: '10.2.1'
+        default: '11.1.2'
         type: string
       ch_versions:
         description: 'Cloud Hypervisor versions to build (space-separated)'
         required: false
-        default: '51.1'
+        default: '54.0'
         type: string
       ch_latest:
         description: 'Which Cloud Hypervisor version should the "latest" tag point to'
         required: false
-        default: '51.1'
+        default: '54.0'
         type: string
   schedule:
     # At 00:00 on Saturday https://crontab.guru/#0_0_*_*_6
@@ -74,10 +74,10 @@ env:
   DEFAULT_NODEJS_VERSION: ${{ github.event.inputs.default_nodejs_version || '24' }}
   TZ: ${{ github.event.inputs.tz || 'America/Vancouver' }}
   APT_MIRROR: ${{ github.event.inputs.apt_mirror || '' }}
-  QEMU_VERSIONS: ${{ github.event.inputs.qemu_versions || '10.2.1' }}
-  QEMU_LATEST: ${{ github.event.inputs.qemu_latest || '10.2.1' }}
-  CH_VERSIONS: ${{ github.event.inputs.ch_versions || '51.1' }}
-  CH_LATEST: ${{ github.event.inputs.ch_latest || '51.1' }}
+  QEMU_VERSIONS: ${{ github.event.inputs.qemu_versions || '11.1.2' }}
+  QEMU_LATEST: ${{ github.event.inputs.qemu_latest || '11.1.2' }}
+  CH_VERSIONS: ${{ github.event.inputs.ch_versions || '54.0' }}
+  CH_LATEST: ${{ github.event.inputs.ch_latest || '54.0' }}
 
 jobs:
   detect-changes:

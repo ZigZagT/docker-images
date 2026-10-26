@@ -12,7 +12,7 @@ docker pull ghcr.io/zigzagt/cloud-hypervisor
 
 ## Tags
 
-- `deaddev/cloud-hypervisor:<version>` — pinned version (e.g., `51.1`)
+- `deaddev/cloud-hypervisor:<version>` — pinned version (e.g., `54.0`)
 - `deaddev/cloud-hypervisor:latest` — latest pinned version
 - `deaddev/cloud-hypervisor:edge` — latest stable version auto-discovered from upstream
 

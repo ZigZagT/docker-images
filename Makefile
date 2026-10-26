@@ -9,10 +9,10 @@ TZ ?= America/Vancouver
 APT_MIRROR ?=
 REGISTRIES ?= ghcr.io/zigzagt deaddev
 PUSH ?= false
-QEMU_VERSIONS ?= 10.2.1
-QEMU_LATEST ?= 10.2.1
-CH_VERSIONS ?= 51.1
-CH_LATEST ?= 51.1
+QEMU_VERSIONS ?= 11.1.2
+QEMU_LATEST ?= 11.1.2
+CH_VERSIONS ?= 54.0
+CH_LATEST ?= 54.0
 
 # Per-arch build support: set TAG_SUFFIX=-amd64 or -arm64 for split builds
 TAG_SUFFIX ?=
