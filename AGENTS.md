@@ -63,7 +63,7 @@ The base ubuntu image compiles two C programs (`setup-tz.c`, `setup-apt.c`) as s
 
 ## CI/CD
 
-Single workflow: `.github/workflows/build-and-push.yml`
+Main workflow: `.github/workflows/build-and-push.yml`; per-image jobs call `build-per-arch-images.yml` and `merge-multi-arch-manifest.yml`
 - Triggers: push to master, PRs, weekly schedule (Saturday 00:00), manual dispatch
 - Change detection: `scripts/has-git-diff-at-path.sh` compares against last successful build commit
 - Build strategy: per-arch native runners (ubuntu-latest for amd64, ubuntu-24.04-arm for arm64), then merge manifests

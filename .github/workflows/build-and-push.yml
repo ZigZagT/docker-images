@@ -101,6 +101,7 @@ jobs:
       browser: ${{ steps.changes.outputs.browser }}
       any-changes: ${{ steps.changes.outputs.any-changes }}
       upstream-tags-json: ${{ steps.matrices.outputs.upstream_tags_json }}
+      settings: ${{ steps.settings.outputs.json }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -260,369 +261,131 @@ jobs:
         run: |
           echo "upstream_tags_json=$(echo "$UPSTREAM_TAGS" | jq -Rc 'split(" ")')" >> $GITHUB_OUTPUT
 
+      # Workflow env does not reach reusable workflows; they receive these
+      # settings as JSON instead.
+      - name: Export build settings
+        id: settings
+        run: |
+          echo "json=$(jq -nc '{
+            UPSTREAM_TAGS: env.UPSTREAM_TAGS,
+            LATEST_TAG: env.LATEST_TAG,
+            NODEJS_VERSIONS: env.NODEJS_VERSIONS,
+            DEFAULT_NODEJS_VERSION: env.DEFAULT_NODEJS_VERSION,
+            TZ: env.TZ,
+            APT_MIRROR: env.APT_MIRROR,
+            QEMU_VERSIONS: env.QEMU_VERSIONS,
+            QEMU_LATEST: env.QEMU_LATEST,
+            CH_VERSIONS: env.CH_VERSIONS,
+            CH_LATEST: env.CH_LATEST
+          }')" >> $GITHUB_OUTPUT
+
   # --- Ubuntu base image (all ubuntu-derived images depend on this) ---
   # Each arch builds natively on its own runner, pushes to arch-suffixed tags.
 
   build-ubuntu-base:
-    name: Build ubuntu:${{ matrix.upstream_tag }} (${{ matrix.platform }})
-    runs-on: ${{ matrix.runner }}
+    name: Build ubuntu:${{ matrix.upstream_tag }}
     needs: detect-changes
     if: |
       contains(needs.*.result, 'success') && !failure() &&
       needs.detect-changes.outputs.ubuntu == 'true'
-    environment: action-build-and-push
     strategy:
       fail-fast: false
       matrix:
         upstream_tag: ${{ fromJSON(needs.detect-changes.outputs.upstream-tags-json) }}
-        platform: [linux/amd64, linux/arm64]
-        include:
-          - platform: linux/amd64
-            runner: ubuntu-latest
-            suffix: -amd64
-          - platform: linux/arm64
-            runner: ubuntu-24.04-arm
-            suffix: -arm64
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-        with:
-          buildkitd-config: ./buildkitd.toml
-
-      - name: Login to DockerHub
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v4
-        with:
-          username: ${{ vars.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Login to GHCR
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ github.token }}
-
-      - name: Build and push ubuntu:${{ matrix.upstream_tag }}
-        run: |
-          make ubuntu \
-            UPSTREAM_TAGS="${{ matrix.upstream_tag }}" \
-            PLATFORM="${{ matrix.platform }}" \
-            TAG_SUFFIX="${{ matrix.suffix }}" \
-            LATEST_TAG="$LATEST_TAG" \
-            TZ="$TZ" \
-            APT_MIRROR="$APT_MIRROR" \
-            PUSH="${{ github.event_name != 'pull_request' && 'true' || 'false' }}"
+    uses: ./.github/workflows/build-per-arch-images.yml
+    with:
+      make-target: ubuntu
+      settings: ${{ needs.detect-changes.outputs.settings }}
+      upstream-tags: ${{ matrix.upstream_tag }}
+    secrets: inherit
 
   merge-ubuntu-base:
     name: Merge ubuntu manifests
-    runs-on: ubuntu-latest
     needs: build-ubuntu-base
     if: |
       contains(needs.*.result, 'success') && !failure() &&
       github.event_name != 'pull_request'
-    environment: action-build-and-push
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Login to DockerHub
-        uses: docker/login-action@v4
-        with:
-          username: ${{ vars.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Login to GHCR
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ github.token }}
-
-      - name: Merge manifests
-        run: |
-          make merge-ubuntu \
-            UPSTREAM_TAGS="$UPSTREAM_TAGS" \
-            LATEST_TAG="$LATEST_TAG"
-      - name: Sync README to DockerHub
-        run: ./scripts/sync-readme.sh ubuntu/README.md ${{ vars.DOCKERHUB_USERNAME }}/ubuntu
-        env:
-          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    uses: ./.github/workflows/merge-multi-arch-manifest.yml
+    with:
+      make-target: merge-ubuntu
+      settings: ${{ needs.build-ubuntu-base.outputs.settings }}
+      image: ubuntu
+      readme-path: ubuntu/README.md
+    secrets: inherit
 
   # --- Ubuntu variants (parallel, depend on base build only) ---
 
   build-ubuntu-nodejs:
-    name: Build ubuntu-nodejs (${{ matrix.platform }})
-    runs-on: ${{ matrix.runner }}
+    name: Build ubuntu-nodejs
     needs: [detect-changes, build-ubuntu-base]
     if: |
       contains(needs.*.result, 'success') && !failure() &&
       needs.detect-changes.outputs.ubuntu == 'true'
-    environment: action-build-and-push
-    strategy:
-      fail-fast: false
-      matrix:
-        platform: [linux/amd64, linux/arm64]
-        include:
-          - platform: linux/amd64
-            runner: ubuntu-latest
-            suffix: -amd64
-          - platform: linux/arm64
-            runner: ubuntu-24.04-arm
-            suffix: -arm64
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-        with:
-          buildkitd-config: ./buildkitd.toml
-
-      - name: Login to DockerHub
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v4
-        with:
-          username: ${{ vars.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Login to GHCR
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ github.token }}
-
-      - name: Build and push ubuntu-nodejs images
-        run: |
-          make ubuntu-nodejs \
-            UPSTREAM_TAGS="$UPSTREAM_TAGS" \
-            PLATFORM="${{ matrix.platform }}" \
-            TAG_SUFFIX="${{ matrix.suffix }}" \
-            LATEST_TAG="$LATEST_TAG" \
-            NODEJS_VERSIONS="$NODEJS_VERSIONS" \
-            DEFAULT_NODEJS_VERSION="$DEFAULT_NODEJS_VERSION" \
-            PUSH="${{ github.event_name != 'pull_request' && 'true' || 'false' }}"
+    uses: ./.github/workflows/build-per-arch-images.yml
+    with:
+      make-target: ubuntu-nodejs
+      settings: ${{ needs.detect-changes.outputs.settings }}
+    secrets: inherit
 
   merge-ubuntu-nodejs:
     name: Merge ubuntu-nodejs manifests
-    runs-on: ubuntu-latest
     needs: build-ubuntu-nodejs
     if: |
       contains(needs.*.result, 'success') && !failure() &&
       github.event_name != 'pull_request'
-    environment: action-build-and-push
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
+    uses: ./.github/workflows/merge-multi-arch-manifest.yml
+    with:
+      make-target: merge-ubuntu-nodejs
+      settings: ${{ needs.build-ubuntu-nodejs.outputs.settings }}
+    secrets: inherit
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Login to DockerHub
-        uses: docker/login-action@v4
-        with:
-          username: ${{ vars.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Login to GHCR
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ github.token }}
-
-      - name: Merge manifests
-        run: |
-          make merge-ubuntu-nodejs \
-            UPSTREAM_TAGS="$UPSTREAM_TAGS" \
-            LATEST_TAG="$LATEST_TAG" \
-            NODEJS_VERSIONS="$NODEJS_VERSIONS" \
-            DEFAULT_NODEJS_VERSION="$DEFAULT_NODEJS_VERSION"
   build-ubuntu-rust:
-    name: Build ubuntu-rust (${{ matrix.platform }})
-    runs-on: ${{ matrix.runner }}
+    name: Build ubuntu-rust
     needs: [detect-changes, build-ubuntu-base]
     if: |
       contains(needs.*.result, 'success') && !failure() &&
       needs.detect-changes.outputs.ubuntu == 'true'
-    environment: action-build-and-push
-    strategy:
-      fail-fast: false
-      matrix:
-        platform: [linux/amd64, linux/arm64]
-        include:
-          - platform: linux/amd64
-            runner: ubuntu-latest
-            suffix: -amd64
-          - platform: linux/arm64
-            runner: ubuntu-24.04-arm
-            suffix: -arm64
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-        with:
-          buildkitd-config: ./buildkitd.toml
-
-      - name: Login to DockerHub
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v4
-        with:
-          username: ${{ vars.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Login to GHCR
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ github.token }}
-
-      - name: Build and push ubuntu-rust images
-        run: |
-          make ubuntu-rust \
-            UPSTREAM_TAGS="$UPSTREAM_TAGS" \
-            PLATFORM="${{ matrix.platform }}" \
-            TAG_SUFFIX="${{ matrix.suffix }}" \
-            LATEST_TAG="$LATEST_TAG" \
-            PUSH="${{ github.event_name != 'pull_request' && 'true' || 'false' }}"
+    uses: ./.github/workflows/build-per-arch-images.yml
+    with:
+      make-target: ubuntu-rust
+      settings: ${{ needs.detect-changes.outputs.settings }}
+    secrets: inherit
 
   merge-ubuntu-rust:
     name: Merge ubuntu-rust manifests
-    runs-on: ubuntu-latest
     needs: build-ubuntu-rust
     if: |
       contains(needs.*.result, 'success') && !failure() &&
       github.event_name != 'pull_request'
-    environment: action-build-and-push
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Login to DockerHub
-        uses: docker/login-action@v4
-        with:
-          username: ${{ vars.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Login to GHCR
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ github.token }}
-
-      - name: Merge manifests
-        run: |
-          make merge-ubuntu-rust \
-            UPSTREAM_TAGS="$UPSTREAM_TAGS" \
-            LATEST_TAG="$LATEST_TAG"
+    uses: ./.github/workflows/merge-multi-arch-manifest.yml
+    with:
+      make-target: merge-ubuntu-rust
+      settings: ${{ needs.build-ubuntu-rust.outputs.settings }}
+    secrets: inherit
 
   build-ubuntu-bun:
-    name: Build ubuntu-bun (${{ matrix.platform }})
-    runs-on: ${{ matrix.runner }}
+    name: Build ubuntu-bun
     needs: [detect-changes, build-ubuntu-base]
     if: |
       contains(needs.*.result, 'success') && !failure() &&
       needs.detect-changes.outputs.ubuntu == 'true'
-    environment: action-build-and-push
-    strategy:
-      fail-fast: false
-      matrix:
-        platform: [linux/amd64, linux/arm64]
-        include:
-          - platform: linux/amd64
-            runner: ubuntu-latest
-            suffix: -amd64
-          - platform: linux/arm64
-            runner: ubuntu-24.04-arm
-            suffix: -arm64
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-        with:
-          buildkitd-config: ./buildkitd.toml
-
-      - name: Login to DockerHub
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v4
-        with:
-          username: ${{ vars.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Login to GHCR
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ github.token }}
-
-      - name: Build and push ubuntu-bun images
-        run: |
-          make ubuntu-bun \
-            UPSTREAM_TAGS="$UPSTREAM_TAGS" \
-            PLATFORM="${{ matrix.platform }}" \
-            TAG_SUFFIX="${{ matrix.suffix }}" \
-            LATEST_TAG="$LATEST_TAG" \
-            PUSH="${{ github.event_name != 'pull_request' && 'true' || 'false' }}"
+    uses: ./.github/workflows/build-per-arch-images.yml
+    with:
+      make-target: ubuntu-bun
+      settings: ${{ needs.detect-changes.outputs.settings }}
+    secrets: inherit
 
   merge-ubuntu-bun:
     name: Merge ubuntu-bun manifests
-    runs-on: ubuntu-latest
     needs: build-ubuntu-bun
     if: |
       contains(needs.*.result, 'success') && !failure() &&
       github.event_name != 'pull_request'
-    environment: action-build-and-push
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Login to DockerHub
-        uses: docker/login-action@v4
-        with:
-          username: ${{ vars.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Login to GHCR
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ github.token }}
-
-      - name: Merge manifests
-        run: |
-          make merge-ubuntu-bun \
-            UPSTREAM_TAGS="$UPSTREAM_TAGS" \
-            LATEST_TAG="$LATEST_TAG"
+    uses: ./.github/workflows/merge-multi-arch-manifest.yml
+    with:
+      make-target: merge-ubuntu-bun
+      settings: ${{ needs.build-ubuntu-bun.outputs.settings }}
+    secrets: inherit
 
   # --- GeoIP: download databases once, then build tags per-arch ---
 
@@ -728,6 +491,8 @@ jobs:
       (needs.detect-changes.outputs.ubuntu-geoip == 'true' || needs.prepare-geoip-databases.outputs.maxmind-changed == 'true') &&
       needs.prepare-geoip-databases.result == 'success'
     environment: action-build-and-push
+    outputs:
+      settings: ${{ needs.detect-changes.outputs.settings }}
     strategy:
       fail-fast: false
       matrix:
@@ -791,494 +556,230 @@ jobs:
 
   merge-ubuntu-geoip:
     name: Merge ubuntu-geoip manifests
-    runs-on: ubuntu-latest
     needs: build-ubuntu-geoip
     if: |
       contains(needs.*.result, 'success') && !failure() &&
       github.event_name != 'pull_request'
-    environment: action-build-and-push
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Login to DockerHub
-        uses: docker/login-action@v4
-        with:
-          username: ${{ vars.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Login to GHCR
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ github.token }}
-
-      - name: Merge manifests
-        run: |
-          make merge-ubuntu-geoip \
-            UPSTREAM_TAGS="$UPSTREAM_TAGS" \
-            LATEST_TAG="$LATEST_TAG"
-
-      - name: Sync README to DockerHub
-        run: ./scripts/sync-readme.sh ubuntu-geoip/README.md ${{ vars.DOCKERHUB_USERNAME }}/ubuntu-geoip
-        env:
-          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    uses: ./.github/workflows/merge-multi-arch-manifest.yml
+    with:
+      make-target: merge-ubuntu-geoip
+      settings: ${{ needs.build-ubuntu-geoip.outputs.settings }}
+      image: ubuntu-geoip
+      readme-path: ubuntu-geoip/README.md
+    secrets: inherit
 
   # --- Images that depend on ubuntu base (not nodejs/rust) ---
 
-  build-ubuntu-base-derived:
-    name: Build ${{ matrix.image }} (${{ matrix.platform }})
-    runs-on: ${{ matrix.runner }}
+  build-dnsmasq:
+    name: Build dnsmasq
     needs: [detect-changes, build-ubuntu-base]
     if: |
       contains(needs.*.result, 'success') && !failure() &&
-      (needs.detect-changes.outputs.dnsmasq == 'true' || needs.detect-changes.outputs.qemu == 'true' || needs.detect-changes.outputs.cloud-hypervisor == 'true')
-    environment: action-build-and-push
-    strategy:
-      fail-fast: false
-      matrix:
-        image: [dnsmasq, qemu, cloud-hypervisor]
-        platform: [linux/amd64, linux/arm64]
-        include:
-          - platform: linux/amd64
-            runner: ubuntu-latest
-            suffix: -amd64
-          - platform: linux/arm64
-            runner: ubuntu-24.04-arm
-            suffix: -arm64
-    steps:
-      - name: Check if build needed
-        id: should-build
-        run: |
-          if [[ "${{ needs.detect-changes.outputs[matrix.image] }}" == "true" ]]; then
-            echo "build=true" >> $GITHUB_OUTPUT
-          else
-            echo "build=false" >> $GITHUB_OUTPUT
-          fi
+      needs.detect-changes.outputs.dnsmasq == 'true'
+    uses: ./.github/workflows/build-per-arch-images.yml
+    with:
+      make-target: dnsmasq
+      settings: ${{ needs.detect-changes.outputs.settings }}
+    secrets: inherit
 
-      - name: Checkout code
-        if: steps.should-build.outputs.build == 'true'
-        uses: actions/checkout@v6
-
-      - name: Set up Docker Buildx
-        if: steps.should-build.outputs.build == 'true'
-        uses: docker/setup-buildx-action@v4
-        with:
-          buildkitd-config: ./buildkitd.toml
-
-      - name: Login to DockerHub
-        if: steps.should-build.outputs.build == 'true' && github.event_name != 'pull_request'
-        uses: docker/login-action@v4
-        with:
-          username: ${{ vars.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Login to GHCR
-        if: steps.should-build.outputs.build == 'true' && github.event_name != 'pull_request'
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ github.token }}
-
-      - name: Build image
-        if: steps.should-build.outputs.build == 'true'
-        run: |
-          make ${{ matrix.image }} \
-            PLATFORM="${{ matrix.platform }}" \
-            TAG_SUFFIX="${{ matrix.suffix }}" \
-            LATEST_TAG="$LATEST_TAG" \
-            QEMU_VERSIONS="$QEMU_VERSIONS" \
-            QEMU_LATEST="$QEMU_LATEST" \
-            CH_VERSIONS="$CH_VERSIONS" \
-            CH_LATEST="$CH_LATEST" \
-            PUSH="${{ github.event_name != 'pull_request' && 'true' || 'false' }}"
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-
-  merge-ubuntu-base-derived:
-    name: Merge ubuntu-base-derived manifests
-    runs-on: ubuntu-latest
-    needs: [detect-changes, build-ubuntu-base-derived]
+  merge-dnsmasq:
+    name: Merge dnsmasq manifests
+    needs: build-dnsmasq
     if: |
       contains(needs.*.result, 'success') && !failure() &&
-      needs.build-ubuntu-base-derived.result == 'success' &&
       github.event_name != 'pull_request'
-    environment: action-build-and-push
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
+    uses: ./.github/workflows/merge-multi-arch-manifest.yml
+    with:
+      make-target: merge-dnsmasq
+      settings: ${{ needs.build-dnsmasq.outputs.settings }}
+      image: dnsmasq
+      readme-path: dnsmasq/README.md
+    secrets: inherit
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+  build-qemu:
+    name: Build qemu
+    needs: [detect-changes, build-ubuntu-base]
+    if: |
+      contains(needs.*.result, 'success') && !failure() &&
+      needs.detect-changes.outputs.qemu == 'true'
+    uses: ./.github/workflows/build-per-arch-images.yml
+    with:
+      make-target: qemu
+      settings: ${{ needs.detect-changes.outputs.settings }}
+    secrets: inherit
 
-      - name: Login to DockerHub
-        uses: docker/login-action@v4
-        with:
-          username: ${{ vars.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+  merge-qemu:
+    name: Merge qemu manifests
+    needs: build-qemu
+    if: |
+      contains(needs.*.result, 'success') && !failure() &&
+      github.event_name != 'pull_request'
+    uses: ./.github/workflows/merge-multi-arch-manifest.yml
+    with:
+      make-target: merge-qemu
+      settings: ${{ needs.build-qemu.outputs.settings }}
+      image: qemu
+      readme-path: qemu/README.md
+    secrets: inherit
 
-      - name: Login to GHCR
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ github.token }}
+  build-cloud-hypervisor:
+    name: Build cloud-hypervisor
+    needs: [detect-changes, build-ubuntu-base]
+    if: |
+      contains(needs.*.result, 'success') && !failure() &&
+      needs.detect-changes.outputs.cloud-hypervisor == 'true'
+    uses: ./.github/workflows/build-per-arch-images.yml
+    with:
+      make-target: cloud-hypervisor
+      settings: ${{ needs.detect-changes.outputs.settings }}
+    secrets: inherit
 
-      - name: Merge dnsmasq
-        if: needs.detect-changes.outputs.dnsmasq == 'true'
-        run: |
-          make merge-dnsmasq
-      - name: Merge qemu
-        if: needs.detect-changes.outputs.qemu == 'true'
-        run: |
-          make merge-qemu \
-            QEMU_VERSIONS="$QEMU_VERSIONS" \
-            QEMU_LATEST="$QEMU_LATEST"
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-
-      - name: Merge cloud-hypervisor
-        if: needs.detect-changes.outputs.cloud-hypervisor == 'true'
-        run: |
-          make merge-cloud-hypervisor \
-            CH_VERSIONS="$CH_VERSIONS" \
-            CH_LATEST="$CH_LATEST"
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-
-      - name: Sync dnsmasq README
-        if: needs.detect-changes.outputs.dnsmasq == 'true'
-        run: ./scripts/sync-readme.sh dnsmasq/README.md ${{ vars.DOCKERHUB_USERNAME }}/dnsmasq
-        env:
-          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Sync qemu README
-        if: needs.detect-changes.outputs.qemu == 'true'
-        run: ./scripts/sync-readme.sh qemu/README.md ${{ vars.DOCKERHUB_USERNAME }}/qemu
-        env:
-          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Sync cloud-hypervisor README
-        if: needs.detect-changes.outputs.cloud-hypervisor == 'true'
-        run: ./scripts/sync-readme.sh cloud-hypervisor/README.md ${{ vars.DOCKERHUB_USERNAME }}/cloud-hypervisor
-        env:
-          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+  merge-cloud-hypervisor:
+    name: Merge cloud-hypervisor manifests
+    needs: build-cloud-hypervisor
+    if: |
+      contains(needs.*.result, 'success') && !failure() &&
+      github.event_name != 'pull_request'
+    uses: ./.github/workflows/merge-multi-arch-manifest.yml
+    with:
+      make-target: merge-cloud-hypervisor
+      settings: ${{ needs.build-cloud-hypervisor.outputs.settings }}
+      image: cloud-hypervisor
+      readme-path: cloud-hypervisor/README.md
+    secrets: inherit
 
   # --- Shadowsocks depends on ubuntu:rust ---
 
   build-shadowsocks:
-    name: Build shadowsocks (${{ matrix.platform }})
-    runs-on: ${{ matrix.runner }}
+    name: Build shadowsocks
     needs: [detect-changes, build-ubuntu-base, build-ubuntu-rust]
     if: |
       contains(needs.*.result, 'success') && !failure() &&
       needs.detect-changes.outputs.shadowsocks == 'true'
-    environment: action-build-and-push
-    strategy:
-      fail-fast: false
-      matrix:
-        platform: [linux/amd64, linux/arm64]
-        include:
-          - platform: linux/amd64
-            runner: ubuntu-latest
-            suffix: -amd64
-          - platform: linux/arm64
-            runner: ubuntu-24.04-arm
-            suffix: -arm64
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-        with:
-          buildkitd-config: ./buildkitd.toml
-
-      - name: Login to DockerHub
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v4
-        with:
-          username: ${{ vars.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Login to GHCR
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ github.token }}
-
-      - name: Build image
-        run: |
-          make shadowsocks \
-            PLATFORM="${{ matrix.platform }}" \
-            TAG_SUFFIX="${{ matrix.suffix }}" \
-            LATEST_TAG="$LATEST_TAG" \
-            PUSH="${{ github.event_name != 'pull_request' && 'true' || 'false' }}"
+    uses: ./.github/workflows/build-per-arch-images.yml
+    with:
+      make-target: shadowsocks
+      settings: ${{ needs.detect-changes.outputs.settings }}
+    secrets: inherit
 
   merge-shadowsocks:
     name: Merge shadowsocks manifests
-    runs-on: ubuntu-latest
     needs: build-shadowsocks
     if: |
       contains(needs.*.result, 'success') && !failure() &&
       github.event_name != 'pull_request'
-    environment: action-build-and-push
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Login to DockerHub
-        uses: docker/login-action@v4
-        with:
-          username: ${{ vars.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Login to GHCR
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ github.token }}
-
-      - name: Merge manifests
-        run: |
-          make merge-shadowsocks
-      - name: Sync README to DockerHub
-        run: ./scripts/sync-readme.sh shadowsocks/README.md ${{ vars.DOCKERHUB_USERNAME }}/shadowsocks
-        env:
-          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    uses: ./.github/workflows/merge-multi-arch-manifest.yml
+    with:
+      make-target: merge-shadowsocks
+      settings: ${{ needs.build-shadowsocks.outputs.settings }}
+      image: shadowsocks
+      readme-path: shadowsocks/README.md
+    secrets: inherit
 
   # --- Browser depends on ubuntu:nodejs ---
 
   build-browser:
-    name: Build browser (${{ matrix.platform }})
-    runs-on: ${{ matrix.runner }}
+    name: Build browser
     needs: [detect-changes, build-ubuntu-nodejs]
     if: |
       contains(needs.*.result, 'success') && !failure() &&
       needs.detect-changes.outputs.browser == 'true'
-    environment: action-build-and-push
-    strategy:
-      fail-fast: false
-      matrix:
-        platform: [linux/amd64, linux/arm64]
-        include:
-          - platform: linux/amd64
-            runner: ubuntu-latest
-            suffix: -amd64
-          - platform: linux/arm64
-            runner: ubuntu-24.04-arm
-            suffix: -arm64
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-        with:
-          buildkitd-config: ./buildkitd.toml
-
-      - name: Login to DockerHub
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v4
-        with:
-          username: ${{ vars.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Login to GHCR
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ github.token }}
-
-      - name: Build and push browser
-        run: |
-          make browser \
-            PLATFORM="${{ matrix.platform }}" \
-            TAG_SUFFIX="${{ matrix.suffix }}" \
-            PUSH="${{ github.event_name != 'pull_request' && 'true' || 'false' }}"
+    uses: ./.github/workflows/build-per-arch-images.yml
+    with:
+      make-target: browser
+      settings: ${{ needs.detect-changes.outputs.settings }}
+    secrets: inherit
 
   merge-browser:
     name: Merge browser manifests
-    runs-on: ubuntu-latest
     needs: build-browser
     if: |
       contains(needs.*.result, 'success') && !failure() &&
       github.event_name != 'pull_request'
-    environment: action-build-and-push
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Login to DockerHub
-        uses: docker/login-action@v4
-        with:
-          username: ${{ vars.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Login to GHCR
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ github.token }}
-
-      - name: Merge manifests
-        run: make merge-browser
-
-      - name: Sync README to DockerHub
-        run: ./scripts/sync-readme.sh browser/README.md ${{ vars.DOCKERHUB_USERNAME }}/browser
-        env:
-          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    uses: ./.github/workflows/merge-multi-arch-manifest.yml
+    with:
+      make-target: merge-browser
+      settings: ${{ needs.build-browser.outputs.settings }}
+      image: browser
+      readme-path: browser/README.md
+    secrets: inherit
 
   # --- Independent images (no ubuntu dependency) ---
 
-  build-other-images:
-    name: Build ${{ matrix.image }} (${{ matrix.platform }})
-    runs-on: ${{ matrix.runner }}
+  build-dnsmasq-exporter:
+    name: Build dnsmasq_exporter
     needs: detect-changes
     if: |
-      contains(needs.*.result, 'success') && !failure()
-    environment: action-build-and-push
-    strategy:
-      fail-fast: false
-      matrix:
-        image: [dnsmasq-exporter, sqitch-pg, wait-for-pg]
-        platform: [linux/amd64, linux/arm64]
-        include:
-          - platform: linux/amd64
-            runner: ubuntu-latest
-            suffix: -amd64
-          - platform: linux/arm64
-            runner: ubuntu-24.04-arm
-            suffix: -arm64
-    steps:
-      - name: Check if build needed
-        id: should-build
-        run: |
-          if [[ "${{ needs.detect-changes.outputs[matrix.image] }}" == "true" ]]; then
-            echo "build=true" >> $GITHUB_OUTPUT
-          else
-            echo "build=false" >> $GITHUB_OUTPUT
-          fi
+      contains(needs.*.result, 'success') && !failure() &&
+      needs.detect-changes.outputs.dnsmasq-exporter == 'true'
+    uses: ./.github/workflows/build-per-arch-images.yml
+    with:
+      make-target: dnsmasq-exporter
+      settings: ${{ needs.detect-changes.outputs.settings }}
+    secrets: inherit
 
-      - name: Checkout code
-        if: steps.should-build.outputs.build == 'true'
-        uses: actions/checkout@v6
-
-      - name: Set up Docker Buildx
-        if: steps.should-build.outputs.build == 'true'
-        uses: docker/setup-buildx-action@v4
-        with:
-          buildkitd-config: ./buildkitd.toml
-
-      - name: Login to DockerHub
-        if: steps.should-build.outputs.build == 'true' && github.event_name != 'pull_request'
-        uses: docker/login-action@v4
-        with:
-          username: ${{ vars.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Login to GHCR
-        if: steps.should-build.outputs.build == 'true' && github.event_name != 'pull_request'
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ github.token }}
-
-      - name: Build image
-        if: steps.should-build.outputs.build == 'true'
-        run: |
-          make ${{ matrix.image }} \
-            PLATFORM="${{ matrix.platform }}" \
-            TAG_SUFFIX="${{ matrix.suffix }}" \
-            PUSH="${{ github.event_name != 'pull_request' && 'true' || 'false' }}"
-
-  merge-other-images:
-    name: Merge other image manifests
-    runs-on: ubuntu-latest
-    needs: [detect-changes, build-other-images]
+  merge-dnsmasq-exporter:
+    name: Merge dnsmasq_exporter manifests
+    needs: build-dnsmasq-exporter
     if: |
       contains(needs.*.result, 'success') && !failure() &&
-      needs.build-other-images.result == 'success' &&
       github.event_name != 'pull_request'
-    environment: action-build-and-push
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
+    uses: ./.github/workflows/merge-multi-arch-manifest.yml
+    with:
+      make-target: merge-dnsmasq-exporter
+      settings: ${{ needs.build-dnsmasq-exporter.outputs.settings }}
+      image: dnsmasq_exporter
+      readme-path: dnsmasq_exporter/README.md
+    secrets: inherit
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+  build-sqitch-pg:
+    name: Build sqitch-pg
+    needs: detect-changes
+    if: |
+      contains(needs.*.result, 'success') && !failure() &&
+      needs.detect-changes.outputs.sqitch-pg == 'true'
+    uses: ./.github/workflows/build-per-arch-images.yml
+    with:
+      make-target: sqitch-pg
+      settings: ${{ needs.detect-changes.outputs.settings }}
+    secrets: inherit
 
-      - name: Login to DockerHub
-        uses: docker/login-action@v4
-        with:
-          username: ${{ vars.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+  merge-sqitch-pg:
+    name: Merge sqitch-pg manifests
+    needs: build-sqitch-pg
+    if: |
+      contains(needs.*.result, 'success') && !failure() &&
+      github.event_name != 'pull_request'
+    uses: ./.github/workflows/merge-multi-arch-manifest.yml
+    with:
+      make-target: merge-sqitch-pg
+      settings: ${{ needs.build-sqitch-pg.outputs.settings }}
+      image: sqitch-pg
+      readme-path: sqitch-pg/README.md
+    secrets: inherit
 
-      - name: Login to GHCR
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ github.token }}
+  build-wait-for-pg:
+    name: Build wait-for-pg
+    needs: detect-changes
+    if: |
+      contains(needs.*.result, 'success') && !failure() &&
+      needs.detect-changes.outputs.wait-for-pg == 'true'
+    uses: ./.github/workflows/build-per-arch-images.yml
+    with:
+      make-target: wait-for-pg
+      settings: ${{ needs.detect-changes.outputs.settings }}
+    secrets: inherit
 
-      - name: Merge dnsmasq-exporter
-        if: needs.detect-changes.outputs.dnsmasq-exporter == 'true'
-        run: |
-          make merge-dnsmasq-exporter
-      - name: Merge sqitch-pg
-        if: needs.detect-changes.outputs.sqitch-pg == 'true'
-        run: |
-          make merge-sqitch-pg
-      - name: Merge wait-for-pg
-        if: needs.detect-changes.outputs.wait-for-pg == 'true'
-        run: |
-          make merge-wait-for-pg
-      - name: Sync dnsmasq_exporter README
-        if: needs.detect-changes.outputs.dnsmasq-exporter == 'true'
-        run: ./scripts/sync-readme.sh dnsmasq_exporter/README.md ${{ vars.DOCKERHUB_USERNAME }}/dnsmasq_exporter
-        env:
-          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Sync sqitch-pg README
-        if: needs.detect-changes.outputs.sqitch-pg == 'true'
-        run: ./scripts/sync-readme.sh sqitch-pg/README.md ${{ vars.DOCKERHUB_USERNAME }}/sqitch-pg
-        env:
-          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Sync wait-for-pg README
-        if: needs.detect-changes.outputs.wait-for-pg == 'true'
-        run: ./scripts/sync-readme.sh wait-for-pg/README.md ${{ vars.DOCKERHUB_USERNAME }}/wait-for-pg
-        env:
-          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+  merge-wait-for-pg:
+    name: Merge wait-for-pg manifests
+    needs: build-wait-for-pg
+    if: |
+      contains(needs.*.result, 'success') && !failure() &&
+      github.event_name != 'pull_request'
+    uses: ./.github/workflows/merge-multi-arch-manifest.yml
+    with:
+      make-target: merge-wait-for-pg
+      settings: ${{ needs.build-wait-for-pg.outputs.settings }}
+      image: wait-for-pg
+      readme-path: wait-for-pg/README.md
+    secrets: inherit

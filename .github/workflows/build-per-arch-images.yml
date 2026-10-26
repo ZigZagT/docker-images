@@ -1,0 +1,84 @@
+name: Build per-arch images
+
+on:
+  workflow_call:
+    inputs:
+      make-target:
+        description: 'Make target that builds and pushes the arch-suffixed tags'
+        required: true
+        type: string
+      settings:
+        description: 'JSON of the calling workflow env (detect-changes.outputs.settings)'
+        required: true
+        type: string
+      upstream-tags:
+        description: 'Ubuntu versions to build; empty keeps UPSTREAM_TAGS from settings'
+        required: false
+        type: string
+        default: ''
+    outputs:
+      settings:
+        description: 'Settings this build used, for the matching merge job'
+        value: ${{ inputs.settings }}
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    environment: action-build-and-push
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            suffix: -amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            suffix: -arm64
+    steps:
+      # make reads these from the environment. jq -e fails the job when
+      # settings is empty, invalid, or {}, or when a setting is null.
+      - name: Load build settings
+        run: |
+          echo "$SETTINGS" | jq -er 'to_entries[] | if .value == null then error("\(.key) is not set") else "\(.key)=\(.value)" end' >> "$GITHUB_ENV"
+          if [ -n "$UPSTREAM_TAGS_OVERRIDE" ]; then
+            echo "UPSTREAM_TAGS=$UPSTREAM_TAGS_OVERRIDE" >> "$GITHUB_ENV"
+          fi
+        env:
+          SETTINGS: ${{ inputs.settings }}
+          UPSTREAM_TAGS_OVERRIDE: ${{ inputs.upstream-tags }}
+
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          buildkitd-config: ./buildkitd.toml
+
+      - name: Login to DockerHub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+
+      - name: Build and push ${{ inputs.make-target }}
+        run: |
+          make "$MAKE_TARGET" \
+            PLATFORM="${{ matrix.platform }}" \
+            TAG_SUFFIX="${{ matrix.suffix }}" \
+            PUSH="${{ github.event_name != 'pull_request' && 'true' || 'false' }}"
+        env:
+          MAKE_TARGET: ${{ inputs.make-target }}
+          GITHUB_TOKEN: ${{ github.token }}
