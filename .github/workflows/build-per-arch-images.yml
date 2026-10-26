@@ -16,6 +16,11 @@ on:
         required: false
         type: string
         default: ''
+      pull-slot:
+        description: 'Delay slot for jobs that pull Docker Hub images at the same time; -1 skips the delay'
+        required: false
+        type: number
+        default: -1
     outputs:
       settings:
         description: 'Settings this build used, for the matching merge job'
@@ -72,6 +77,16 @@ jobs:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ github.token }}
+
+      # Docker Hub images are pulled through the ECR mirror, which allows one
+      # unauthenticated pull per second. Each job pulling at the same time
+      # waits a distinct number of seconds: two per slot, one per platform.
+      - name: Wait for pull slot
+        if: inputs.pull-slot >= 0
+        run: sleep $(( PULL_SLOT * 2 + PLATFORM_INDEX ))
+        env:
+          PULL_SLOT: ${{ inputs.pull-slot }}
+          PLATFORM_INDEX: ${{ strategy.job-index }}
 
       - name: Build and push ${{ inputs.make-target }}
         run: |

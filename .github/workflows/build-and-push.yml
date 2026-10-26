@@ -80,10 +80,6 @@ env:
   CH_LATEST: ${{ github.event.inputs.ch_latest || '51.1' }}
 
 jobs:
-  # Jobs gate on `contains(needs.*.result, 'success') && !failure()`: at least
-  # one dependency succeeded and none failed. Replacing implicit success() which
-  # skips a job when any ancestor was skipped (GitHub docs: jobs.<job_id>.needs),
-  # For us a skipped build only means part of build artifacts can be reused.
   detect-changes:
     name: Detect Changed Images
     runs-on: ubuntu-latest
@@ -285,9 +281,7 @@ jobs:
   build-ubuntu-base:
     name: Build ubuntu:${{ matrix.upstream_tag }}
     needs: detect-changes
-    if: |
-      contains(needs.*.result, 'success') && !failure() &&
-      needs.detect-changes.outputs.ubuntu == 'true'
+    if: needs.detect-changes.outputs.ubuntu == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -297,13 +291,17 @@ jobs:
       make-target: ubuntu
       settings: ${{ needs.detect-changes.outputs.settings }}
       upstream-tags: ${{ matrix.upstream_tag }}
+      pull-slot: ${{ strategy.job-index }}
     secrets: inherit
 
+  # Merges also check the change flag: in run 40308606353 a skipped
+  # reusable-workflow build did not skip its dependent merge.
   merge-ubuntu-base:
     name: Merge ubuntu manifests
-    needs: build-ubuntu-base
+    needs: [detect-changes, build-ubuntu-base]
     if: |
-      contains(needs.*.result, 'success') && !failure() &&
+      needs.build-ubuntu-base.result == 'success' &&
+      needs.detect-changes.outputs.ubuntu == 'true' &&
       github.event_name != 'pull_request'
     uses: ./.github/workflows/merge-multi-arch-manifest.yml
     with:
@@ -319,8 +317,9 @@ jobs:
     name: Build ubuntu-nodejs
     needs: [detect-changes, build-ubuntu-base]
     if: |
-      contains(needs.*.result, 'success') && !failure() &&
-      needs.detect-changes.outputs.ubuntu == 'true'
+      always() &&
+      needs.detect-changes.outputs.ubuntu == 'true' &&
+      (needs.build-ubuntu-base.result == 'success' || needs.build-ubuntu-base.result == 'skipped')
     uses: ./.github/workflows/build-per-arch-images.yml
     with:
       make-target: ubuntu-nodejs
@@ -329,9 +328,10 @@ jobs:
 
   merge-ubuntu-nodejs:
     name: Merge ubuntu-nodejs manifests
-    needs: build-ubuntu-nodejs
+    needs: [detect-changes, build-ubuntu-nodejs]
     if: |
-      contains(needs.*.result, 'success') && !failure() &&
+      needs.build-ubuntu-nodejs.result == 'success' &&
+      needs.detect-changes.outputs.ubuntu == 'true' &&
       github.event_name != 'pull_request'
     uses: ./.github/workflows/merge-multi-arch-manifest.yml
     with:
@@ -343,8 +343,9 @@ jobs:
     name: Build ubuntu-rust
     needs: [detect-changes, build-ubuntu-base]
     if: |
-      contains(needs.*.result, 'success') && !failure() &&
-      needs.detect-changes.outputs.ubuntu == 'true'
+      always() &&
+      needs.detect-changes.outputs.ubuntu == 'true' &&
+      (needs.build-ubuntu-base.result == 'success' || needs.build-ubuntu-base.result == 'skipped')
     uses: ./.github/workflows/build-per-arch-images.yml
     with:
       make-target: ubuntu-rust
@@ -353,9 +354,10 @@ jobs:
 
   merge-ubuntu-rust:
     name: Merge ubuntu-rust manifests
-    needs: build-ubuntu-rust
+    needs: [detect-changes, build-ubuntu-rust]
     if: |
-      contains(needs.*.result, 'success') && !failure() &&
+      needs.build-ubuntu-rust.result == 'success' &&
+      needs.detect-changes.outputs.ubuntu == 'true' &&
       github.event_name != 'pull_request'
     uses: ./.github/workflows/merge-multi-arch-manifest.yml
     with:
@@ -367,8 +369,9 @@ jobs:
     name: Build ubuntu-bun
     needs: [detect-changes, build-ubuntu-base]
     if: |
-      contains(needs.*.result, 'success') && !failure() &&
-      needs.detect-changes.outputs.ubuntu == 'true'
+      always() &&
+      needs.detect-changes.outputs.ubuntu == 'true' &&
+      (needs.build-ubuntu-base.result == 'success' || needs.build-ubuntu-base.result == 'skipped')
     uses: ./.github/workflows/build-per-arch-images.yml
     with:
       make-target: ubuntu-bun
@@ -377,9 +380,10 @@ jobs:
 
   merge-ubuntu-bun:
     name: Merge ubuntu-bun manifests
-    needs: build-ubuntu-bun
+    needs: [detect-changes, build-ubuntu-bun]
     if: |
-      contains(needs.*.result, 'success') && !failure() &&
+      needs.build-ubuntu-bun.result == 'success' &&
+      needs.detect-changes.outputs.ubuntu == 'true' &&
       github.event_name != 'pull_request'
     uses: ./.github/workflows/merge-multi-arch-manifest.yml
     with:
@@ -394,8 +398,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: detect-changes
     if: |
-      contains(needs.*.result, 'success') && !failure() &&
-      (needs.detect-changes.outputs.ubuntu-geoip == 'true' || github.event_name != 'pull_request')
+      needs.detect-changes.outputs.ubuntu-geoip == 'true' ||
+      github.event_name != 'pull_request'
     environment: action-build-and-push
     outputs:
       maxmind-changed: ${{ steps.maxmind.outputs.changed }}
@@ -487,9 +491,10 @@ jobs:
     runs-on: ${{ matrix.runner }}
     needs: [detect-changes, build-ubuntu-base, prepare-geoip-databases]
     if: |
-      contains(needs.*.result, 'success') && !failure() &&
+      always() &&
       (needs.detect-changes.outputs.ubuntu-geoip == 'true' || needs.prepare-geoip-databases.outputs.maxmind-changed == 'true') &&
-      needs.prepare-geoip-databases.result == 'success'
+      needs.prepare-geoip-databases.result == 'success' &&
+      (needs.build-ubuntu-base.result == 'success' || needs.build-ubuntu-base.result == 'skipped')
     environment: action-build-and-push
     outputs:
       settings: ${{ needs.detect-changes.outputs.settings }}
@@ -558,7 +563,8 @@ jobs:
     name: Merge ubuntu-geoip manifests
     needs: build-ubuntu-geoip
     if: |
-      contains(needs.*.result, 'success') && !failure() &&
+      always() &&
+      needs.build-ubuntu-geoip.result == 'success' &&
       github.event_name != 'pull_request'
     uses: ./.github/workflows/merge-multi-arch-manifest.yml
     with:
@@ -574,8 +580,9 @@ jobs:
     name: Build dnsmasq
     needs: [detect-changes, build-ubuntu-base]
     if: |
-      contains(needs.*.result, 'success') && !failure() &&
-      needs.detect-changes.outputs.dnsmasq == 'true'
+      always() &&
+      needs.detect-changes.outputs.dnsmasq == 'true' &&
+      (needs.build-ubuntu-base.result == 'success' || needs.build-ubuntu-base.result == 'skipped')
     uses: ./.github/workflows/build-per-arch-images.yml
     with:
       make-target: dnsmasq
@@ -584,9 +591,11 @@ jobs:
 
   merge-dnsmasq:
     name: Merge dnsmasq manifests
-    needs: build-dnsmasq
+    needs: [detect-changes, build-dnsmasq]
     if: |
-      contains(needs.*.result, 'success') && !failure() &&
+      always() &&
+      needs.build-dnsmasq.result == 'success' &&
+      needs.detect-changes.outputs.dnsmasq == 'true' &&
       github.event_name != 'pull_request'
     uses: ./.github/workflows/merge-multi-arch-manifest.yml
     with:
@@ -600,8 +609,9 @@ jobs:
     name: Build qemu
     needs: [detect-changes, build-ubuntu-base]
     if: |
-      contains(needs.*.result, 'success') && !failure() &&
-      needs.detect-changes.outputs.qemu == 'true'
+      always() &&
+      needs.detect-changes.outputs.qemu == 'true' &&
+      (needs.build-ubuntu-base.result == 'success' || needs.build-ubuntu-base.result == 'skipped')
     uses: ./.github/workflows/build-per-arch-images.yml
     with:
       make-target: qemu
@@ -610,9 +620,11 @@ jobs:
 
   merge-qemu:
     name: Merge qemu manifests
-    needs: build-qemu
+    needs: [detect-changes, build-qemu]
     if: |
-      contains(needs.*.result, 'success') && !failure() &&
+      always() &&
+      needs.build-qemu.result == 'success' &&
+      needs.detect-changes.outputs.qemu == 'true' &&
       github.event_name != 'pull_request'
     uses: ./.github/workflows/merge-multi-arch-manifest.yml
     with:
@@ -626,8 +638,9 @@ jobs:
     name: Build cloud-hypervisor
     needs: [detect-changes, build-ubuntu-base]
     if: |
-      contains(needs.*.result, 'success') && !failure() &&
-      needs.detect-changes.outputs.cloud-hypervisor == 'true'
+      always() &&
+      needs.detect-changes.outputs.cloud-hypervisor == 'true' &&
+      (needs.build-ubuntu-base.result == 'success' || needs.build-ubuntu-base.result == 'skipped')
     uses: ./.github/workflows/build-per-arch-images.yml
     with:
       make-target: cloud-hypervisor
@@ -636,9 +649,11 @@ jobs:
 
   merge-cloud-hypervisor:
     name: Merge cloud-hypervisor manifests
-    needs: build-cloud-hypervisor
+    needs: [detect-changes, build-cloud-hypervisor]
     if: |
-      contains(needs.*.result, 'success') && !failure() &&
+      always() &&
+      needs.build-cloud-hypervisor.result == 'success' &&
+      needs.detect-changes.outputs.cloud-hypervisor == 'true' &&
       github.event_name != 'pull_request'
     uses: ./.github/workflows/merge-multi-arch-manifest.yml
     with:
@@ -654,8 +669,10 @@ jobs:
     name: Build shadowsocks
     needs: [detect-changes, build-ubuntu-base, build-ubuntu-rust]
     if: |
-      contains(needs.*.result, 'success') && !failure() &&
-      needs.detect-changes.outputs.shadowsocks == 'true'
+      always() &&
+      needs.detect-changes.outputs.shadowsocks == 'true' &&
+      (needs.build-ubuntu-base.result == 'success' || needs.build-ubuntu-base.result == 'skipped') &&
+      (needs.build-ubuntu-rust.result == 'success' || needs.build-ubuntu-rust.result == 'skipped')
     uses: ./.github/workflows/build-per-arch-images.yml
     with:
       make-target: shadowsocks
@@ -664,9 +681,11 @@ jobs:
 
   merge-shadowsocks:
     name: Merge shadowsocks manifests
-    needs: build-shadowsocks
+    needs: [detect-changes, build-shadowsocks]
     if: |
-      contains(needs.*.result, 'success') && !failure() &&
+      always() &&
+      needs.build-shadowsocks.result == 'success' &&
+      needs.detect-changes.outputs.shadowsocks == 'true' &&
       github.event_name != 'pull_request'
     uses: ./.github/workflows/merge-multi-arch-manifest.yml
     with:
@@ -682,8 +701,9 @@ jobs:
     name: Build browser
     needs: [detect-changes, build-ubuntu-nodejs]
     if: |
-      contains(needs.*.result, 'success') && !failure() &&
-      needs.detect-changes.outputs.browser == 'true'
+      always() &&
+      needs.detect-changes.outputs.browser == 'true' &&
+      (needs.build-ubuntu-nodejs.result == 'success' || needs.build-ubuntu-nodejs.result == 'skipped')
     uses: ./.github/workflows/build-per-arch-images.yml
     with:
       make-target: browser
@@ -692,9 +712,11 @@ jobs:
 
   merge-browser:
     name: Merge browser manifests
-    needs: build-browser
+    needs: [detect-changes, build-browser]
     if: |
-      contains(needs.*.result, 'success') && !failure() &&
+      always() &&
+      needs.build-browser.result == 'success' &&
+      needs.detect-changes.outputs.browser == 'true' &&
       github.event_name != 'pull_request'
     uses: ./.github/workflows/merge-multi-arch-manifest.yml
     with:
@@ -705,24 +727,27 @@ jobs:
     secrets: inherit
 
   # --- Independent images (no ubuntu dependency) ---
+  # These pull Docker Hub images at the same time as the ubuntu base builds,
+  # which take pull slots 0-2.
 
   build-dnsmasq-exporter:
     name: Build dnsmasq_exporter
     needs: detect-changes
-    if: |
-      contains(needs.*.result, 'success') && !failure() &&
-      needs.detect-changes.outputs.dnsmasq-exporter == 'true'
+    if: needs.detect-changes.outputs.dnsmasq-exporter == 'true'
     uses: ./.github/workflows/build-per-arch-images.yml
     with:
       make-target: dnsmasq-exporter
       settings: ${{ needs.detect-changes.outputs.settings }}
+      pull-slot: 3
     secrets: inherit
 
   merge-dnsmasq-exporter:
     name: Merge dnsmasq_exporter manifests
-    needs: build-dnsmasq-exporter
+    needs: [detect-changes, build-dnsmasq-exporter]
     if: |
-      contains(needs.*.result, 'success') && !failure() &&
+      always() &&
+      needs.build-dnsmasq-exporter.result == 'success' &&
+      needs.detect-changes.outputs.dnsmasq-exporter == 'true' &&
       github.event_name != 'pull_request'
     uses: ./.github/workflows/merge-multi-arch-manifest.yml
     with:
@@ -735,20 +760,21 @@ jobs:
   build-sqitch-pg:
     name: Build sqitch-pg
     needs: detect-changes
-    if: |
-      contains(needs.*.result, 'success') && !failure() &&
-      needs.detect-changes.outputs.sqitch-pg == 'true'
+    if: needs.detect-changes.outputs.sqitch-pg == 'true'
     uses: ./.github/workflows/build-per-arch-images.yml
     with:
       make-target: sqitch-pg
       settings: ${{ needs.detect-changes.outputs.settings }}
+      pull-slot: 4
     secrets: inherit
 
   merge-sqitch-pg:
     name: Merge sqitch-pg manifests
-    needs: build-sqitch-pg
+    needs: [detect-changes, build-sqitch-pg]
     if: |
-      contains(needs.*.result, 'success') && !failure() &&
+      always() &&
+      needs.build-sqitch-pg.result == 'success' &&
+      needs.detect-changes.outputs.sqitch-pg == 'true' &&
       github.event_name != 'pull_request'
     uses: ./.github/workflows/merge-multi-arch-manifest.yml
     with:
@@ -761,20 +787,21 @@ jobs:
   build-wait-for-pg:
     name: Build wait-for-pg
     needs: detect-changes
-    if: |
-      contains(needs.*.result, 'success') && !failure() &&
-      needs.detect-changes.outputs.wait-for-pg == 'true'
+    if: needs.detect-changes.outputs.wait-for-pg == 'true'
     uses: ./.github/workflows/build-per-arch-images.yml
     with:
       make-target: wait-for-pg
       settings: ${{ needs.detect-changes.outputs.settings }}
+      pull-slot: 5
     secrets: inherit
 
   merge-wait-for-pg:
     name: Merge wait-for-pg manifests
-    needs: build-wait-for-pg
+    needs: [detect-changes, build-wait-for-pg]
     if: |
-      contains(needs.*.result, 'success') && !failure() &&
+      always() &&
+      needs.build-wait-for-pg.result == 'success' &&
+      needs.detect-changes.outputs.wait-for-pg == 'true' &&
       github.event_name != 'pull_request'
     uses: ./.github/workflows/merge-multi-arch-manifest.yml
     with:
