@@ -73,11 +73,11 @@ See the [Use Custom `ENTRYPOINT`](#use-custom-entrypoint) section for guides of 
 
 #### Build time usage
 
-For build time, use `build-arg` to set the environment variable like `docker build --build-arg APT_MIRROR=http://archive.ubuntu.com/ubuntu/`, and then add `RUN /container-setup/setup-tz.sh` in your `Dockerfile`.
+For build time, use `build-arg` to set the environment variable like `docker build --build-arg APT_MIRROR=https://archive.ubuntu.com/ubuntu/`, and then add `RUN /container-setup/setup-tz.sh` in your `Dockerfile`.
 
 #### Runtime usage
 
-If you're not overriding the `ENTRYPOINT` comes with the image, you may simply set `environment` like `docker run -e APT_MIRROR=http://archive.ubuntu.com/ubuntu/`. Everything would just work. And this even supports non-root users.
+If you're not overriding the `ENTRYPOINT` comes with the image, you may simply set `environment` like `docker run -e APT_MIRROR=https://archive.ubuntu.com/ubuntu/`. Everything would just work. And this even supports non-root users.
 
 See the [Use Custom `ENTRYPOINT`](#use-custom-entrypoint) section for guides of using custom entrypoint script.
 

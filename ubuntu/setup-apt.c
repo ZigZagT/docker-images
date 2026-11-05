@@ -32,6 +32,9 @@ int main() {
     }
 
     LOG_INFO("setup-apt: Configuring APT mirror to %s\n", apt_mirror);
+    if (strncmp(apt_mirror, "https://", strlen("https://")) != 0) {
+        LOG_WARN("setup-apt: WARNING: APT mirror %s is not HTTPS\n", apt_mirror);
+    }
 
     FILE *fp = fopen("/etc/os-release", "r");
     if (!fp) {
